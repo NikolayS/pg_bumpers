@@ -11,6 +11,10 @@ members = [
     "crates/pgwire",
     "crates/audit",
     "crates/cli",
+    # Throwaway S0 fidelity-spike harness (issue #8). publish = false; not
+    # production. Kept in the workspace only so it compiles under the fast CI job;
+    # its DB tests are env-gated (PG_BUMPERS_IT=1) and skipped by `cargo test`.
+    "spikes/fidelity",
 ]
 
 # Shared metadata for every crate in the workspace. Crates opt in via

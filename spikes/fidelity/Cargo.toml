@@ -1,0 +1,28 @@
+[package]
+name = "fidelity-spike"
+description = "THROWAWAY S0 fidelity-spike harness (issue #8): red-tests clone<->prod PK-set prediction + typed-inverse restore against real PG18. NOT production."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# Throwaway spike — never published.
+publish = false
+
+[lib]
+name = "fidelity_spike"
+
+[dependencies]
+# Consume the merged core seams (ApplyBarrier, Clock, PkChecksum/PkSetBuilder,
+# InverseKind/InversePlan, certified-action set). DB-free; we drive it from here.
+pgb-core = { path = "../../crates/core" }
+# Synchronous Postgres client (MIT/Apache — keeps cargo-deny green). The spike is
+# small and linear, so the sync client keeps the harness readable.
+postgres = "0.19"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+# (none beyond the above — tests live in tests/ and use the lib API)
