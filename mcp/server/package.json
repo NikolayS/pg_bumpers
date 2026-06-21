@@ -1,0 +1,17 @@
+{
+  "name": "@pg-bumpers/mcp-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "pg_bumpers MCP server (TS skeleton). The real MCP tools land in S4 (SPEC.md §4).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "license-check": "node scripts/license-check.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3",
+    "vitest": "2.1.9"
+  }
+}

@@ -1,0 +1,11 @@
+# pnpm 11 settings home (the `pnpm` field in package.json is no longer read).
+#
+# Approve esbuild to run its install script (a no-op verification on prebuilt
+# platforms) — vitest depends on it. Without this pnpm reports
+# ERR_PNPM_IGNORED_BUILDS and the deps-status check fails.
+allowBuilds:
+  esbuild: true
+
+# Skip the deps-status recheck before each `pnpm run` (CI installs explicitly
+# with --frozen-lockfile first).
+verifyDepsBeforeRun: false

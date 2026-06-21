@@ -1,0 +1,13 @@
+[package]
+name = "pgb-policy"
+description = "pg_bumpers policy library: policy.yaml model, certified-action-set, and the RiskEngine seam."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pgb_policy"

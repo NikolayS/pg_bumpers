@@ -1,0 +1,52 @@
+# cargo-deny configuration for pg_bumpers.
+#
+# ===========================================================================
+#  AGPL GUARD (license hygiene — SPEC §4): this file is the deterministic gate
+#  that keeps copyleft out of the dependency tree. Only permissive licenses
+#  (Apache-2.0 / MIT / BSD / ISC, plus the Unicode license used by some deps)
+#  are allowed. ANY GPL / AGPL / LGPL dependency causes `cargo deny check` to
+#  FAIL, by design — we ship Apache-2.0 and must never link copyleft, and the
+#  pgDog clean-room rule (AGPL) means we never copy that code either.
+# ===========================================================================
+
+[graph]
+all-features = true
+
+[licenses]
+# Allow-list only. Anything not listed here (e.g. GPL-3.0, AGPL-3.0, LGPL-3.0)
+# is rejected, which makes `cargo deny check licenses` fail closed.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    # Unicode-* are permissive and required by some transitive deps
+    # (e.g. unicode-ident); they are NOT copyleft.
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+# Require a high confidence match when inferring a license from text.
+confidence-threshold = 0.8
+
+[bans]
+# Warn on multiple versions of the same crate; deny external wildcard deps.
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace `path = "..."` deps legitimately carry no version req; exempt
+# them so the wildcard ban only catches risky *external* unpinned deps.
+allow-wildcard-paths = true
+# No banned crates yet; add copyleft-leaning or risky crates here as needed.
+deny = []
+
+[advisories]
+# RUSTSEC advisory database checks. Fail on security vulnerabilities and
+# unmaintained crates so issues surface in CI rather than in production.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+[sources]
+# Only crates.io (and any explicitly allowed git/registry sources) are permitted.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,20 @@
+[package]
+name = "pgb-proxy"
+description = "pg_bumpers proxy binary: inline read-only enforcement (budgets, cutoff, timeouts, audit) — agent-only endpoint."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "pgb-proxy"
+path = "src/main.rs"
+
+[dependencies]
+pgb-core = { path = "../core" }
+pgb-policy = { path = "../policy" }
+pgb-pgwire = { path = "../pgwire" }
+pgb-audit = { path = "../audit" }

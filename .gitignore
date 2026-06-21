@@ -1,2 +1,28 @@
+# Rust
+/target/
+**/target/
+*.rs.bk
+
+# Node / pnpm
+node_modules/
+mcp/server/dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Clone / rehearsal artifacts (clone-orchestrator dry-run scratch, restore points, dumps)
+/clones/
+*.clone
+*.restore-point
+clone-artifacts/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
 # Generated GitHub Pages site (assembled by scripts/build-site.sh)
 /site/

@@ -1,0 +1,17 @@
+[package]
+name = "pgb-warden"
+description = "pg_bumpers warden binary: out-of-band watchdog that kills agent-tagged runaways and owns the circuit breaker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "pgb-warden"
+path = "src/main.rs"
+
+[dependencies]
+pgb-core = { path = "../core" }

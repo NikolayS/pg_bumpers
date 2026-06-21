@@ -1,0 +1,13 @@
+[package]
+name = "pgb-pgwire"
+description = "pg_bumpers PostgreSQL wire-protocol helpers (extended-protocol-only enforcement seam)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pgb_pgwire"

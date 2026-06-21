@@ -1,0 +1,13 @@
+[package]
+name = "pgb-audit"
+description = "pg_bumpers tamper-evident audit: append-only hash-chained records with external anchoring."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pgb_audit"

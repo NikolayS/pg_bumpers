@@ -1,0 +1,6 @@
+# Pin the toolchain so every contributor and CI runner build identically.
+# 1.90.0 matches the version validated for the MVP build (issue #3).
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,18 @@
+[package]
+name = "pgb-cli"
+description = "pg_bumpers CLI binary: operator approval flow issuing signed, single-use, proposal-bound grants."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "pgb-cli"
+path = "src/main.rs"
+
+[dependencies]
+pgb-core = { path = "../core" }
+pgb-policy = { path = "../policy" }
