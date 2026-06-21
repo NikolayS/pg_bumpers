@@ -622,6 +622,14 @@ dependencies = [
 [[package]]
 name = "pgb-clone-orchestrator"
 version = "0.0.0"
+dependencies = [
+ "pgb-core",
+ "postgres",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "thiserror",
+]
 
 [[package]]
 name = "pgb-core"

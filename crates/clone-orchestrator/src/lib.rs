@@ -1,11 +1,51 @@
-//! Clone-orchestrator for pg_bumpers.
+//! Clone-orchestrator for pg_bumpers — the **dry-run blast-radius engine**
+//! (SPEC §4, §10.1, §12).
 //!
-//! Rehearses a proposed write (on a DBLab clone if present, else in a rolled-back
-//! txn), measures the blast radius, and guards apply with a PK-set checksum so
-//! row-identity drift is caught even when the row *count* is unchanged (SPEC §4).
-//! Guarded apply re-checks the affected-PK set at apply time and aborts on any
-//! drift (0-tolerance for destructive ops). This S0 crate provides the drift-
-//! decision seam and a test; the live rehearsal lands in S2/S3.
+//! Rehearses a proposed write (on a DBLab clone if present, else in a
+//! rolled-back txn — the baseline `clone.provider: none`, §12), measures the
+//! blast radius into the §10.1 [`pgb_core::BlastRadius`] record, and guards apply
+//! with a PK-set checksum so row-identity drift is caught even when the row
+//! *count* is unchanged (SPEC §4, §10.2).
+//!
+//! # The flow
+//!
+//! 1. [`propose`] a candidate statement → a [`Proposal`] (stable id + TTL,
+//!    measured against the injected [`pgb_core::Clock`], §10.4).
+//! 2. [`dry_run`] the proposal against a [`Rehearsal`] backend: it refuses
+//!    volatile/non-deterministic predicates and PK-less targets **before
+//!    executing**, otherwise runs the statement in a `BEGIN … ROLLBACK` txn,
+//!    measures (affected-PK set + cascades + triggers + locks + WAL + duration +
+//!    LSN/staleness), and folds the facts into a [`pgb_core::BlastRadius`] — then
+//!    rolls back so **nothing is persisted**.
+//!
+//! # Refusals (fail-closed)
+//!
+//! - Volatile predicate (`now()`/`random()`/`clock_timestamp()` …) → REFUSED,
+//!   never executed (SPEC §4) — see [`predicate`].
+//! - PK-less / no-replica-identity target → REFUSED, **no `ctid` fallback**
+//!   (SPEC §10.2).
+//! - Non-certified shape (DDL/`TRUNCATE`/`INSERT`/…) → REFUSED (default-deny,
+//!   §10.3).
+//!
+//! # Guarded apply seam
+//!
+//! [`guard_decision`] is the drift-decision seam the guarded-apply path (S3)
+//! uses: it compares the dry-run affected-PK-set checksum to the apply-time
+//! checksum and **aborts on any mismatch** — the guard is the PK-set checksum,
+//! not the row count.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod dry_run;
+pub mod predicate;
+pub mod proposal;
+
+pub use dry_run::{
+    classify, dry_run, AffectedTable, DryRunError, Measurement, Rehearsal, WriteKind,
+};
+pub use predicate::{is_volatile, volatile_reason, VolatileReason, VOLATILE_FUNCTIONS};
+pub use proposal::{propose, propose_with_ttl, Proposal, DEFAULT_TTL_MILLIS};
 
 /// The outcome of comparing the dry-run affected-PK set against the apply-time set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

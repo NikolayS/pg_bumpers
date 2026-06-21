@@ -11,3 +11,24 @@ publish = false
 
 [lib]
 name = "pgb_clone_orchestrator"
+
+[dependencies]
+# The merged core seams: BlastRadius (§10.1), PkChecksum/PkSetBuilder (§10.2),
+# typed-inverse InverseKind (§10.3), Clock (§10.4). DB-free; the orchestrator
+# drives a live connection and folds the measured facts into these types.
+pgb-core = { path = "../core" }
+# Advisory SQL parse (§4 "parse advisory only"): classify the proposed write and
+# extract its target relation + volatile-function references. Apache-2.0; already
+# in the workspace tree (pgwire). Built from the SPEC + the public sqlparser AST
+# only — clean-room (no pgDog).
+sqlparser = "0.62"
+# §10.1 BlastRadius JSON emission round-trips through serde.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# Synchronous Postgres client for the env-gated (PG_BUMPERS_IT=1) real-PG18
+# integration tests. MIT/Apache (keeps cargo-deny green); the sync client keeps
+# the rehearsal harness linear and readable, matching the S0 fidelity spike.
+postgres = "0.19"
