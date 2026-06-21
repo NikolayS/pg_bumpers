@@ -1,43 +1,47 @@
-//! Tamper-evident audit for pg_bumpers.
+//! Tamper-evident audit for pg_bumpers (SPEC §3, §4, §5, §10.9; issue #21).
 //!
-//! Append-only, hash-chained records live in the `_meta` DB and the chain head
-//! is anchored externally (WORM / transparency log) with a separated signing key
-//! (SPEC §4). The audited principal cannot rewrite the audit. This S0 crate
-//! provides a minimal, deterministic chain-link hash so the seam exists and is
-//! tested; the full chain and anchor land later.
+//! Append-only, **hash-chained** records record *every* statement the proxy
+//! sees — including the ones it blocks or rejects — so the audit log is the
+//! tamper-evident evidence that a hostile statement was stopped. Each record is
+//! linked to its predecessor by
+//! `record_hash = sha256(prev_hash ∥ canonical_encoding(record))`, anchored at a
+//! defined [`GENESIS_PREV_HASH`](record::GENESIS_PREV_HASH). Editing or deleting
+//! any mid-chain record breaks the chain, and [`verify_chain`](chain::verify_chain)
+//! returns the **first** broken link.
+//!
+//! The chain lives in the `_meta` DB on an append-only table whose grants
+//! `REVOKE` write from the audited principal — "the audited cannot write audit"
+//! (SPEC §3/§4/§10.9). The external WORM **anchor** + KMS **key-separation** are
+//! S4 (this S1 crate ships the chain + recording + the `_meta` schema + the
+//! REVOKE).
+//!
+//! # Modules
+//! - [`record`] — the [`AuditRecord`]/[`AuditPayload`], the [`Decision`] enum
+//!   (`ALLOW`/`BLOCK`/`REJECT`), the canonical encoding, and the chain hash.
+//! - [`chain`] — the append-only [`AuditChain`] builder and
+//!   [`verify_chain`](chain::verify_chain) (the tamper detector).
+//! - [`sink`] — the append-only [`Sink`] trait + the [`InMemorySink`].
+//! - [`pg`] — the Postgres `_meta` sink (behind the default-on `pg` feature).
+//!
+//! Time is always read from `core::Clock` upstream and passed in as a
+//! millisecond stamp, so no part of the crate touches a wall clock and tests
+//! are fully deterministic via `core::MockClock`.
 
-/// A simple, deterministic FNV-1a hash used to link audit records into a chain.
-///
-/// This is a placeholder digest for the S0 seam — the production chain uses a
-/// cryptographic hash. The property tested here is determinism and chaining:
-/// linking the same `(prev, payload)` always yields the same value.
-pub fn chain_link(prev: u64, payload: &[u8]) -> u64 {
-    // FNV-1a over prev-bytes then payload, so each link depends on the last.
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    for byte in prev.to_le_bytes().iter().chain(payload.iter()) {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod chain;
+pub mod record;
+pub mod sink;
 
-    #[test]
-    fn chain_link_is_deterministic() {
-        assert_eq!(chain_link(0, b"first"), chain_link(0, b"first"));
-    }
+#[cfg(feature = "pg")]
+pub mod pg;
 
-    #[test]
-    fn chain_link_depends_on_predecessor() {
-        // Tampering with a prior link changes every downstream link.
-        let a = chain_link(0, b"record");
-        let b = chain_link(a, b"record");
-        assert_ne!(a, b);
-        assert_ne!(chain_link(1, b"record"), chain_link(2, b"record"));
-    }
-}
+pub use chain::{verify_chain, AuditChain, ChainBreak, NewEntry};
+pub use record::{
+    AuditPayload, AuditRecord, Decision, IntentTiers, Principal, WriteSafetyRefs, GENESIS_PREV_HASH,
+};
+pub use sink::{InMemorySink, Sink, SinkError};
+
+#[cfg(feature = "pg")]
+pub use pg::PgSink;

@@ -42,11 +42,13 @@ fn main() {
     let trust = pgb_core::TrustLevel::default_floor();
     let verdict = pgb_policy::StubRiskEngine.evaluate();
     let proto_ok = pgb_pgwire::ProtocolMode::Extended.is_allowed_for_agent();
-    let chain = pgb_audit::chain_link(0, b"pgb-proxy:boot");
+    // Exercise the audit seam: an empty hash chain's head is the defined
+    // genesis (the real FE/BE loop appends recorded statements in S1).
+    let audit_head = pgb_audit::AuditChain::new().head_hash();
     println!(
         "pgb-proxy: stub — inline read enforcement lands in S1 (see SPEC.md §3). \
          seams ready (budget_limit={}, charged={charged}, trust={trust:?}, \
-         verdict={verdict:?}, extended_only={proto_ok}, audit_head={chain:#x}).",
+         verdict={verdict:?}, extended_only={proto_ok}, audit_head={audit_head}).",
         budget.limit
     );
 }

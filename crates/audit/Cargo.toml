@@ -11,3 +11,30 @@ publish = false
 
 [lib]
 name = "pgb_audit"
+
+[features]
+# The Postgres `_meta` sink is behind a default-on feature so the pure chain +
+# in-memory sink can be built/tested without a DB client when desired. The
+# env-gated integration test (`PG_BUMPERS_IT=1`) needs this feature.
+default = ["pg"]
+pg = ["dep:postgres"]
+
+[dependencies]
+# Deterministic time at the seam (no wall-clock in tests). Merged S0 core.
+pgb-core = { path = "../core" }
+# Reference the policy crate's T0–T2 intent-capture shapes so the audit record
+# embeds the exact one-way-door types (SPEC §10.10, §11.2).
+pgb-policy = { path = "../policy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Cryptographic chain hash (MIT/Apache — keeps cargo-deny green).
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+# Synchronous Postgres client for the `_meta` sink (MIT/Apache). Matches the
+# fidelity-spike convention; the sink is small + linear so sync keeps it
+# readable and adds no tokio runtime to this crate.
+postgres = { version = "0.19", optional = true }
+
+[dev-dependencies]
+# (tests use the lib API + core::MockClock; DB tests are env-gated.)
