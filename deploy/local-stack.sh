@@ -242,13 +242,19 @@ END
 EOF
 
   # =====================================================================
-  # >>> HARDENED-ROLE INCLUDE POINT — issue #5 (do NOT duplicate here) <<<
+  # >>> HARDENED-ROLE INCLUDE POINT — issue #5 (the native-role WALL) <<<
   # The native-role WALL (hardened agent role, least-privilege GRANTs,
-  # role-hardening matrix, pg_hba network boundary; SPEC §3 layer 0-1)
-  # lands in #5. When it does, source its SQL here against the primary,
-  # e.g.:  "$PGBIN/psql" ... -f "$SCRIPT_DIR/init/10_hardened_role.sql"
-  # This script intentionally does the WAL/replication wiring only.
+  # role-hardening matrix; SPEC §3 layer 0-1) is applied here against the
+  # primary. The SQL is idempotent, so re-running `up` re-asserts the
+  # hardened state. The pg_hba network boundary (Layer 0) is a deploy-time
+  # concern (deploy/hba/) exercised by the dedicated matrix harness
+  # (deploy/test/wall_matrix.sh) — the dev primary keeps trust-local auth so
+  # the stack stays queryable; the boundary template/generator ship in
+  # deploy/hba/ and the harness proves the boundary on its own cluster.
   # =====================================================================
+  log "applying hardened-role WALL SQL (deploy/sql/10_hardened_role.sql)"
+  "$PGBIN/psql" -X -h "$LISTEN" -p "$PRIMARY_PORT" -U postgres -d postgres \
+    -v ON_ERROR_STOP=1 -q -f "$SCRIPT_DIR/sql/10_hardened_role.sql" >/dev/null
 
   # Minimal baseline marker table so the stack is queryable end-to-end and the
   # smoke harness has a deterministic row to replicate.

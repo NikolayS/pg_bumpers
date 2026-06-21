@@ -1,0 +1,53 @@
+# pg_bumpers — Layer 0 NETWORK BOUNDARY (pg_hba.conf rules), template.
+# =====================================================================================
+# Source of truth: docs/spec/SPEC.md (v0.8) §3 (layer 0, the mandatory network boundary),
+# §4 ("Network/roles — do FIRST"), §5 ("network-boundary: direct-to-DB by agent role is
+# refused"). decisions.md: "Mandatory network boundary — agent role reaches Postgres ONLY
+# via the proxy host (pg_hba + network) … direct-to-DB bypass otherwise defeats all
+# enforcement + audit." Issue #5.
+#
+# THE RULE: the agent role may connect ONLY from the proxy host. A direct-to-DB
+# connection by the agent role from ANY other origin is REJECTED at pg_hba — before
+# auth, before any query. Without this, an agent connects direct-to-DB and bypasses the
+# proxy's read-only/cost/byte/audit enforcement entirely (the proxy becomes meaningless).
+#
+# These rules are MORE SPECIFIC than (and therefore precede) any catch-all host rule for
+# the agent role. pg_hba.conf is FIRST-MATCH, top-to-bottom: the `reject` line below must
+# appear ABOVE any broader `host all all 0.0.0.0/0 …` line, or the broad line would let
+# the agent in from anywhere.
+#
+# Placeholders (substituted by deploy/hba/render-hba.sh, or edit by hand). The names
+# below are written without the @...@ markers so this doc block reads cleanly after
+# rendering; the live rule lines further down DO carry the markers and get substituted:
+#   AGENT_ROLE   the hardened agent role name              (default: pgb_agent)
+#   AGENT_DB     the database the agent is scoped to        (default: all)
+#   PROXY_CIDR   the proxy host's IP/CIDR — the ONLY origin (e.g. 10.0.0.5/32)
+#   AUTH         auth method for the agent from the proxy   (default: scram-sha-256)
+#
+# Local-test note: the harness (deploy/test/wall_matrix.sh) renders this with
+# PROXY_CIDR = ::1/128 and exercises the boundary by connecting as the agent from ::1
+# (the proxy-host stand-in -> ALLOWED) and from 127.0.0.1 (a non-proxy origin -> REJECTED).
+# ::1 vs 127.0.0.1 MODELS "proxy host vs elsewhere"; a real deployment substitutes the
+# proxy's real IP/CIDR for the PROXY_CIDR placeholder and rejects every other origin.
+# =====================================================================================
+
+# TYPE   DATABASE       USER            ADDRESS              METHOD
+
+# --- Layer 0: the agent role is permitted ONLY from the proxy host -------------------
+# (1) Allow the agent role from the proxy host's CIDR (the one legitimate origin).
+host     @AGENT_DB@     @AGENT_ROLE@    @PROXY_CIDR@         @AUTH@
+
+# (2) Default-deny the agent role from EVERYWHERE ELSE. These reject lines are the
+#     boundary: any direct-to-DB attempt by the agent from a non-proxy origin is refused
+#     at pg_hba (FATAL: pg_hba.conf rejects connection), regardless of credentials.
+host     @AGENT_DB@     @AGENT_ROLE@    0.0.0.0/0            reject
+host     @AGENT_DB@     @AGENT_ROLE@    ::0/0               reject
+# Also deny the agent over local Unix sockets and loopback (the proxy connects over TCP
+# from its own host; the agent must never reach the DB by any other path).
+local    @AGENT_DB@     @AGENT_ROLE@                         reject
+host     @AGENT_DB@     @AGENT_ROLE@    127.0.0.1/32         reject
+host     @AGENT_DB@     @AGENT_ROLE@    ::1/128              reject
+
+# NOTE: the (2) reject lines that overlap the proxy CIDR are unreachable because rule (1)
+# matches first (first-match wins). They are explicit so the default-deny intent is
+# self-documenting and survives someone reordering or widening rule (1).

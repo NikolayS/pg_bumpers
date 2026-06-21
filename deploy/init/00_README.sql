@@ -7,14 +7,24 @@
 -- Source of truth: docs/spec/SPEC.md (v0.8) §3 (WALL layers 0-1), §4 (_meta audit).
 --
 -- ===========================================================================
--- >>> HARDENED-ROLE INCLUDE POINT — issue #5 (do NOT duplicate here) <<<
+-- >>> HARDENED-ROLE INCLUDE POINT — issue #5 (the native-role WALL) <<<
 -- ===========================================================================
--- The native-role WALL (hardened agent role, least-privilege GRANTs, the
--- role-hardening test matrix, and the pg_hba network boundary) lands in
--- issue #5 (SPEC §3 layer 0-1). When #5 lands, its bootstrap SQL goes here as
--- e.g. deploy/init/10_hardened_role.sql and will be picked up automatically by
--- this same entrypoint mount. This file deliberately does NOT create that role
--- so the two issues don't collide on the WALL work.
+-- The native-role WALL (hardened agent role, least-privilege GRANTs, and the
+-- role-hardening matrix; SPEC §3 layer 1) is in this directory as
+-- deploy/init/10_hardened_role.sql and is picked up automatically by this
+-- entrypoint mount (files run alphabetically — this 00_ file runs first, then
+-- 10_hardened_role.sql). That file is a byte-for-byte SYNCED COPY of the
+-- canonical deploy/sql/10_hardened_role.sql (the docker entrypoint mounts only
+-- deploy/init/, so the WALL SQL is duplicated here; a symlink would dangle
+-- inside the container). deploy/sql/check-init-sync.sh guards against drift.
+--
+-- The Layer 0 pg_hba NETWORK BOUNDARY (agent role permitted only from the proxy
+-- host) is a deploy-time pg_hba concern, not an initdb-SQL concern. Its template
+-- + generator + network-policy companion live in deploy/hba/; the dedicated
+-- matrix harness deploy/test/wall_matrix.sh proves the boundary (agent from a
+-- non-proxy origin REJECTED, from the proxy host allowed) on its own throwaway
+-- cluster. The dev primary itself keeps trust-local auth so the stack stays
+-- queryable end-to-end.
 -- ===========================================================================
 
 -- Minimal, non-WALL baseline so a fresh `up` is queryable end-to-end.
