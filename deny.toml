@@ -17,6 +17,13 @@ all-features = true
 # is rejected, which makes `cargo deny check licenses` fail closed.
 allow = [
     "Apache-2.0",
+    # Apache-2.0 plus the LLVM exception — strictly MORE permissive than plain
+    # Apache-2.0 (it removes a linking/attribution restriction); it is the
+    # license of LLVM and the Rust toolchain itself, and is NOT copyleft. Pulled
+    # in transitively by `ar_archive_writer` (build-dep of `psm`/`stacker`),
+    # which provides sqlparser's recursive stack-overflow protection — a
+    # security control we keep for parsing hostile SQL (crates/pgwire #20).
+    "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",

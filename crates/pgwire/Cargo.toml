@@ -1,6 +1,6 @@
 [package]
 name = "pgb-pgwire"
-description = "pg_bumpers PostgreSQL wire-protocol helpers (extended-protocol-only enforcement seam)."
+description = "pg_bumpers PostgreSQL wire-protocol layer: clean-room FE/BE v3 codec (framing, startup/SCRAM auth, extended protocol), a simple-query/COPY rejection detector, and a fail-closed read-only classifier (sqlparser-rs)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,16 @@ publish = false
 
 [lib]
 name = "pgb_pgwire"
+
+[dependencies]
+# Async byte-level control of the FE/BE message loop (clean-room codec — no
+# pgwire crate; we need explicit byte framing for enforcement). tokio "io-util"
+# gives AsyncRead/AsyncWrite + read/write helpers; "macros"/"rt" for tests.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "net"] }
+bytes = "1"
+thiserror = "2"
+# Apache-2.0 SQL parser for the advisory, fail-closed read-only classifier.
+sqlparser = "0.62"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
