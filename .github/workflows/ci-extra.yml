@@ -30,6 +30,12 @@ jobs:
     name: Fuzz (codec + classifier, 60s/target)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Force nightly across the whole job: the repo rust-toolchain.toml pins
+    # 1.90.0, but RUSTUP_TOOLCHAIN overrides any rust-toolchain.toml so every
+    # cargo/rustc invocation here (incl. the build cargo-fuzz drives) uses
+    # nightly, which libFuzzer requires.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - name: Checkout
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -45,19 +51,22 @@ jobs:
           workspaces: fuzz
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # `+nightly` is required: the repo rust-toolchain.toml pins 1.90.0, which
+        # would otherwise override the default toolchain and fail cargo-fuzz's
+        # MSRV. cargo-fuzz / libFuzzer need nightly anyway.
+        run: cargo +nightly install cargo-fuzz --locked
 
       - name: Fuzz pgwire frontend decoder (60s, must never panic)
         working-directory: fuzz
-        run: cargo fuzz run frontend_decode -- -max_total_time=60
+        run: cargo +nightly fuzz run frontend_decode -- -max_total_time=60
 
       - name: Fuzz pgwire backend decoder (60s, must never panic)
         working-directory: fuzz
-        run: cargo fuzz run backend_decode -- -max_total_time=60
+        run: cargo +nightly fuzz run backend_decode -- -max_total_time=60
 
       - name: Fuzz read-only classifier (60s, never-panic + fail-closed invariant)
         working-directory: fuzz
-        run: cargo fuzz run classifier -- -max_total_time=60
+        run: cargo +nightly fuzz run classifier -- -max_total_time=60
 
       - name: Upload any crash reproducers
         if: failure()
