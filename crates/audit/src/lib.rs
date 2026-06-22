@@ -70,7 +70,7 @@ pub use secret::{LocalSecretStore, SecretError, SecretStore, AUDIT_SIGNING_KEY_I
 pub use sink::{InMemorySink, SharedSink, Sink, SinkError};
 
 #[cfg(feature = "pg")]
-pub use boot::{AuditBoot, BootError};
+pub use boot::{AnchorRole, AuditBoot, BootError};
 
 #[cfg(feature = "pg")]
-pub use pg::PgSink;
+pub use pg::{PgSink, AUDIT_CHAIN_LOCK_KEY};

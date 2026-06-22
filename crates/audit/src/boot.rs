@@ -105,6 +105,57 @@ pub enum BootError {
     Anchor(#[from] AnchorError),
 }
 
+/// Which role a booting binary plays over the **one shared, durable anchor**
+/// (S5 #76, item 3).
+///
+/// Proxy and applyd both boot over the SAME `_meta` chain and the SAME durable
+/// WORM anchor file + signing key. Exactly ONE of them must **own** the anchor
+/// (publish forward); the others must **verify-only** (still fail-closed on a
+/// tampered chain) but never anchor. Two uncoordinated anchorers over one chain
+/// is the bug this closes: each would pin a different head into the (now-shared)
+/// file at a different cadence, so a restart could fail-closed-deadlock against
+/// the *other's* head, or a fresh process could re-baseline a tampered chain by
+/// anchoring first.
+///
+/// Resolved from `PGB_ANCHOR_ROLE` (`owner` | `verify`); the proxy defaults to
+/// `owner`, applyd to `verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorRole {
+    /// This binary OWNS the anchor: it runs the verify-before-anchor boot
+    /// sequence ([`AuditBoot::verify_then_anchor`]) and the interval anchorer.
+    Owner,
+    /// This binary VERIFIES ONLY ([`AuditBoot::verify_only`]): it checks the
+    /// persisted chain against the owner's durable anchored head (fail-closed on a
+    /// mismatch) but NEVER anchors — so there is exactly one anchorer over the
+    /// shared chain.
+    Verify,
+}
+
+impl AnchorRole {
+    /// Parse `PGB_ANCHOR_ROLE` (case-insensitive `owner`|`verify`). `default` is
+    /// returned when the value is unset/empty (so each binary can pick its own
+    /// default — proxy `Owner`, applyd `Verify`). An unrecognized value is an
+    /// error (fail-closed: never silently guess the anchor topology).
+    pub fn parse(value: Option<&str>, default: AnchorRole) -> Result<AnchorRole, String> {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            None => Ok(default),
+            Some(v) if v.is_empty() => Ok(default),
+            Some(v) if v == "owner" => Ok(AnchorRole::Owner),
+            Some(v) if v == "verify" || v == "verifier" || v == "verify-only" => {
+                Ok(AnchorRole::Verify)
+            }
+            Some(other) => Err(format!(
+                "PGB_ANCHOR_ROLE must be `owner` or `verify`, got `{other}`"
+            )),
+        }
+    }
+
+    /// Whether this role anchors (only the owner does).
+    pub fn is_owner(self) -> bool {
+        matches!(self, AnchorRole::Owner)
+    }
+}
+
 /// The boot handle for the canonical, anchored `_meta` chain.
 ///
 /// Holds the [`SharedSink`] both consumers append to, the WORM anchor, and the
@@ -284,6 +335,42 @@ impl AuditBoot {
         self.anchorer
             .maybe_anchor_records(&records, now_monotonic_millis, &mut self.worm)?;
         Ok(())
+    }
+
+    /// The **verify-only** boot for a non-owner binary (S5 #76, item 3). It checks
+    /// the persisted `_meta` chain but NEVER anchors — so over the one shared chain
+    /// there is exactly ONE anchorer (the owner). Fail-closed:
+    ///
+    /// 1. within-chain integrity must hold (catches a mid-chain edit/delete);
+    /// 2. IF the durable WORM already holds the owner's anchored head, the chain's
+    ///    head MUST match it ([`BootError::AnchorHeadMismatch`] otherwise) — so a
+    ///    verify-only binary booting over a tampered chain REFUSES, and crucially
+    ///    cannot re-baseline it (it does not anchor);
+    /// 3. IF the durable WORM is still empty (the owner has not published the first
+    ///    baseline yet — a benign genesis race), there is nothing to verify
+    ///    against, so we pass on within-chain integrity alone WITHOUT anchoring. The
+    ///    owner establishes the baseline; this binary will verify against it on its
+    ///    next boot. (It never opens the re-baseline hole because it never anchors.)
+    pub fn verify_only(&mut self) -> Result<(), BootError> {
+        let records = self.sink.load_chain_mut()?;
+        crate::chain::verify_chain(&records).map_err(BootError::ChainIntegrity)?;
+        if self.worm.latest().is_some() {
+            self.assert_head_matches_durable_anchor(&records)?;
+        }
+        // else: no owner baseline yet — verify-only does NOT anchor (single owner).
+        Ok(())
+    }
+
+    /// Dispatch the correct boot sequence for `role` (S5 #76, item 3): the
+    /// [`AnchorRole::Owner`] runs [`verify_then_anchor`](AuditBoot::verify_then_anchor)
+    /// (verify-before-anchor + the interval anchorer), the [`AnchorRole::Verify`]
+    /// runs [`verify_only`](AuditBoot::verify_only) (fail-closed, never anchors).
+    /// `now_monotonic_millis` is the caller's `core::Clock::monotonic_millis`.
+    pub fn boot(&mut self, role: AnchorRole, now_monotonic_millis: u64) -> Result<(), BootError> {
+        match role {
+            AnchorRole::Owner => self.verify_then_anchor(now_monotonic_millis),
+            AnchorRole::Verify => self.verify_only(),
+        }
     }
 
     /// **Fail-closed startup verification** (SPEC §3/§10.9). Loads the persisted
@@ -590,5 +677,152 @@ mod tests {
             .maybe_anchor(clock.monotonic_millis())
             .unwrap()
             .is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    //  S5 #76 item 3 — SINGLE ANCHOR OWNER over the one shared chain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anchor_role_parse_defaults_and_values() {
+        // Unset / empty ⇒ the binary's default.
+        assert_eq!(
+            AnchorRole::parse(None, AnchorRole::Owner).unwrap(),
+            AnchorRole::Owner
+        );
+        assert_eq!(
+            AnchorRole::parse(Some(""), AnchorRole::Verify).unwrap(),
+            AnchorRole::Verify
+        );
+        // Explicit values (case-insensitive).
+        assert_eq!(
+            AnchorRole::parse(Some("owner"), AnchorRole::Verify).unwrap(),
+            AnchorRole::Owner
+        );
+        assert_eq!(
+            AnchorRole::parse(Some("VERIFY"), AnchorRole::Owner).unwrap(),
+            AnchorRole::Verify
+        );
+        // Unrecognized ⇒ fail-closed error (never silently guess the topology).
+        assert!(AnchorRole::parse(Some("both"), AnchorRole::Owner).is_err());
+        assert!(AnchorRole::Owner.is_owner());
+        assert!(!AnchorRole::Verify.is_owner());
+    }
+
+    /// A VERIFY-only boot over an empty durable WORM (the owner has not anchored
+    /// the baseline yet) passes on within-chain integrity alone and does NOT
+    /// anchor — so it never re-baselines, and there is only ONE anchorer (the
+    /// owner). RED before item 3: there was no verify-only path; the non-owner ran
+    /// `verify_then_anchor` and became a SECOND anchorer.
+    #[test]
+    fn verify_only_does_not_anchor_when_no_owner_baseline_exists() {
+        let mut boot = AuditBoot::with_sink(InMemorySink::new(), signer(), 1_000);
+        let mut a = boot.shared_sink();
+        a.append(entry("pgb_agent", "X", Decision::Allow, "ok"), 1)
+            .unwrap();
+
+        boot.boot(AnchorRole::Verify, 0)
+            .expect("verify-only boots clean over an un-anchored chain");
+        assert!(
+            boot.worm().latest().is_none(),
+            "verify-only MUST NOT anchor — there is exactly one anchorer (the owner)"
+        );
+    }
+
+    /// The coherent single-owner topology across a concurrent restart (DB-free):
+    /// the OWNER anchors the honest baseline to a DURABLE file; a VERIFY-only
+    /// binary booting over the SAME durable WORM but a tampered (offline-rewritten)
+    /// chain REFUSES — and, because it never anchors, it cannot re-baseline the
+    /// tampered chain. An honest verify-only boot over the untampered chain passes.
+    #[test]
+    fn verify_only_refuses_a_tampered_chain_and_never_rebaselines() {
+        let path = std::env::temp_dir().join(format!(
+            "pgb_boot_role_{}.worm",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // OWNER anchors the honest baseline to the durable file.
+        {
+            let mut honest = InMemorySink::new();
+            honest
+                .append(
+                    entry("pgb_agent", "UPDATE t SET x=1", Decision::Block, "ro"),
+                    1,
+                )
+                .unwrap();
+            let mut owner = AuditBoot::with_sink_and_worm(
+                honest,
+                signer(),
+                1_000,
+                WormAnchor::open_file(&path).unwrap(),
+            );
+            owner
+                .boot(AnchorRole::Owner, 0)
+                .expect("owner anchors the honest baseline");
+            assert!(WormAnchor::open_file(&path).unwrap().latest().is_some());
+        }
+
+        // VERIFY-only over a TAMPERED chain (BLOCK→ALLOW, re-linked) + the same
+        // durable WORM ⇒ head mismatch ⇒ REFUSE, and the WORM is untouched (no
+        // re-baseline).
+        {
+            let mut forged = InMemorySink::new();
+            forged
+                .append(
+                    entry("pgb_agent", "UPDATE t SET x=1", Decision::Allow, "ok"),
+                    1,
+                )
+                .unwrap();
+            crate::chain::verify_chain(&forged.load_chain().unwrap()).unwrap();
+            let mut verifier = AuditBoot::with_sink_and_worm(
+                forged,
+                signer(),
+                1_000,
+                WormAnchor::open_file(&path).unwrap(),
+            );
+            let before = WormAnchor::open_file(&path).unwrap().entries().len();
+            let err = verifier
+                .boot(AnchorRole::Verify, 0)
+                .expect_err("verify-only over a tampered chain must FAIL CLOSED");
+            assert!(
+                matches!(err, BootError::AnchorHeadMismatch { .. }),
+                "expected AnchorHeadMismatch, got {err:?}"
+            );
+            let after = WormAnchor::open_file(&path).unwrap().entries().len();
+            assert_eq!(
+                before, after,
+                "verify-only MUST NOT anchor (no re-baseline of a tampered chain)"
+            );
+        }
+
+        // VERIFY-only over the UNTAMPERED chain + same durable WORM ⇒ passes,
+        // still without anchoring.
+        {
+            let mut honest = InMemorySink::new();
+            honest
+                .append(
+                    entry("pgb_agent", "UPDATE t SET x=1", Decision::Block, "ro"),
+                    1,
+                )
+                .unwrap();
+            let mut verifier = AuditBoot::with_sink_and_worm(
+                honest,
+                signer(),
+                1_000,
+                WormAnchor::open_file(&path).unwrap(),
+            );
+            let before = WormAnchor::open_file(&path).unwrap().entries().len();
+            verifier
+                .boot(AnchorRole::Verify, 0)
+                .expect("verify-only over the honest chain passes");
+            let after = WormAnchor::open_file(&path).unwrap().entries().len();
+            assert_eq!(before, after, "verify-only still does not anchor");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

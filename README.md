@@ -3,7 +3,7 @@
 [![CI](https://github.com/NikolayS/pg_bumpers/actions/workflows/ci.yml/badge.svg)](https://github.com/NikolayS/pg_bumpers/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-3ddc97)
 ![spec](https://img.shields.io/badge/SPEC-v0.8%20·%20build--frozen-5b8cff)
-![status](https://img.shields.io/badge/build-S0·S1·S2%20merged%20·%20S3%20in%20progress-ffb454)
+![status](https://img.shields.io/badge/build-S0–S5%20merged%20·%20green%20on%20PG18-3ddc97)
 ![substrate](https://img.shields.io/badge/substrate-local%20Postgres%2018-336791)
 
 > **Working title** (brand TBD; nine-lives / *Felis* leads).
@@ -74,9 +74,9 @@ the live, fully-tested implementation.
 | **S0** | Skeleton · WALL (hardened role + network boundary) · core seams · contracts · fidelity gate | **merged · green on PG18** |
 | **S1** | pgwire termination · read enforcement (read-only / byte-row cutoff / `statement_timeout`) · audit · proxy | **merged · green on PG18** |
 | **S2** | Clone-orchestrator dry-run (blast-radius preview) · clone governance | **merged · green on PG18** |
-| **S3** | Guarded apply + typed-inverse (PITR fence · apply-time PK-set re-check · `RETURNING` written-set) | **in progress** ([#35](https://github.com/NikolayS/pg_bumpers/issues/35)) |
-| **S4** | Warden · MCP server · `policy.yaml` wiring · external audit anchor · deferred read gates · CLI approval | **upcoming** |
-| **S5** | Focused deterministic benchmark breadth + the marquee "delete a DB through the official MCP" end-to-end repro (per damage class, live stack) + `KNOWN_BYPASSES.md` | **in progress** ([#68](https://github.com/NikolayS/pg_bumpers/issues/68)) — run `deploy/marquee.sh`; evidence in `deploy/marquee.transcript.txt` |
+| **S3** | Guarded apply + typed-inverse (PITR fence · apply-time PK-set re-check · `RETURNING` written-set) | **merged · green on PG18** |
+| **S4** | Warden · MCP server · `policy.yaml` wiring · external audit anchor · deferred read gates · CLI approval | **merged · green on PG18** |
+| **S5** | `pgb-applyd` write-path daemon + live MCP `Core` over the grant-gated floor · ONE shared, persistent, anchored `_meta` chain (single owner) · runnable audited warden · benchmark breadth + the marquee "delete a DB through the official MCP" end-to-end repro + `KNOWN_BYPASSES.md` | **merged · green on PG18** — run `deploy/marquee.sh`; evidence in `deploy/marquee.transcript.txt` |
 | — | **LLM gating engine** (the risk model that tightens) | **fast-follow** |
 
 **Substrate:** live integration tests run against **local Postgres 18** (Homebrew
@@ -92,9 +92,9 @@ environment. `deploy/docker-compose.yml` is retained as the **shipped artifact**
 |---|-------|--------------|----------------|
 | **0** | **Network boundary** *(mandatory)* | Agent reaches Postgres **only via the proxy** — `pg_hba` permits the agent role **only from the proxy host**; every other origin is rejected. | `deploy/hba/`, `deploy/init/` |
 | **1** | **The WALL — native Postgres roles** *(unbypassable)* | Hardened least-priv role `pgb_agent` (NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant anywhere · SELECT-whitelist only); a hostile *raw* client physically can't write or read denied data. | `deploy/sql/10_hardened_role.sql`, `deploy/test/wall_matrix.sh` |
-| **2** | **Enforcement — Rust proxy + warden** | Extended-protocol-only, read-only gate, byte/row **mid-stream cutoff**, `statement_timeout`, hash-chained audit. Warden is the out-of-band watchdog (S4). | `crates/proxy`, `crates/pgwire`, `crates/audit`, `crates/warden` |
-| **3** | **Intent / UX — MCP server** *(agent-facing)* | What the agent talks to; executes *through* the proxy; recoverable blocks. **Skeleton today; tools land in S4.** | `mcp/server` |
-| **4** | **Write-safety — guarded apply (+ optional clone rehearsal)** *(the moat)* | Bounded + reversible writes; with a clone (DBLab), a zero-impact pre-flight preview. **Dry-run shipped (S2); guarded apply in progress (S3).** | `crates/clone-orchestrator`, `crates/core` |
+| **2** | **Enforcement — Rust proxy + warden** | Extended-protocol-only, read-only gate, byte/row **mid-stream cutoff**, `statement_timeout`, hash-chained audit. The warden is the runnable, audited out-of-band watchdog. Every gate verdict — incl. rejects and refused writes — lands on **one shared, persistent, anchored `_meta` chain** (a single anchor owner). | `crates/proxy`, `crates/pgwire`, `crates/audit`, `crates/warden` |
+| **3** | **Intent / UX — MCP server** *(agent-facing)* | What the agent talks to; reads execute *through* the proxy, writes through `pgb-applyd`; recoverable blocks. The `pgb-mcp` stdio shell speaks MCP and maps tool calls onto the Rust floor. | `mcp/server` (`pgb-mcp`) |
+| **4** | **Write-safety — guarded apply (+ optional clone rehearsal)** *(the moat)* | Bounded + reversible writes via the grant-gated apply floor; with a clone (DBLab), a zero-impact pre-flight preview. The `pgb-applyd` daemon owns the propose→dry_run→approve→apply lifecycle behind an owner-only Unix socket; refused proposals are audited. | `crates/applyd`, `crates/clone-orchestrator`, `crates/core` |
 
 A full architecture write-up is in [`docs/architecture.md`](docs/architecture.md).
 The authoritative references for *intent* remain
@@ -110,9 +110,10 @@ The authoritative references for *intent* remain
    *before* executing; fold rows / cascades / triggers / locks / WAL / the
    affected-PK set into a `BlastRadius` record, then roll back so **nothing is
    persisted** (`crates/clone-orchestrator/src/dry_run.rs`). **Shipped (S2).**
-3. **apply** — restore-point fence → PK-set/row-count guard (abort on drift) →
-   commit → typed-inverse captured. The drift-decision seam (`guard_decision`)
-   exists today; the full **guarded-apply engine is S3 (in progress)**.
+3. **apply** — under a signed, single-use, proposal-bound grant: restore-point
+   fence → apply-time PK-set re-check (abort on drift) → commit → typed-inverse
+   captured. The grant-gated apply floor (`guarded_apply_with_grant`) runs in
+   `crates/clone-orchestrator`, driven in production by the `pgb-applyd` daemon.
 
 > **Killer demo (the marquee):** `UPDATE accounts SET balance=0` (no `WHERE`) is
 > **rehearsed**, the affected-PK set is **measured**, and the operator sees the
@@ -153,23 +154,25 @@ and the docker-compose shipped artifact are documented in
 | Focused deterministic benchmark + bypass repro | |
 
 > In the MVP the `RiskEngine` is a **stub returning `Allow`** and intent tiers
-> T0–T2 are **captured/logged only** (SPEC §15.1). The CLI and MCP server are
-> **skeletons** wiring their core seams (single-use proposal-bound grant; block
-> contract); the live operator-approval and MCP-tool flows land in **S4**.
+> T0–T2 are **captured/logged only** (SPEC §15.1) — populated on both the read
+> and the write path, never consulted by a gate. The live operator-approval flow
+> (signed, single-use, proposal-bound grant) and the MCP-tool flow are **wired**;
+> the LLM gating engine is the disclosed fast-follow.
 
 ## Repository layout
 
 ```
 crates/
-  proxy/              # S1: inline read-only enforcement (agent-only endpoint); binary `pgb-proxy`
+  proxy/              # inline read-only enforcement (agent-only endpoint); binary `pgb-proxy` (audit anchor OWNER)
   pgwire/             # PostgreSQL wire-protocol helpers (extended-protocol-only)
-  audit/              # tamper-evident hash-chained audit (+ Postgres _meta sink)
+  audit/              # tamper-evident hash-chained audit (one shared, persistent, anchored `_meta` chain; single owner)
   core/               # domain types + one-way-door seams (BlastRadius, PK-checksum, inverse, clock, barrier)
   policy/             # policy.yaml model + RiskEngine seam (MVP stub: Allow) + grant/intent/verdict
-  clone-orchestrator/ # S2: propose/dry-run, blast-radius, PK-set guard seam; S3 guarded apply (in progress)
-  warden/             # out-of-band watchdog + circuit breaker (S4 — skeleton)
-  cli/                # operator approval flow (signed, single-use, proposal-bound grant — S4; seam today)
-mcp/server/           # MCP server (TypeScript) — agent-facing layer (S4; skeleton + block contract)
+  clone-orchestrator/ # propose/dry-run, blast-radius, grant-gated guarded apply + typed-inverse
+  applyd/             # write-path daemon owning propose→dry_run→approve→apply over the floor; binary `pgb-applyd` (owner-only Unix socket)
+  warden/             # runnable, audited out-of-band watchdog + circuit breaker
+  cli/                # operator approval flow + `pgb-cli verify` (load + verify the shared `_meta` chain + anchored head); binary `pgb-cli`
+mcp/server/           # MCP server (TypeScript) — agent-facing layer; `pgb-mcp` stdio shell over the Rust floor
 spikes/fidelity/      # S0 throwaway fidelity-spike harness (gate; publish=false)
 deploy/               # local-stack.sh (live substrate) + docker-compose (shipped artifact) + WALL SQL/hba
 proto/                # protocol/IDL definitions (added as protocols solidify)

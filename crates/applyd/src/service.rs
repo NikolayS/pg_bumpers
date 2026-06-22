@@ -143,7 +143,16 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
         clock: &dyn Clock,
     ) -> Result<ProposeResult, RpcError> {
         // Classify up front: refuse a non-certified shape (DDL/TRUNCATE/…) now.
-        let (kind, relation) = classify(sql).map_err(dry_run_error_to_rpc)?;
+        // S5 #76 item 1: a structural refusal (the "delete a DB"/DROP/TRUNCATE
+        // headline) must leave a verifiable BLOCK record on the shared `_meta`
+        // chain (SPEC §3/§10 "rejects recorded") — fail-closed.
+        let (kind, relation) = match classify(sql) {
+            Ok(kr) => kr,
+            Err(e) => {
+                let refusal = dry_run_error_to_rpc(e);
+                return Err(self.audit_refusal_then(sql, role, session_id, refusal, clock));
+            }
+        };
         let proposal = propose(sql, expected_rows, clock);
         let id = proposal.id.clone();
         let ttl = proposal.ttl_millis;
@@ -181,18 +190,48 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
             .ok_or_else(proposal_not_found)?;
         let proposal = record.proposal.clone();
         let relation = record.relation.clone();
+        // Captured up front so a dry_run REFUSAL can be audited with the proposal's
+        // own {statement, role, session} (S5 #76 item 1).
+        let statement = record.proposal.statement.clone();
+        let role = record.role.clone();
+        let session_id = record.session_id.clone();
 
-        // The real dry-run (refuses volatile / PK-less / non-rehearsable).
-        let blast_radius = dry_run(&proposal, rehearsal, clock).map_err(dry_run_error_to_rpc)?;
+        // The real dry-run (refuses volatile / PK-less / non-rehearsable). A
+        // refusal must leave a verifiable BLOCK record on the shared `_meta` chain
+        // (SPEC §3/§10 "rejects recorded") — fail-closed.
+        let blast_radius = match dry_run(&proposal, rehearsal, clock) {
+            Ok(br) => br,
+            Err(e) => {
+                let refusal = dry_run_error_to_rpc(e);
+                return Err(self.audit_refusal_then(
+                    &statement,
+                    &role,
+                    &session_id,
+                    refusal,
+                    clock,
+                ));
+            }
+        };
         let total_rows = blast_radius.affected.total_rows;
-        let pk_set_checksum = blast_radius
+        let pk_set_checksum = match blast_radius
             .affected
             .pk_set_checksum
             .get(&relation)
             .cloned()
-            .ok_or_else(|| {
-                ErrorCode::PkLess.error(format!("no pk_set_checksum for target `{relation}`"))
-            })?;
+        {
+            Some(c) => c,
+            None => {
+                let refusal =
+                    ErrorCode::PkLess.error(format!("no pk_set_checksum for target `{relation}`"));
+                return Err(self.audit_refusal_then(
+                    &statement,
+                    &role,
+                    &session_id,
+                    refusal,
+                    clock,
+                ));
+            }
+        };
         let reversible = blast_radius.reversible;
         let confirm_token = format!("ct-{proposal_id}-{total_rows}");
 
@@ -509,23 +548,95 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
         reason: Option<String>,
         clock: &dyn Clock,
     ) -> Result<(), pgb_audit::SinkError> {
+        self.audit_decision(
+            &live.statement_text,
+            &live.role,
+            &live.session_id,
+            Some(&live.proposal_id),
+            decision,
+            reason_code,
+            reason,
+            clock,
+        )
+    }
+
+    /// Append ONE decision record to the shared `_meta` chain, from the raw
+    /// `{statement, role, session}` in hand (no [`LiveRequest`] required). This is
+    /// the path the **structural/dry-run REFUSALS** use (S5 #76, item 1): a refused
+    /// `propose`/`dry_run` would otherwise leave ZERO audit trace, violating SPEC
+    /// §3/§10 "rejects recorded". It is the same fail-closed append the apply path
+    /// uses — the `Result` is surfaced, never swallowed.
+    ///
+    /// The write-path [`IntentTiers`] are POPULATED from the statement (S5 #76,
+    /// item 4): `IntentTiers::from_statement` derives T0 (role) + T1 (SQL class +
+    /// any `/* intent: … */` annotation). RiskEngine stays a stub = Allow per
+    /// §15.1 — this is capture/log only.
+    #[allow(clippy::too_many_arguments)]
+    fn audit_decision(
+        &mut self,
+        statement_text: &str,
+        role: &str,
+        session_id: &str,
+        proposal_id: Option<&str>,
+        decision: Decision,
+        reason_code: &str,
+        reason: Option<String>,
+        clock: &dyn Clock,
+    ) -> Result<(), pgb_audit::SinkError> {
         let entry = NewEntry {
-            statement_text: live.statement_text.clone(),
+            statement_text: statement_text.to_string(),
             decision,
             reason_code: reason_code.to_string(),
             reason,
             principal: AuditPrincipal {
-                role: live.role.clone(),
-                session_id: Some(live.session_id.clone()),
+                role: role.to_string(),
+                session_id: Some(session_id.to_string()),
                 principal: None,
             },
-            intent: IntentTiers::default(),
+            // S5 #76 item 4: populate the write-path intent tiers from the data in
+            // hand (was `IntentTiers::default()` — empty). `application_name` is the
+            // daemon ("applyd") since the write path has no session GUC to read.
+            intent: IntentTiers::from_statement(role, statement_text, Some("applyd".into())),
             write_safety: WriteSafetyRefs {
-                dry_run_id: Some(live.proposal_id.clone()),
+                dry_run_id: proposal_id.map(|s| s.to_string()),
                 blast_radius_ref: None,
             },
         };
         self.sink.append(entry, clock.now_unix_millis()).map(|_| ())
+    }
+
+    /// Audit a structural/dry-run REFUSAL, then return the appropriate error.
+    /// **Fail-closed (item 1):** if the audit append itself fails, the caller is
+    /// told the operation failed via `AUDIT_FAILED` rather than getting the
+    /// (now-unrecorded) refusal — no enforcement decision is silently lost. The
+    /// `_meta` append uses the cross-process-serialized path (item 2).
+    fn audit_refusal_then(
+        &mut self,
+        statement_text: &str,
+        role: &str,
+        session_id: &str,
+        refusal: RpcError,
+        clock: &dyn Clock,
+    ) -> RpcError {
+        // The refusal's own stable code is the reason_code we record.
+        let reason_code = refusal.data.code.clone();
+        let reason = Some(refusal.message.clone());
+        match self.audit_decision(
+            statement_text,
+            role,
+            session_id,
+            None,
+            Decision::Block,
+            &reason_code,
+            reason,
+            clock,
+        ) {
+            Ok(()) => refusal,
+            Err(e) => ErrorCode::AuditFailed.error(format!(
+                "a write proposal was refused ({reason_code}) but the refusal could not be \
+                 appended to the _meta chain: {e}"
+            )),
+        }
     }
 
     /// Read the audit tail (oldest-first), up to `limit` (most-recent window).

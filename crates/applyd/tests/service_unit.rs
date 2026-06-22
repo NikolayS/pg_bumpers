@@ -707,6 +707,87 @@ fn non_rehearsable_statement_is_refused_at_propose() {
     assert_eq!(err.data.code, ErrorCode::NotRehearsable.as_str());
 }
 
+// ===========================================================================
+//  (S5 #76, item 1) STRUCTURAL/DRY-RUN REFUSALS ARE AUDITED. A refused propose
+//  (e.g. the "delete a DB"/TRUNCATE headline) and a dry_run refusal must each
+//  leave a verifiable BLOCK record on the SHARED `_meta` chain — SPEC §3/§10
+//  "rejects recorded". Before this fix they left ZERO audit trace.
+// ===========================================================================
+
+#[test]
+fn refused_propose_leaves_a_verifiable_meta_block_record() {
+    let (_sk, vk) = keypair();
+    let clock = MockClock::starting_at(5_000);
+    let mut svc = service(vk);
+
+    // The "delete a DB"/TRUNCATE structural refusal headline.
+    let stmt = "TRUNCATE public.accounts";
+    let err = svc
+        .propose(stmt, None, "app_writer", "sess-a", &clock)
+        .unwrap_err();
+    assert_eq!(err.data.code, ErrorCode::NotRehearsable.as_str());
+
+    // The refusal is AUDITED: a BLOCK record carrying the reason_code + the
+    // verbatim statement now exists on the shared chain.
+    let records = svc.audit_records(50);
+    let refusal = records
+        .iter()
+        .find(|r| r.payload.decision == pgb_audit::Decision::Block)
+        .expect("a refused propose must append a BLOCK record to _meta (item 1)");
+    assert_eq!(
+        refusal.payload.reason_code,
+        ErrorCode::NotRehearsable.as_str(),
+        "the refusal reason_code is recorded"
+    );
+    assert!(
+        refusal.payload.statement_text.contains("TRUNCATE"),
+        "the refused statement is captured verbatim: {:?}",
+        refusal.payload.statement_text
+    );
+    assert_eq!(
+        refusal.payload.principal.role, "app_writer",
+        "the principal is recorded"
+    );
+    pgb_audit::verify_chain(&records).expect("the chain with the refusal record verifies");
+}
+
+#[test]
+fn refused_dry_run_leaves_a_verifiable_meta_block_record() {
+    let (_sk, vk) = keypair();
+    let clock = MockClock::starting_at(5_000);
+    let mut svc = service(vk);
+
+    // A well-formed UPDATE proposes fine, but dry_run refuses a VOLATILE
+    // predicate (now()) — fail-closed. That refusal must be audited too.
+    let stmt = "UPDATE public.accounts SET balance = 0 WHERE owner < now()::text";
+    let proposed = svc
+        .propose(stmt, Some(1), "app_writer", "sess-a", &clock)
+        .expect("propose accepts the shape; volatility is caught at dry_run");
+
+    // `now()` is caught as a nondeterministic keyword by the AST-walk BEFORE any
+    // DB rehearsal, so a plain MockRehearsal suffices — dry_run refuses.
+    let mut rehearsal = MockRehearsal::new(REL, IDS);
+    let err = svc
+        .dry_run(&proposed.proposal_id, &mut rehearsal, &clock)
+        .unwrap_err();
+    assert_eq!(err.data.code, ErrorCode::Volatile.as_str());
+
+    let records = svc.audit_records(50);
+    let refusal = records
+        .iter()
+        .find(|r| {
+            r.payload.decision == pgb_audit::Decision::Block
+                && r.payload.reason_code == ErrorCode::Volatile.as_str()
+        })
+        .expect("a refused dry_run must append a BLOCK record to _meta (item 1)");
+    assert!(
+        refusal.payload.statement_text.contains("now()"),
+        "the refused statement is captured: {:?}",
+        refusal.payload.statement_text
+    );
+    pgb_audit::verify_chain(&records).expect("the chain with the dry_run refusal verifies");
+}
+
 #[test]
 fn full_lifecycle_is_audited_to_the_shared_chain() {
     let (sk, vk) = keypair();
@@ -736,6 +817,65 @@ fn full_lifecycle_is_audited_to_the_shared_chain() {
     assert!(codes.contains(&"apply_committed"), "{codes:?}");
     // The chain verifies within-chain (one shared genesis).
     pgb_audit::verify_chain(&records).expect("the lifecycle chain verifies");
+}
+
+// ===========================================================================
+//  (S5 #76, item 4) WRITE-PATH INTENT TIERS ARE POPULATED. The apply-committed
+//  `_meta` record must carry NON-EMPTY T0–T2 intent (was IntentTiers::default()
+//  — empty). RiskEngine stays a stub=Allow per §15.1; this is capture/log only.
+// ===========================================================================
+
+#[test]
+fn apply_committed_meta_record_carries_populated_intent_tiers() {
+    let (sk, vk) = keypair();
+    let clock = MockClock::starting_at(5_000);
+    let mut svc = service(vk);
+    // Annotate the statement so T1 also captures the intent annotation.
+    let annotated = "/* intent: zero even balances ticket: OPS-9 actor: claude */ \
+                     UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let a = approve_through(&mut svc, &sk, &clock, annotated, "sess-intent", "nonce-it");
+    let mut conn = MockConn::new(REL, IDS);
+    run_apply(
+        &mut svc,
+        &a.proposal_id,
+        a.total_rows,
+        Some(&a.confirm_token),
+        &mut conn,
+        &NoopBarrier::new(),
+        &clock,
+    )
+    .expect("apply commits");
+
+    let records = svc.audit_records(50);
+    let committed = records
+        .iter()
+        .find(|r| r.payload.reason_code == "apply_committed")
+        .expect("apply_committed record exists");
+    let intent = &committed.payload.intent;
+    // T0: the role is captured (NOT empty).
+    assert_eq!(intent.t0.role, "app_writer", "T0 role populated");
+    // T1: the SQL class + verbatim statement + the parsed annotation.
+    assert_eq!(
+        intent.t1.statement_class.as_deref(),
+        Some("UPDATE"),
+        "T1 statement_class populated"
+    );
+    assert!(
+        intent.t1.statement_text.contains("UPDATE public.accounts"),
+        "T1 statement_text populated"
+    );
+    assert_eq!(
+        intent.t1.annotation.intent.as_deref(),
+        Some("zero even balances"),
+        "T1 intent annotation parsed"
+    );
+    assert_eq!(intent.t1.annotation.ticket.as_deref(), Some("OPS-9"));
+    // The whole record must NOT be the empty default.
+    assert_ne!(
+        *intent,
+        pgb_policy::IntentTiers::default(),
+        "the write-path intent must NOT be the empty default (item 4)"
+    );
 }
 
 // ===========================================================================
