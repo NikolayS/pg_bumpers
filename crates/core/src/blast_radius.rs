@@ -17,6 +17,47 @@ use serde::{Deserialize, Serialize};
 
 use crate::inverse::InverseKind;
 
+/// One relation's per-op-type in-txn change footprint, measured from the
+/// `pg_stat_xact_n_tup_{ins,upd,del}` deltas (SPEC §4).
+///
+/// The guarded apply reconciles its own deltas against this **per op-type**, not
+/// against a collapsed total: a relation the dry-run predicted to only `ins` that
+/// the apply sees `del`/`upd` is the **data-loss direction** and must abort —
+/// even when the *total* matches (an INSERT-of-N prediction satisfied by a DELETE
+/// of N pre-existing rows). Collapsing to a single total discards op-type and is
+/// the exact catastrophic false-negative this struct exists to close.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpCounts {
+    /// Rows inserted in the relation within the txn (`pg_stat_xact_n_tup_ins`).
+    #[serde(default)]
+    pub ins: u64,
+    /// Rows updated in the relation within the txn (`pg_stat_xact_n_tup_upd`).
+    #[serde(default)]
+    pub upd: u64,
+    /// Rows deleted in the relation within the txn (`pg_stat_xact_n_tup_del`).
+    #[serde(default)]
+    pub del: u64,
+}
+
+impl OpCounts {
+    /// Construct from the three op-type counts.
+    pub const fn new(ins: u64, upd: u64, del: u64) -> Self {
+        OpCounts { ins, upd, del }
+    }
+
+    /// Total tuples changed across all op types (`ins + upd + del`) — a display /
+    /// cross-check helper. The **guard does not use this**: reconciliation is
+    /// per-op-type so an op-type substitution (same total, different op) aborts.
+    pub fn total(&self) -> u64 {
+        self.ins.saturating_add(self.upd).saturating_add(self.del)
+    }
+
+    /// Whether this footprint records no change at all.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 /// The set of rows a proposed write would affect (SPEC §10.1 `affected`).
 ///
 /// `by_table` and `cascade_by_table` are keyed by `schema.table` and use a
@@ -31,6 +72,24 @@ pub struct Affected {
     pub cascade_by_table: BTreeMap<String, u64>,
     /// Per-table affected-PK-set checksum (`"sha256:…"`); see SPEC §10.2.
     pub pk_set_checksum: BTreeMap<String, String>,
+    /// The **full** per-relation, **per-op-type** in-txn change footprint the
+    /// dry-run measured via `pg_stat_xact_n_tup_{ins,upd,del}` deltas (SPEC §4) —
+    /// the target, every cascade child, **and every relation a fired trigger wrote
+    /// to** (e.g. an audit table). This is the symmetric prediction the guarded
+    /// apply reconciles its own `pg_stat_xact_*` deltas against, **per op channel**
+    /// ([`OpCounts`]): a write to a relation **not** in this map, **more** changes
+    /// of any op type than recorded here, or **any** op type the prediction did not
+    /// have (e.g. a `del` on an `ins`-only relation), is drift and aborts. It is the
+    /// apply-time "0 catastrophic data-loss FN by construction" mechanism — and it
+    /// is op-type-aware so an INSERT-of-N prediction can NOT be silently satisfied
+    /// by a DELETE of N pre-existing rows (same total, opposite, destructive op).
+    ///
+    /// `#[serde(default)]` keeps the §10.1 wire contract backward-compatible: an
+    /// older record without this field deserializes to an empty map (a guarded
+    /// apply then has no predicted footprint to reconcile and must refuse — a
+    /// stale grant cannot authorize a write, fail-closed).
+    #[serde(default)]
+    pub effect_by_table: BTreeMap<String, OpCounts>,
     /// Total rows affected across target + cascade.
     pub total_rows: u64,
 }
@@ -235,6 +294,7 @@ mod tests {
             "by_table",
             "cascade_by_table",
             "pk_set_checksum",
+            "effect_by_table",
             "total_rows",
         ] {
             assert!(
@@ -242,6 +302,69 @@ mod tests {
                 "missing affected.{key} spec field"
             );
         }
+    }
+
+    /// The new `effect_by_table` field is backward-compatible: an older §10.1
+    /// record without it deserializes to an empty map (and a guarded apply then
+    /// refuses the stale grant, fail-closed).
+    #[test]
+    fn effect_by_table_defaults_to_empty_for_a_legacy_record() {
+        let br: BlastRadius = serde_json::from_str(SAMPLE_JSON).expect("sample must parse");
+        assert!(
+            br.affected.effect_by_table.is_empty(),
+            "a record without effect_by_table deserializes to an empty footprint"
+        );
+    }
+
+    /// `effect_by_table` carries the per-op-type counts ([`OpCounts`]) and
+    /// round-trips through serde. This is what lets the guarded apply reconcile each
+    /// op channel independently (and so refuse an op-type substitution).
+    #[test]
+    fn effect_by_table_carries_per_op_type_counts_and_round_trips() {
+        const J: &str = r#"{
+            "proposal_id": "p-op",
+            "clone_lsn": "0/0",
+            "staleness_lsn_bytes": 0,
+            "affected": {
+                "by_table": { "public.accounts": 4 },
+                "cascade_by_table": {},
+                "pk_set_checksum": { "public.accounts": "sha256:x" },
+                "effect_by_table": {
+                    "public.accounts": { "ins": 0, "upd": 4, "del": 0 },
+                    "public.account_audit": { "ins": 4, "upd": 0, "del": 0 }
+                },
+                "total_rows": 4
+            },
+            "triggers_fired": [],
+            "locks": [],
+            "max_lock_mode": "RowExclusiveLock",
+            "duration_ms": 1,
+            "wal_bytes": 0,
+            "constraint_violations": [],
+            "reversible": true,
+            "inverse_kind": "PREIMAGE_UPSERT",
+            "predicate_volatile": false
+        }"#;
+        let br: BlastRadius = serde_json::from_str(J).expect("per-op record must parse");
+        let audit = br.affected.effect_by_table["public.account_audit"];
+        assert_eq!(audit.ins, 4);
+        assert_eq!(audit.del, 0);
+        assert_eq!(audit.total(), 4);
+        let acct = br.affected.effect_by_table["public.accounts"];
+        assert_eq!(acct.upd, 4);
+        // Round-trips without loss.
+        let s = serde_json::to_string(&br).expect("serialize");
+        let back: BlastRadius = serde_json::from_str(&s).expect("re-parse");
+        assert_eq!(br, back);
+    }
+
+    /// A partial `OpCounts` (some op fields omitted) defaults the missing channels
+    /// to 0 — fail-closed, never inferring a write that was not measured.
+    #[test]
+    fn op_counts_missing_channels_default_to_zero() {
+        let c: OpCounts = serde_json::from_str(r#"{ "del": 3 }"#).expect("partial OpCounts");
+        assert_eq!(c, OpCounts::new(0, 0, 3));
+        assert_eq!(c.total(), 3);
     }
 
     #[test]

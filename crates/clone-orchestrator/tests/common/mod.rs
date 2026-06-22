@@ -30,9 +30,11 @@ pub mod cluster;
 
 use std::collections::BTreeMap;
 
-use pgb_clone_orchestrator::dry_run::{AffectedTable, Measurement, Rehearsal, WriteKind};
+use pgb_clone_orchestrator::dry_run::{
+    AffectedTable, Measurement, Rehearsal, RelationEffect, WriteKind,
+};
 use pgb_clone_orchestrator::Volatility;
-use pgb_core::blast_radius::ConstraintViolation;
+use pgb_core::blast_radius::{ConstraintViolation, OpCounts};
 use pgb_core::{Clock, LockHeld, LockMode, PkSetBuilder, PkTuple, PkValue, TriggerFired};
 use postgres::types::Type;
 use postgres::{Client, NoTls, Row, Transaction};
@@ -258,6 +260,11 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
 
         let mut txn = self.client.transaction().map_err(|e| e.to_string())?;
 
+        // (pg_stat_xact baseline) — it accumulates across the session (does NOT
+        // reset on txn start), so the forward op's full footprint is the DELTA
+        // against this baseline. Capture it before any forward execution.
+        let xact_baseline = xact_raw(&mut txn)?;
+
         // (PK columns) — refuse PK-less targets with checksum = None (no ctid).
         let pk_cols = pk_columns(&mut txn, target_relation)?;
 
@@ -283,6 +290,13 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
         // (Locks held on the target — they are held until ROLLBACK; §12.)
         let locks = locks_on(&mut txn, target_relation)?;
 
+        // (FULL per-relation change footprint via pg_stat_xact_* — the symmetric
+        //  measure the guarded apply reconciles against. Captures the target,
+        //  cascade children, AND every relation a fired trigger wrote to, e.g. an
+        //  audit table. SPEC §4. Computed as the DELTA against the baseline taken at
+        //  txn start so prior-session writes (the seed) don't leak in.)
+        let full_effect = xact_full_effect(&mut txn, &xact_baseline)?;
+
         let triggers_fired = triggers_fired_names
             .into_iter()
             .map(|name| TriggerFired {
@@ -297,6 +311,7 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
         Ok(Measurement {
             target,
             cascades,
+            full_effect,
             triggers_fired,
             locks,
             duration_ms,
@@ -577,6 +592,59 @@ fn locks_on(txn: &mut Transaction, relation: &str) -> Result<Vec<LockHeld>, Stri
             });
         }
     }
+    Ok(out)
+}
+
+/// Raw per-relation `(n_tup_ins, n_tup_upd, n_tup_del)` from
+/// `pg_stat_xact_user_tables` (cumulative within the session). Keyed by
+/// `schema.table`. The three op channels are kept SEPARATE so the dry-run records a
+/// per-op-type footprint (an INSERT footprint must not be conflated with a DELETE).
+fn xact_raw(txn: &mut Transaction) -> Result<BTreeMap<String, (i64, i64, i64)>, String> {
+    let rows = txn
+        .query(
+            "SELECT schemaname || '.' || relname AS rel, \
+                    n_tup_ins, n_tup_upd, n_tup_del \
+             FROM pg_stat_xact_user_tables",
+            &[],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, String>(0),
+                (r.get::<_, i64>(1), r.get::<_, i64>(2), r.get::<_, i64>(3)),
+            )
+        })
+        .collect())
+}
+
+/// The FULL per-relation, **per-op-type** in-txn change footprint, from
+/// `pg_stat_xact_user_tables` as the DELTA against `baseline` (SPEC §4). One entry
+/// per user relation the rehearsal's forward op changed — target, cascade children,
+/// AND trigger-written tables (e.g. an audit table) — each with its `ins`/`upd`/
+/// `del` counts. The delta cancels prior-session writes (the seed) that also sit in
+/// the cumulative counter. This is the dry-run side of the symmetric measurement the
+/// guarded apply reconciles against per op channel.
+fn xact_full_effect(
+    txn: &mut Transaction,
+    baseline: &BTreeMap<String, (i64, i64, i64)>,
+) -> Result<Vec<RelationEffect>, String> {
+    let after = xact_raw(txn)?;
+    let mut out = Vec::new();
+    for (rel, (ins, upd, del)) in &after {
+        let (b_ins, b_upd, b_del) = baseline.get(rel).copied().unwrap_or((0, 0, 0));
+        let d_ins = (ins - b_ins).max(0) as u64;
+        let d_upd = (upd - b_upd).max(0) as u64;
+        let d_del = (del - b_del).max(0) as u64;
+        if d_ins + d_upd + d_del > 0 {
+            out.push(RelationEffect {
+                relation: rel.clone(),
+                counts: OpCounts::new(d_ins, d_upd, d_del),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.relation.cmp(&b.relation));
     Ok(out)
 }
 
