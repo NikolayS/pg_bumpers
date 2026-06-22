@@ -28,7 +28,10 @@
 //!   / [`Killer`](poller::Killer) seams.
 //!
 //! ## Recovery runbook (SPEC §10.9, breaker recovery)
-//! When the breaker is **Open**, the proxy sheds agent traffic. After
+//! When the breaker is **Open**, the proxy is *intended* to shed agent traffic
+//! (the proxy-side wiring that consumes this breaker state is **deferred** —
+//! #52 authorized the deferral; the breaker is a warden-side state machine only
+//! in S4, see `docs/spec/SPEC.amendments.md` §S4). After
 //! `breaker_cooldown_millis` the warden moves it to **HalfOpen** and probes
 //! recovery; a healthy probe **Closes** it, a failed one re-**Opens** it with a
 //! fresh cooldown. Only the warden principal (holding the unforgeable

@@ -206,7 +206,11 @@ impl<S: ActivitySource, K: Killer> WardenLoop<S, K> {
     /// (SPEC §4 "interval mockable for tests").
     ///
     /// Requires a [`MockClock`](pgb_core::MockClock) handle so the loop can
-    /// advance it; production uses [`run_with_sleep`](Self::run_with_sleep).
+    /// advance it. The production driver that advances a real
+    /// [`SystemClock`](pgb_core::SystemClock) on a wall-clock cadence (a
+    /// `run_with_sleep`-style loop) is **not implemented yet** — the warden
+    /// binary does not run a live loop in S4 (deferred to S5, #65; see
+    /// `docs/spec/SPEC.amendments.md` §S4).
     pub fn run_ticks(&mut self, clock: &pgb_core::MockClock, n: usize) -> Vec<TickOutcome> {
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
