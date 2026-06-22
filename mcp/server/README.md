@@ -61,6 +61,21 @@ minimal MCP toolset and executes everything **through the proxy**.
   at this layer; unit tests use in-memory `FakeProxyTransport` / `FakeCore`
   (`src/testing/fakes.ts`).
 
+## Not yet wired (S4 — deferred to S5)
+
+This crate ships the §11 toolset, the block contract, and the RiskEngine seam,
+all individually tested, but it is **not a deployable, end-to-end server yet**:
+
+- **No JSON-RPC/stdio entrypoint.** There is no runnable MCP wire process; the
+  `McpServer` surface is exercised by tests, not served over a transport.
+- **No production `Core`.** The write path (`propose_write → dry_run →
+  apply_write`) terminates in the **test `FakeCore`** (`src/testing/fakes.ts`).
+  No live `Core` drives the real Rust `propose → dry_run → guarded_apply` path,
+  so a write through this server does **not** reach a real database apply.
+- The full **MCP → proxy → `guarded_apply`** wiring (a real JSON-RPC/stdio shell
+  + a production `Core`) is tracked for **S5** (#63). See
+  `docs/spec/SPEC.amendments.md` §S4 for the full disclosure.
+
 ## Develop
 
 ```sh

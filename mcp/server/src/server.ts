@@ -2,10 +2,19 @@
  * The minimal MCP server — the §4/§11 toolset, executing THROUGH the proxy.
  *
  * SPEC §3: layer 3 (MCP) is **cooperative, NOT a security boundary**. This
- * server adds no privilege: every read goes through `ProxyTransport` (proxy +
- * warden + WALL = the real boundary) and every write goes through `Core`'s
- * propose→dry_run→apply path. It is **stateless** — proposal/ticket/audit state
- * lives in Core (TTL'd), never in this process.
+ * server adds no privilege. The **intended** design is: every read goes through
+ * `ProxyTransport` (proxy + warden + WALL = the real boundary) and every write
+ * goes through `Core`'s propose→dry_run→apply path. It is **stateless** —
+ * proposal/ticket/audit state lives in Core (TTL'd), never in this process.
+ *
+ * Status (S4 — not yet wired end-to-end): this module ships the §11 toolset, the
+ * block contract, and the RiskEngine seam, but there is **no deployable
+ * JSON-RPC/stdio entrypoint** and it is **not yet wired to a production `Core`**
+ * — in the shipped tests the write path terminates in the test `FakeCore`
+ * (`src/testing/fakes.ts`), not a live Core driving the real
+ * propose→dry_run→`guarded_apply` path. The full MCP→proxy→`guarded_apply`
+ * wiring is **deferred to S5** (#63); see README ("Not yet wired") and
+ * `docs/spec/SPEC.amendments.md` §S4.
  *
  * Invariants this file upholds:
  *   - Every denial returns the block contract {status,code,reason,remedy,

@@ -292,3 +292,120 @@ deferred under **#48** for S4. A future N-level capture seam can supply the deep
 pre-images via `cascade_preimages`, at which point the same step-8 coverage check passes
 and the apply commits (proven by
 `apply::tests::multilevel_grandchild_with_captured_preimages_commits`).
+
+---
+
+## S4 components — each shipped and individually proven; the END-TO-END running system is NOT wired yet (deferred-and-now-disclosed)
+
+**SPEC sections touched:** §3 (layer 2 warden + the authenticated breaker), §4 / §11
+(the MCP toolset + the propose→dry_run→apply path), §10.9 (warden↔proxy mTLS / breaker
+state), §14.3 (the signed proposal-bound grant), §4 (`_meta` audit DB + the external
+anchor / KMS key separation). Build target: §7 S4.
+
+**Issues:** #51 (S4 EPIC, the source of this disclosure), #62 (this disclosure-honesty
+PR). Carry-forwards into S5: #65 (runnable+audited warden), #66 (production apply path +
+§14.3 grant consumption), #64 (unify+persist+anchor the audit chain), #45 (production
+generic-schema `ApplyConn`), #52 (warden / breaker, CLOSED — proxy-side breaker wiring
+deferral authorized there), #26 (wire `PgSink` `_meta` into the proxy — an S1 follow-up,
+now also an S4 carry), #18 (S0/S3 carry-forwards). The S5 assembly EPIC is #63.
+
+### Deviation
+
+S4 **built every deterministic-floor component the sprint called for, and proved each one
+individually** (unit + env-gated real-PG18 integration, plus the CLI's in-process grant
+demo). What S4 did **not** do is **join those components into one running system**: the
+seams that connect agent → MCP → proxy → `guarded_apply` → audit, and warden → proxy
+(breaker), **do not exist yet**. The components are real and tested; the wiring is S5
+(#63). Concretely:
+
+1. **Warden — logic + env-gated test seams shipped; the binary does NOT run a live
+   loop.** `pgb_warden` (poller / breaker / thresholds / targeting) is exhaustively unit-
+   tested on a `MockClock`, and a real `PgActivitySource` / `PgKiller` is proven against
+   PG18 in the env-gated integration test (`crates/warden/tests/warden_it.rs`). But the
+   shipped binary's `main()` only **prints and validates** the threshold config (fail-
+   closed on a bad config); it does **not** poll. The `postgres` client is a
+   **dev-dependency** (`crates/warden/Cargo.toml`), so the binary cannot even open a
+   backend connection. The live watchdog (`main()` driving a `WardenLoop` over
+   `PgActivitySource` / `PgKiller` on a `SystemClock` cadence) is **deferred to S5**
+   (#65). Tracking: #18 (carry-forwards) and #65 (the filed S5 warden-wiring issue).
+
+2. **Circuit breaker — a warden-side state machine only; NOT consumed by the proxy.**
+   `pgb_warden::CircuitBreaker` is a real, clock-driven, non-forgeable state machine
+   (Closed → Open → HalfOpen), with the §10.9 authentication modelled at the type level
+   (`WardenCredential`, no public constructor / no `Deserialize`). Its state correctness
+   and forgery-resistance are tested. But **no running proxy reads this state** to
+   actually shed traffic — the `Open`/`Closed` "traffic shed/flows" semantics are the
+   *intended* proxy-side effect, and that wiring is **deferred** (authorized in **#52**).
+
+3. **MCP server — §11 toolset + block contract + RiskEngine seam shipped; NO deployable
+   wire, NO live `Core`.** `mcp/server` ships the exactly-nine §11 tools, the block
+   contract on every denial, the `confirm_rows` forcing function, the
+   result-data-can-never-widen-capability defense, and the RiskEngine seam (the MVP
+   `AllowStub`, T0–T2 captured/logged). But there is **no deployable JSON-RPC/stdio
+   entrypoint** (the `McpServer` surface is driven by tests, not served over a transport),
+   and it is **not wired to a production `Core`** — in the shipped tests the write path
+   terminates in the test **`FakeCore`** (`src/testing/fakes.ts`), not a live Core driving
+   the real propose→dry_run→`guarded_apply` path. The full **MCP → proxy →
+   `guarded_apply`** wiring is **deferred to S5** (#63; the live `Core` is part of the
+   #66 apply-path work).
+
+4. **§14.3 signed grant — minted & verified end-to-end ONLY in the CLI's in-process
+   demo.** `pgb_policy::GrantToken` (Ed25519, binding hash over the §14.3 fields, single-
+   use nonce, expiry, `verify_for_apply` re-verify-at-apply) is real and tested, and the
+   CLI approval flow (`pgb_cli::flow`) mints a grant and calls `verify_for_apply` in
+   process. But **no production apply path consumes it**: `guarded_apply`
+   (`crates/clone-orchestrator`) has no caller that threads a `GrantToken` through, and
+   the proxy never calls `verify_for_apply`. Binding the signed grant into the production
+   apply path is **deferred to S5** (#66) and is **blocked on the generic-schema
+   `ApplyConn`** (#45). Until then the approval ceremony is proven as a mechanism, not as
+   an end-to-end production gate (the "approval-theater" gap the S5 work closes).
+
+5. **Audit `_meta` `PgSink` + external WORM anchor + KMS — library-only; the running
+   proxy still uses an in-memory chain.** `pgb_audit` ships the `PgSink` (`_meta`
+   persistence), the external WORM/transparency anchor, the KMS key-separation seam
+   (`Kms` trait — the audited principal cannot materialize the signing key), and the
+   secret-store seam — each tested at the library level. But the **shipped proxy binary
+   still records to the in-memory hash chain** (`InMemorySink`,
+   `crates/proxy/src/main.rs`); the persistent, anchored `_meta` chain is **not** injected
+   into the running proxy (or shared with the CLI). This is the open **S1 follow-up #26**,
+   now also an **S4 carry**; unifying + persisting + anchoring one chain across proxy/CLI
+   is **deferred to S5** (#64).
+
+### Rationale
+
+S4 deliberately built and **independently proved** each deterministic-floor component
+before spending effort on the cross-component wiring, so that S5 assembles known-good
+parts rather than debugging logic and wiring at once. The safety *properties* each
+component enforces are real and tested in isolation; what is **not** yet true is any
+claim that they enforce those properties **as one running system** on a live agent→DB
+write path. The honest posture is: the floor's **bricks** are built and load-tested; the
+**mortar** joining them into a single guarded path is S5 work (#63). This record exists
+because several modules asserted present-tense behavior (a live warden loop, the proxy
+consuming the breaker, every MCP write going through a real Core, the proxy calling
+`verify_for_apply`, the proxy persisting to `_meta`) that the **binaries do not perform**.
+
+### What this amendment changed (doc/comment-only; zero behavior change — #62)
+
+To make the in-tree record match reality, the following **doc-comments / banners /
+header comments** were corrected from affirmative present tense to honest intended/future
+tense, each pointing here and at the tracking issue. **No runtime logic was touched.**
+
+- `crates/warden/src/main.rs` — the module doc + the runtime banner no longer claim a
+  "Live ActivitySource/Killer wired at start-up"; they state plainly that `main()`
+  validates config and the live loop is deferred to S5 (#65).
+- `crates/warden/src/poller.rs` — the `run_ticks` doc no longer links a **nonexistent**
+  `run_with_sleep` method (a broken intra-doc reference); it states the production driver
+  is not implemented yet (S5, #65).
+- `crates/warden/src/lib.rs` + `crates/warden/src/breaker.rs` — "the proxy sheds agent
+  traffic" / "traffic is shed/flows" reworded to "*intended* to … (proxy-side wiring
+  deferred — #52)".
+- `mcp/server/src/server.ts` + `mcp/server/README.md` — the "every write goes through
+  Core's propose→dry_run→apply path" claim qualified as the **intended** design, with a
+  "Not yet wired (S4 → S5)" disclosure (no JSON-RPC/stdio wire; `FakeCore` only; #63).
+- `crates/policy/src/grant.rs` — "the proxy re-derives … / the single entry point the
+  proxy calls" reworded to intended/future tense, noting the only caller today is the CLI
+  demo and production consumption is deferred to S5 (#66, blocked on #45).
+
+The §10.1 BlastRadius "grant" that `guarded_apply` (`crates/clone-orchestrator/src/apply.rs`)
+**does** cross-check at apply time is a *different* artifact and that claim is accurate;
+it was **not** changed. (The unwired one is the §14.3 *signed* `GrantToken`.)

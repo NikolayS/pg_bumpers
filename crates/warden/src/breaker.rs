@@ -17,8 +17,11 @@
 //! constructor and no `Deserialize`, so a breaker command arriving over the
 //! wire from an agent/operator carries no way to forge one. `trip`/`force_close`
 //! reject any other [`Principal`]. This is the **documented MVP interface** for
-//! the mTLS channel (full proxy-side wiring is fast-follow); the *state
-//! correctness + non-forgeability* are real and tested here.
+//! the mTLS channel: the *state correctness + non-forgeability* are real and
+//! tested here, but the proxy-side wiring that consumes this state to actually
+//! shed traffic is **deferred** (#52 authorized the deferral; see
+//! `docs/spec/SPEC.amendments.md` §S4). In S4 this is a warden-side state
+//! machine only — no running proxy reads it yet.
 
 use pgb_core::Clock;
 
@@ -68,10 +71,11 @@ impl WardenCredential {
 /// opened so the cooldown is computed against the injected clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerState {
-    /// Healthy: traffic flows.
+    /// Healthy: traffic is *intended* to flow (proxy-side wiring deferred — #52).
     Closed,
-    /// Tripped: traffic is shed. `opened_at_millis` is the monotonic reading
-    /// when it opened; the cooldown is measured from it.
+    /// Tripped: traffic is *intended* to be shed once the proxy consumes this
+    /// state (proxy-side wiring deferred — #52). `opened_at_millis` is the
+    /// monotonic reading when it opened; the cooldown is measured from it.
     Open {
         /// Monotonic ms when the breaker opened (for the cooldown window).
         opened_at_millis: u64,
