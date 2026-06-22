@@ -26,6 +26,8 @@ appliable = "appliable"    # "auto-appliable" — the project's chosen spelling
 Unparseable = "Unparseable"  # the spelling used across the codebase/docs
 SELEKT = "SELEKT"          # DELIBERATE bad-SQL example in docs/demo.md
 FRM = "FRM"                # part of the same deliberate bad-SQL example
+applyd = "applyd"          # the write-path DAEMON crate/binary `pgb-applyd` (#67)
+APPLYD = "APPLYD"          # its env-var prefix, e.g. PGB_APPLYD_SOCKET
 
 [default.extend-identifiers]
 # Verbatim code identifiers / acronyms that must never be "corrected".
@@ -34,3 +36,4 @@ provolatile = "provolatile"
 datadir = "datadir"
 datadirs = "datadirs"
 basebackup = "basebackup"
+applyd = "applyd"          # `pgb-applyd` / `pgb_applyd` / PGB_APPLYD_* identifiers
