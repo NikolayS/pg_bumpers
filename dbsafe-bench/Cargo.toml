@@ -1,0 +1,41 @@
+# dbsafe-bench — the deterministic FP/FN **floor** gate (SPEC §3 "Separate:
+# dbsafe-bench", §13.5 CI-gating plane, §10.6 golden file). NOT a production
+# crate (`publish = false`); it consumes the merged enforcement floor and asserts
+# **0 catastrophic FN + 0 FP regression vs a golden file**. The seed S5 grows.
+[package]
+name = "dbsafe-bench"
+description = "pg_bumpers deterministic FP/FN floor gate: labeled corpus + golden expected-outcome + 0-FN/0-FP-regression CI gate (SPEC §13.5, §10.6)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# Not a published artifact — a benchmark/CI harness (like spikes/fidelity).
+publish = false
+
+[lib]
+name = "dbsafe_bench"
+path = "src/lib.rs"
+
+[dependencies]
+# The real deterministic floor under test. We exercise the PUBLIC APIs only —
+# the proxy frontend-frame gate + read-only classifier, the byte/row cutoff, the
+# default-deny certified-action set, and the guarded-apply data-loss guards — so
+# the gate is the same floor that ships, not a re-implementation.
+pgb-core = { path = "../crates/core" }
+pgb-policy = { path = "../crates/policy" }
+pgb-pgwire = { path = "../crates/pgwire" }
+pgb-proxy = { path = "../crates/proxy" }
+pgb-clone-orchestrator = { path = "../crates/clone-orchestrator" }
+
+# Golden expected-outcome (de)serialization. BTreeMap-backed maps keep the JSON
+# deterministic (sorted keys) so the golden diff is stable.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# DB-backed (env-gated PG_BUMPERS_IT=1) scenarios drive a throwaway PG18 cluster
+# via psql/initdb (no extra deps) plus a synchronous client for the WALL
+# direct-to-DB-bypass denial.
+postgres = "0.19"

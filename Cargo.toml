@@ -15,6 +15,12 @@ members = [
     # production. Kept in the workspace only so it compiles under the fast CI job;
     # its DB tests are env-gated (PG_BUMPERS_IT=1) and skipped by `cargo test`.
     "spikes/fidelity",
+    # The deterministic FP/FN floor gate (issue #43; SPEC §3 "Separate:
+    # dbsafe-bench", §13.5, §10.6). publish = false; consumes the merged
+    # enforcement floor and gates CI on 0 catastrophic FN + 0 FP regression vs a
+    # golden file. Its pure-logic gate runs in the fast `cargo test`; DB-backed
+    # scenarios are env-gated (PG_BUMPERS_IT=1).
+    "dbsafe-bench",
 ]
 
 # Shared metadata for every crate in the workspace. Crates opt in via
