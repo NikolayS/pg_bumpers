@@ -65,7 +65,12 @@ ALTER ROLE pgb_agent
 -- this role-level pin is NOT immutable. PostgreSQL lets ANY non-superuser role change its
 -- OWN role-level GUCs, so `ALTER ROLE pgb_agent SET search_path=…` / `RESET ALL` (run as
 -- the agent itself) defeats this pin. The AUTHORITATIVE search_path pin is the PROXY (S1),
--- which sets search_path per session on every connection it brokers; this line is
+-- which IS WIRED to `SET search_path` per session on EVERY brokered backend connection
+-- (crates/proxy/src/session.rs `inject_search_path`, run on `connect_backend` right beside
+-- the statement_timeout injection; ProxyConfig::DEFAULT_SEARCH_PATH = `pg_catalog, "public"`
+-- matches THIS line). A fresh brokered session is always re-pinned, so no agent-chosen path
+-- survives into a new session (proven by crates/proxy/tests/proxy_it.rs
+-- `proxy_pins_search_path_on_every_brokered_session`). This role-level line is
 -- defense-in-depth for the raw-client lens and to drift-correct on every re-apply.
 --   The WALL's REAL guarantee does NOT depend on search_path: access is via fully-qualified
 -- EXPLICIT SELECT grants only (§6 whitelist), and the agent can neither CREATE schemas/

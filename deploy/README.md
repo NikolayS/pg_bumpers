@@ -219,8 +219,13 @@ deploy/hba/render-hba.sh --agent-role pgb_agent --proxy-cidr 10.0.0.5/32 >> "$PG
 > pin in the migration is **best-effort only**. PostgreSQL lets ANY non-superuser role change
 > its **own** role-level GUCs, so the agent itself can run `ALTER ROLE pgb_agent SET
 > search_path = …` or `RESET ALL` and defeat the pin (until the migration re-applies). **The
-> authoritative search_path pin is the proxy (S1)**, which sets it per session on every
-> brokered connection. The WALL's real guarantee does **not** depend on `search_path`: reads
+> authoritative search_path pin is the proxy (S1)**, which **is wired** to `SET search_path`
+> per session on every brokered backend connection (`crates/proxy/src/session.rs`
+> `inject_search_path`, applied in `connect_backend` alongside the `statement_timeout`
+> injection; the default `pg_catalog, "public"` matches the migration). Every brokered session
+> is a fresh origination the proxy re-pins, so no agent-chosen path survives into a new session
+> — proven by `crates/proxy/tests/proxy_it.rs::proxy_pins_search_path_on_every_brokered_session`
+> (env-gated PG18 IT). The WALL's real guarantee does **not** depend on `search_path`: reads
 > are via fully-qualified **explicit SELECT grants** only, and the agent can neither CREATE
 > schemas/objects (so no trojan-shadowing) nor write anywhere — therefore **no `search_path`
 > the agent chooses can widen its read surface or escalate**. The matrix proves this

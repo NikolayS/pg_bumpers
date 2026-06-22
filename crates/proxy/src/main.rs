@@ -27,6 +27,11 @@
 //! - `PGB_POLICY_PATH` — path to `policy.yaml`.
 //! - `PGB_POLICY_ROLE` — which role's budgets apply (default `analytics`).
 //! - `PGB_STATEMENT_TIMEOUT_MS` — injected `statement_timeout` (default 30000).
+//! - `PGB_SEARCH_PATH` — the authoritative per-session `search_path` pinned on
+//!   every brokered backend session (default `pg_catalog, "public"`, matching
+//!   `deploy/sql/10_hardened_role.sql`). Keep it minimal (no `"$user"`); empty
+//!   disables the pin (not recommended). SPEC §3 layer-1 WALL ("search_path
+//!   pinned").
 //!
 //! Audit (`_meta` chain — SPEC §3/§4/§10.9, issue #64):
 //! - `PGB_META_DSN` — the `_meta` writer DSN (keyword/value, **`pgb_audit_writer`**
@@ -134,6 +139,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_role: policy_role.clone(),
         budget,
         statement_timeout_ms: env_or("PGB_STATEMENT_TIMEOUT_MS", "30000").parse()?,
+        // The authoritative per-session search_path pin (SPEC §3 layer-1 WALL).
+        // Defaults to the minimal fixed path the WALL role intends, matching
+        // deploy/sql/10_hardened_role.sql. Operators may override but should keep
+        // it minimal (no "$user", not wide-open).
+        search_path: env_or("PGB_SEARCH_PATH", ProxyConfig::DEFAULT_SEARCH_PATH),
     });
 
     // Fail-closed on an incoherent TLS posture (require_tls without material).

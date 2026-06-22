@@ -1056,3 +1056,74 @@ topology + honesty fixes, every one tighten-only. The `_meta` audit append is st
 atomically co-committed with the apply txn (the documented #75 ordering caveat stands). The
 RiskEngine is still a stub=Allow (§15.1). The optional MCP-passed explicit intent remains a
 disclosed non-requirement.
+
+---
+
+## #80 — MVP spec-faithfulness closeout: proxy `search_path` pin WIRED + `replica.dsn`/§10.8-degraded-budgets recorded as inert
+
+**SPEC sections touched:** §3 (layer-1 WALL "search_path pinned"; layer-2 proxy injection),
+§10.8 (degraded mode, no replica), §12 / §12.1–§12.2 (replica is OPTIONAL; the bounded +
+reversible invariant holds regardless of the replica).
+
+**Issue:** #80 (final-audit LOW-gap closeout → 0 undisclosed gaps). Tracks the deferred
+read-routing/degraded-budget work under **#77**.
+
+### Gap 1 — proxy `search_path` pin: WIRED (code now matches the docs)
+
+SPEC §3's layer-1 WALL lists "search_path pinned", and both
+`deploy/sql/10_hardened_role.sql` and `deploy/README.md` named the **proxy** as the
+*authoritative* per-session pin — but `crates/proxy/src` injected ONLY `statement_timeout`
+on backend originate; it never `SET search_path`. That was a **true-in-docs / absent-in-code**
+claim (the only enforcement was the role-level GUC, which a non-superuser can defeat on its
+own session).
+
+**Fix (tighten-only, defense-in-depth):** the proxy now `SET search_path = <pin>` on **every**
+brokered backend session, run in `connect_backend` (`crates/proxy/src/session.rs`
+`inject_search_path`) right beside the existing `statement_timeout` injection, over the same
+self-issued extended-protocol unit, fail-closed on a backend error. The pin is config-driven
+(`ProxyConfig::search_path`, env `PGB_SEARCH_PATH`) and defaults to
+`ProxyConfig::DEFAULT_SEARCH_PATH = pg_catalog, "public"` — the **same minimal fixed value**
+`deploy/sql/10_hardened_role.sql` pins at the role level (no `"$user"`, not wide-open).
+Because each brokered session is a fresh origination the proxy re-pins, an agent-chosen
+`search_path` can never carry into a new session.
+
+This is **not** a new guarantee — the WALL's read guarantee is grant-based and already
+`search_path`-invariant (`deploy/test/wall_matrix.sh` §I proves the agent can mutate / `RESET
+ALL` its path yet STILL cannot read non-whitelisted data or write). The pin cannot *widen*
+access; it makes the code match the SPEC/WALL docs and gives a deterministic minimal path.
+
+**Red→green (real PG18, high ports via `deploy/local-stack.sh`; NEVER 5432):**
+`crates/proxy/tests/proxy_it.rs::proxy_pins_search_path_on_every_brokered_session`. The pin
+used in the test (`pg_catalog, public, pg_temp`) is deliberately DISTINCT from the role-level
+pin so a pass proves the **proxy** set it. RED (injection disabled):
+`current_setting('search_path')` on a brokered session returns the role-level `pg_catalog,
+public` — assertion fails. GREEN (injection wired): it equals the proxy pin; the agent's own
+`SET search_path` is blocked by the proxy; a fresh brokered session is re-pinned.
+
+`deploy/sql/10_hardened_role.sql:67` and `deploy/README.md` were updated from "the proxy is
+authoritative (intended)" to "the proxy **is wired** (`inject_search_path`), proven by the
+IT" — closing the doc-vs-code gap in both directions.
+
+### Gap 2 — `replica.dsn` is INERT and §10.8 degraded budgets are NOT differential (RECORDED, deferred → #77)
+
+`replica.dsn` parses into `pgb_policy::ReplicaConfig` (`crates/policy/src/config.rs`) and is
+validated/round-tripped, but it is **not consumed** by any enforcement path: the proxy always
+originates its backend against the configured `PGB_BACKEND_*` target (the primary in the local
+stack), there is **no read-routing to a replica**, and the per-role budgets are **not** made
+differentially stricter when no replica is present (no SPEC §10.8 degraded-mode budget switch).
+Today the same `policy.yaml` budgets apply whether or not a replica DSN is set.
+
+This is recorded, not wired, by design and matches the SPEC's §12-optional posture: §12 makes
+the replica (and DBLab and PITR) **OPTIONAL**, and §12.1 states the bounded-blast-radius +
+reversibility **invariant holds regardless of the replica**. The deterministic floor (WALL +
+single-shot byte/row cutoff + cumulative per-window budget + `statement_timeout` + warden +
+EXPLAIN-cost gate) already bounds reads to ≤ B and refuses irreversible/structural writes on
+the **primary** path — so routing reads to a replica and tightening budgets in degraded mode
+is a **preview/isolation-experience upgrade** (SPEC §12 "Graceful degradation" table), not a
+safety prerequisite. Wiring read-routing + a stricter degraded budget profile is tracked
+**post-MVP under #77**.
+
+**Honest scope:** no degraded-mode budget differential and no replica read-routing exist yet;
+`replica.dsn` being set does **not** change runtime behavior. Disclosed in `KNOWN_BYPASSES.md`
+as **B7**. (This is a scope/disclosure note, NOT a deterministic-floor false-negative — the
+`dbsafe-bench` catastrophic-FN ledger stays empty.)

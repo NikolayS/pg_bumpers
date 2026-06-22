@@ -80,9 +80,33 @@ pub struct ProxyConfig {
     /// The `statement_timeout` (milliseconds) injected on every backend session.
     /// `0` disables the injection (not recommended).
     pub statement_timeout_ms: u64,
+    /// The `search_path` pinned on **every** brokered backend session (SPEC §3
+    /// layer-1 WALL: "search_path pinned"). The proxy is the *authoritative*
+    /// per-session pin: because each agent connection originates a **fresh**
+    /// backend session and the proxy `SET search_path = <this>` before any agent
+    /// statement runs, an agent that ran `SET search_path = 'evil'` (or
+    /// `ALTER ROLE self …` / `RESET ALL`) can never carry a chosen path into a new
+    /// brokered session — the proxy re-pins it every time.
+    ///
+    /// Defense-in-depth only: the WALL's read guarantee is grant-based and
+    /// `search_path`-invariant (proven by `deploy/test/wall_matrix.sh` §I), so this
+    /// pin can never *widen* access; it makes the proxy match the SPEC/WALL docs and
+    /// gives a deterministic, minimal path. Defaults to
+    /// [`ProxyConfig::DEFAULT_SEARCH_PATH`] (matching `deploy/sql/10_hardened_role.sql`);
+    /// an empty value disables the injection (not recommended).
+    pub search_path: String,
 }
 
 impl ProxyConfig {
+    /// The default pinned `search_path`: the minimal fixed path the WALL role
+    /// intends — `pg_catalog` first (built-ins resolve as expected) then the one
+    /// whitelisted application schema `public`. This MUST match the value
+    /// `deploy/sql/10_hardened_role.sql` pins at the role level
+    /// (`ALTER ROLE pgb_agent SET search_path = pg_catalog, "public"`), so the
+    /// proxy pin and the role pin agree. Deliberately **not** wide-open and with
+    /// **no** `"$user"` element (no per-user schema shadowing).
+    pub const DEFAULT_SEARCH_PATH: &'static str = "pg_catalog, \"public\"";
+
     /// Resolve a `policy_role`'s single-shot budget from a loaded policy.
     pub fn budget_for(
         policy: &pgb_policy::PolicyConfig,
@@ -192,6 +216,7 @@ mod tests {
                 },
             },
             statement_timeout_ms: 30000,
+            search_path: ProxyConfig::DEFAULT_SEARCH_PATH.to_string(),
         }
     }
 

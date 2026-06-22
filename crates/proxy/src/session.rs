@@ -125,7 +125,8 @@ pub async fn serve_connection(
     finish_agent_startup(&mut stream).await?;
 
     // (3) Originate the backend session as the WALL role.
-    let mut backend = connect_backend(&cfg.backend, cfg.statement_timeout_ms).await?;
+    let mut backend =
+        connect_backend(&cfg.backend, cfg.statement_timeout_ms, &cfg.search_path).await?;
 
     // (4) The enforced query loop.
     query_loop(&mut stream, &mut backend, &cfg, &recorder, &session_id).await
@@ -334,16 +335,27 @@ struct Backend {
     stream: TcpStream,
 }
 
-/// Open the backend session as the WALL role and inject `statement_timeout`.
+/// Open the backend session as the WALL role and inject the per-session GUCs the
+/// deterministic floor pins: `statement_timeout` **and** `search_path` (SPEC §3
+/// layer-1 WALL "search_path pinned" + §3 layer-2 timeout injection).
 ///
 /// The local-stack primary trusts local connections (auth is `trust` for the
 /// boundary's loopback), so the proxy sends a `StartupMessage` and expects
 /// `AuthenticationOk`. (Terminate-and-originate: the agent's SCRAM proof gates
 /// reaching this point; the backend trusts the network boundary — SPEC §3
 /// layer 0. TLS to the backend is out of MVP scope and noted in the PR.)
+///
+/// Because **every** brokered agent connection runs through here on a **fresh**
+/// backend session, the `search_path` pin is re-applied unconditionally before
+/// any agent statement — so an agent's own `SET search_path = …` (or a persisted
+/// `ALTER ROLE self … / RESET ALL`) can never carry a chosen path into a new
+/// brokered session. The proxy is the authoritative pin (defense-in-depth: the
+/// WALL guarantee is already `search_path`-invariant — grant-based — so this can
+/// never widen access; it makes the code match the SPEC/WALL docs).
 async fn connect_backend(
     target: &BackendTarget,
     statement_timeout_ms: u64,
+    search_path: &str,
 ) -> Result<Backend, SessionError> {
     let mut stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
     stream.set_nodelay(true).ok();
@@ -361,7 +373,15 @@ async fn connect_backend(
     // Drive auth to AuthenticationOk, then to the first ReadyForQuery.
     wait_for_ready(&mut stream, target).await?;
 
-    // (4) Timeout injection — set statement_timeout on the backend session.
+    // (4a) search_path pin — set the authoritative per-session search_path on the
+    // fresh backend session BEFORE any agent statement (the agent never sees a
+    // session where its own SET/ALTER survived). Run the same way/time as the
+    // timeout injection, on every brokered connection.
+    if !search_path.is_empty() {
+        inject_search_path(&mut stream, search_path).await?;
+    }
+
+    // (4b) Timeout injection — set statement_timeout on the backend session.
     if statement_timeout_ms > 0 {
         inject_statement_timeout(&mut stream, statement_timeout_ms).await?;
     }
@@ -418,6 +438,21 @@ async fn inject_statement_timeout(
     // A parameterless SET via the extended protocol (we force extended for
     // ourselves too — no simple query path anywhere).
     let sql = format!("SET statement_timeout = {timeout_ms}");
+    send_extended_unit(stream, &sql).await?;
+    drain_to_ready(stream).await
+}
+
+/// Inject the pinned `search_path` via an extended-protocol round-trip on the
+/// backend (Parse/Bind/Execute/Sync), draining to `ReadyForQuery`.
+///
+/// The value comes from operator config ([`ProxyConfig::search_path`]), not agent
+/// input, and is emitted verbatim into `SET search_path = <value>` — exactly the
+/// form `deploy/sql/10_hardened_role.sql` uses (`pg_catalog, "public"`). This is
+/// the same self-issued extended-protocol path the proxy uses for its own
+/// `statement_timeout` (no simple-query path anywhere), and like that injection it
+/// fails the session closed if the backend reports an error.
+async fn inject_search_path(stream: &mut TcpStream, search_path: &str) -> Result<(), SessionError> {
+    let sql = format!("SET search_path = {search_path}");
     send_extended_unit(stream, &sql).await?;
     drain_to_ready(stream).await
 }
@@ -1043,6 +1078,7 @@ mod tests {
                 },
             },
             statement_timeout_ms: 30_000,
+            search_path: ProxyConfig::DEFAULT_SEARCH_PATH.to_string(),
         }
     }
 

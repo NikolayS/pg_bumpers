@@ -150,9 +150,30 @@ mod tempdir {
 
 /// Spawn the proxy on an ephemeral port with the given budget + timeout, return
 /// the bound address, the shared audit sink, and the client's cert trust DER.
+/// Uses the default pinned `search_path`.
 async fn spawn_proxy(
     budget: RoleBudget,
     statement_timeout_ms: u64,
+) -> (
+    std::net::SocketAddr,
+    Arc<Mutex<InMemorySink>>,
+    Vec<u8>,
+    tempdir::TempPaths,
+) {
+    spawn_proxy_with_search_path(
+        budget,
+        statement_timeout_ms,
+        ProxyConfig::DEFAULT_SEARCH_PATH.to_string(),
+    )
+    .await
+}
+
+/// As [`spawn_proxy`] but lets a test pick the pinned `search_path` (so the
+/// search_path-pin IT can assert an explicit, non-default value is enforced).
+async fn spawn_proxy_with_search_path(
+    budget: RoleBudget,
+    statement_timeout_ms: u64,
+    search_path: String,
 ) -> (
     std::net::SocketAddr,
     Arc<Mutex<InMemorySink>>,
@@ -180,6 +201,7 @@ async fn spawn_proxy(
         policy_role: "analytics".to_string(),
         budget,
         statement_timeout_ms,
+        search_path,
     });
 
     let sink_inner = Arc::new(Mutex::new(InMemorySink::new()));
@@ -497,5 +519,128 @@ async fn tls_is_required_when_configured() {
     eprintln!(
         "[ok] sslmode=require works over TLS: SELECT returned {} rows",
         rows.len()
+    );
+}
+
+/// A generous budget that never trips the cutoff/EXPLAIN gates — for tests that
+/// gate on something other than the budget (e.g. the search_path pin).
+fn generous_budget() -> RoleBudget {
+    RoleBudget {
+        max_bytes: 50_000,
+        max_rows: 100,
+        max_plan_cost: 1_000_000_000.0,
+        max_plan_rows: 1_000_000_000,
+        per_window: WindowBudget {
+            window_secs: 60,
+            max_bytes: 50_000_000,
+            max_rows: 1_000_000,
+        },
+    }
+}
+
+/// **search_path PIN (SPEC §3 layer-1 WALL: "search_path pinned"; issue #80
+/// gap 1).** The proxy is the AUTHORITATIVE per-session `search_path` pin, set on
+/// every brokered backend session BEFORE any agent statement. Proven end-to-end
+/// against live PG18:
+///
+///   * a brokered session's active `search_path` (read via the read-only
+///     `current_setting('search_path')` — `SHOW`/`SET` are utility statements the
+///     proxy's read-only gate blocks) equals the configured pinned value (the
+///     proxy set it — not the agent, not the role-level default);
+///   * the agent's own `SET search_path = 'evil'` is itself **blocked** by the
+///     read-only gate (it cannot even mutate the session path through the proxy),
+///     and — belt to that suspender — a brand-NEW brokered session is re-pinned to
+///     the configured value regardless (terminate-and-originate: every brokered
+///     backend session is a fresh origination the proxy re-pins).
+///
+/// RED (no pin wired): `current_setting('search_path')` returns the role-level
+/// default `pg_catalog, "public"`, NOT the configured pin → the first assertion
+/// fails. GREEN: it equals the pin.
+///
+/// The pinned value here (`pg_catalog, public, pg_temp`) is deliberately DISTINCT
+/// from the role-level pin in `deploy/sql/10_hardened_role.sql`
+/// (`pg_catalog, "public"`), so a pass proves the **proxy** pinned it (the
+/// role-level GUC alone would yield the two-element value).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_pins_search_path_on_every_brokered_session() {
+    if !it_enabled() {
+        eprintln!(
+            "[skip] set PG_BUMPERS_IT=1 (+ deploy/local-stack.sh up) for the search_path-pin IT"
+        );
+        return;
+    }
+    tokio::task::spawn_blocking(setup_fixtures)
+        .await
+        .expect("fixture setup thread");
+
+    // A pin distinct from the role-level pin so a pass proves the PROXY set it.
+    let pinned = "pg_catalog, public, pg_temp".to_string();
+    let (addr, _sink, cert_der, _paths) =
+        spawn_proxy_with_search_path(generous_budget(), 30_000, pinned.clone()).await;
+
+    // ---- 1. A brokered session's active search_path equals the pinned value ----
+    // `current_setting('search_path')` is a plain read-only SELECT (allowed),
+    // whereas `SHOW search_path` is a utility statement the read-only gate blocks.
+    let client = connect_client(addr, &cert_der).await;
+    let observed: String = client
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .expect("current_setting('search_path') must succeed")
+        .get(0);
+    eprintln!("[search_path] brokered session 1 search_path = {observed:?} (pin {pinned:?})");
+    assert_eq!(
+        observed, pinned,
+        "the brokered session's search_path must equal the proxy pin (got {observed:?}, \
+         expected {pinned:?}) — the proxy is the authoritative per-session pin"
+    );
+    eprintln!("[ok] brokered session search_path is pinned by the proxy");
+
+    // ---- 2a. The agent's own SET search_path='evil' is BLOCKED ----
+    // The agent cannot even mutate its session path through the proxy: a
+    // `batch_execute` SET goes over the simple-query protocol, which the proxy
+    // rejects outright (extended-protocol-only, the statement-stacking defense),
+    // and a SET is in any case a non-read utility the read-only gate would block.
+    // Either way the agent's `SET` never takes hold — a stronger property than
+    // "it doesn't persist".
+    let set_err = client
+        .batch_execute("SET search_path = 'evil_schema_that_should_not_persist'")
+        .await
+        .expect_err("agent SET search_path must be blocked by the proxy");
+    eprintln!(
+        "[ok] agent `SET search_path='evil'` blocked: {}",
+        db_msg(&set_err)
+    );
+    // The session survives the recoverable block and is still on the pin.
+    let still_pinned: String = client
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .expect("session survives the blocked SET")
+        .get(0);
+    assert_eq!(
+        still_pinned, pinned,
+        "after the blocked SET the session's search_path is unchanged (still the pin)"
+    );
+
+    // ---- 2b. A brand-NEW brokered session is re-pinned regardless ----
+    // Open a fresh connection through the proxy: a new brokered backend session.
+    // It must be re-pinned to the configured value — no agent-chosen path survives.
+    let client2 = connect_client(addr, &cert_der).await;
+    let after: String = client2
+        .query_one("SELECT current_setting('search_path')", &[])
+        .await
+        .expect("current_setting on the fresh brokered session")
+        .get(0);
+    eprintln!("[search_path] fresh brokered session 2 search_path = {after:?}");
+    assert_eq!(
+        after, pinned,
+        "a fresh brokered session must be re-pinned to {pinned:?} (got {after:?}) — the \
+         proxy re-pins every brokered session"
+    );
+    assert!(
+        !after.contains("evil_schema_that_should_not_persist"),
+        "the agent's chosen path must NEVER appear in a fresh brokered session"
+    );
+    eprintln!(
+        "[ok] every fresh brokered session is re-pinned by the proxy (no agent path survives)"
     );
 }

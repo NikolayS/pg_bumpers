@@ -156,14 +156,43 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
 - **SPEC.amendments tie:** CLAUDE.md §2 (the LLM risk-gate is tighten-only; MVP
   `RiskEngine` is an `Allow` stub) + SPEC §15.1.
 
+## B7 — `replica.dsn` is INERT and §10.8 degraded budgets are NOT differential (read-routing DEFERRED → #77)
+
+- **Damage class:** N/A (topology / preview-experience, not a floor guarantee).
+  **Defense layer:** the deterministic floor holds on the **primary** path regardless.
+- **What it is:** `replica.dsn` parses + validates into `pgb_policy::ReplicaConfig`
+  (`crates/policy/src/config.rs`) but is **not consumed** by any enforcement path. The
+  proxy always originates its backend against the configured `PGB_BACKEND_*` target
+  (the primary in the local stack) — there is **no read-routing to a replica** — and
+  the per-role byte/row/window budgets are **not** made differentially stricter when
+  no replica is present (no SPEC §10.8 degraded-mode budget switch). Setting
+  `replica.dsn` does **not** change runtime behavior today.
+- **Why it is not closed:** §12 makes the replica (and DBLab and PITR) **OPTIONAL**,
+  and §12.1 states the bounded-blast-radius + reversibility **invariant holds
+  regardless of the replica**. The floor (WALL + single-shot byte/row cutoff +
+  cumulative per-window budget + `statement_timeout` + warden + EXPLAIN-cost gate)
+  already bounds reads to ≤ B and refuses irreversible/structural writes on the
+  primary path. Replica read-routing + a stricter degraded-mode budget profile is a
+  **preview/isolation-experience upgrade** (SPEC §12 "Graceful degradation" table),
+  not a safety prerequisite. Tracked **post-MVP under #77**.
+- **Repro:** grep shows `replica.dsn` referenced only in `crates/policy` parse/
+  round-trip tests (`config::tests::example_policy_loads_and_validates`,
+  `clone_provider_defaults_to_none`), never in the proxy/warden enforcement path; the
+  proxy connects to `PGB_BACKEND_HOST/PORT` (`crates/proxy/src/main.rs`), with no
+  replica branch and no degraded-budget branch. The bounded/reversible guarantees are
+  proven on the primary path (`dbsafe-bench`, `crates/proxy/tests/proxy_it.rs`).
+- **SPEC.amendments tie:** "#80 — MVP spec-faithfulness closeout" → *Gap 2*
+  (`replica.dsn` inert + §10.8 degraded budgets recorded as deferred → #77).
+
 ---
 
 ### Bottom line
 
-None of B1–B6 is a deterministic-floor false-negative: the catastrophic-FN ledger
+None of B1–B7 is a deterministic-floor false-negative: the catastrophic-FN ledger
 (`dbsafe-bench/golden/known_bypasses.json`) is **empty**, and the gate keeps it
-empty (0 FN / 0 FP over the frozen corpus). B1–B6 are the honest **scope** of the
+empty (0 FN / 0 FP over the frozen corpus). B1–B7 are the honest **scope** of the
 MVP — bounded (not zero) read disclosure, a cooperative MCP, single-int-PK apply,
-deferred cross-process attestation, a file-anchor stand-in, and a stubbed
-(tighten-only) RiskEngine — each disclosed here with a repro and tied to its
+deferred cross-process attestation, a file-anchor stand-in, a stubbed (tighten-only)
+RiskEngine, and an inert `replica.dsn` (no replica read-routing / degraded-budget
+differential yet, deferred → #77) — each disclosed here with a repro and tied to its
 SPEC.amendments entry.

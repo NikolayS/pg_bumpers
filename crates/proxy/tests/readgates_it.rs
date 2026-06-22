@@ -172,6 +172,7 @@ async fn spawn_proxy(
         policy_role: "analytics".to_string(),
         budget,
         statement_timeout_ms,
+        search_path: ProxyConfig::DEFAULT_SEARCH_PATH.to_string(),
     });
 
     let sink_inner = Arc::new(Mutex::new(InMemorySink::new()));
