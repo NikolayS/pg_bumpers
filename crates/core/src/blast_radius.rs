@@ -164,8 +164,10 @@ pub struct BlastRadius {
     pub proposal_id: String,
     /// LSN of the clone the dry-run ran against (e.g. `"3A/7F00C8"`).
     pub clone_lsn: String,
-    /// How far behind prod the clone is, in WAL bytes. The staleness gate
-    /// rejects clones above a configured ceiling (SPEC §10.5c).
+    /// How far behind prod the clone is, in WAL bytes. Captured and propagated for
+    /// audit; the SPEC §10.5(c) staleness-ceiling reject is the **S0 fidelity-spike
+    /// binary's** pass criterion, not a `clone-orchestrator` gate (no ceiling
+    /// enforcement exists here — the field is informational on this path).
     pub staleness_lsn_bytes: u64,
     /// The rows this write would affect (see [`Affected`]).
     pub affected: Affected,

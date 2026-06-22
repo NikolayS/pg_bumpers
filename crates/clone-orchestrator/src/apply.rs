@@ -689,39 +689,108 @@ fn guarded_body(
         });
     }
 
-    // (8) Full reversible pre-image capture check (fail-closed). For a DELETE, the
-    //     inverse must hold a pre-image for EVERY cascade-destroyed child row, else
-    //     the revert cannot restore it. If the change count for any cascade
-    //     relation is non-zero but no pre-image was captured, the change is not
-    //     certifiably reversible → ABORT.
-    if kind == WriteKind::Delete {
-        for (cascade_rel, _) in &predicted.cascades {
-            // A DELETE cascade destroys child rows → the predicted `del` channel is
-            // exactly the number of pre-images the inverse must hold to be revertible.
-            let predicted_n = predicted
-                .effect_by_table
-                .get(cascade_rel)
-                .copied()
-                .unwrap_or_default()
-                .del;
-            let captured = forward
-                .cascade_preimages
-                .get(cascade_rel)
-                .map(|v| v.len() as u64)
-                .unwrap_or(0);
-            if predicted_n > 0 && captured < predicted_n {
-                return Err(ApplyError::IrreversibleChange {
-                    relation: cascade_rel.clone(),
-                    detail: format!(
-                        "cascade destroyed {predicted_n} child rows but only {captured} \
-                         pre-images were captured — revert cannot fully restore"
-                    ),
-                });
-            }
-        }
-    }
+    // (8) Full reversible pre-image capture check (fail-closed). The typed-inverse
+    //     must hold a pre-image for EVERY destructively-changed row across ALL
+    //     relations the apply ACTUALLY touched (`deltas`) — not just the direct
+    //     `predicted.cascades` children. This is the structural "0 catastrophic
+    //     data-loss FN by construction" guard: a relation that lost rows but whose
+    //     pre-image is not captured cannot be reverted, so we ABORT rather than
+    //     commit an unrevertable change (#48 multi-level-cascade fail-closed).
+    assert_reversible_preimage_coverage(relation, &deltas, &forward)?;
 
     Ok(forward)
+}
+
+/// Step 8 — **fail-closed reversible pre-image coverage** across the FULL actual
+/// footprint (SPEC §4 step 8, #48).
+///
+/// The typed-inverse [`build_inverse`] captures pre-images for exactly two sources:
+/// the **target** rows (from `RETURNING`, in [`ForwardResult::written`]) and each
+/// **direct** `cascade_by_table` child (in [`ForwardResult::cascade_preimages`]).
+/// The reconciliation footprint, however, is the FULL `pg_stat_xact_*` measure —
+/// it includes **grandchildren** of a `parent → child → grandchild ON DELETE
+/// CASCADE` and any other relation a fired trigger destroyed. Those rows are real
+/// data loss, but [`build_inverse`] captures **no** pre-image for them and
+/// [`build_inverse`]'s `fk_order` never lists them, so the revert cannot restore
+/// them.
+///
+/// This guard closes that asymmetry. For **every** relation in the ACTUAL deltas
+/// that destroyed rows on a channel the inverse must be able to undo, the captured
+/// inverse must cover at least that many rows:
+///
+/// - **`del` (any kind)** — a deleted row is reversible only by re-inserting its
+///   captured pre-image. Every relation with `del > 0` MUST be covered:
+///   - the **target** is covered by `forward.written`;
+///   - a **direct cascade** is covered by `forward.cascade_preimages[rel]`;
+///   - **anything else** (a grandchild present in `effect_by_table` but NOT in
+///     `predicted.cascades`, a trigger-deleted side relation) has **no** captured
+///     pre-image → its destruction is uncapturable → **ABORT**.
+/// - **`upd` on a relation that is not the target** — an identity/value change to a
+///   relation outside the target also needs a captured pre-image to revert; the
+///   inverse only captures the target's own `upd` pre-image, so any other relation
+///   showing `upd > 0` is likewise uncapturable → **ABORT**.
+///
+/// (The target's own `upd` is exactly what `RETURNING` captured into
+/// `forward.written`; the step-7 written-set check already pins it. A relation that
+/// changed *less* than the inverse captured cannot under-restore. This is the
+/// minimum bar #48 requires: **refuse** the un-capturable multi-level case. Full
+/// N-level pre-image *capture* (so such cascades can be applied + reverted rather
+/// than refused) stays deferred under #48.)
+fn assert_reversible_preimage_coverage(
+    target: &str,
+    deltas: &[RelationChange],
+    forward: &ForwardResult,
+) -> Result<(), ApplyError> {
+    // How many pre-image rows the inverse holds for each relation it can revert.
+    let target_captured = forward.written.len() as u64;
+    for change in deltas {
+        if change.total() == 0 {
+            continue;
+        }
+        let is_target = change.relation == target;
+        let captured = if is_target {
+            target_captured
+        } else {
+            forward
+                .cascade_preimages
+                .get(&change.relation)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0)
+        };
+
+        // The `del` channel always needs a re-insert pre-image to be reversible.
+        if change.del > 0 && captured < change.del {
+            return Err(ApplyError::IrreversibleChange {
+                relation: change.relation.clone(),
+                detail: format!(
+                    "{} destroyed {} row(s) but only {} pre-image(s) were captured — \
+                     the typed-inverse cannot restore them (relation outside the \
+                     captured target/direct-cascade set, e.g. a multi-level \
+                     grandchild cascade; #48). Fail-closed: refusing to commit an \
+                     unrevertable change",
+                    change.relation, change.del, captured,
+                ),
+            });
+        }
+
+        // An identity/value-changing `upd` on any relation OTHER than the target is
+        // not captured by the inverse (only the target's `upd` pre-image is). For a
+        // DELETE-kind apply, a non-target `upd` is doubly unexpected. Either way it
+        // is uncapturable → fail-closed.
+        if !is_target && change.upd > 0 && captured < change.upd {
+            return Err(ApplyError::IrreversibleChange {
+                relation: change.relation.clone(),
+                detail: format!(
+                    "{} updated {} row(s) outside the target with only {} captured \
+                     pre-image(s) — the typed-inverse cannot restore the prior values \
+                     (relation outside the captured target/direct-cascade set; #48). \
+                     Fail-closed: refusing to commit an unrevertable change",
+                    change.relation, change.upd, captured,
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile the apply txn's per-relation `pg_stat_xact_*` tuple deltas against
@@ -1770,6 +1839,279 @@ mod tests {
             matches!(err, ApplyError::IrreversibleChange { .. }),
             "{err:?}"
         );
+        assert!(probe.inner().rolled_back);
+        assert!(!probe.inner().committed);
+    }
+
+    // ---- THE S3 BLOCKER: multi-level (grandchild) cascade is fail-closed ----
+
+    /// A `parent → child → grandchild ON DELETE CASCADE` grant (#48). The dry-run's
+    /// FULL `pg_stat_xact_*` measure (`full_effect`) records the grandchild's `del`
+    /// into `effect_by_table`, but `cascade_by_table` walks **direct children only**
+    /// — so the grandchild is present in `effect_by_table` and ABSENT from
+    /// `cascade_by_table` (and therefore from `predicted.cascades`). This is the
+    /// exact asymmetry the S3 sprint review flagged.
+    #[allow(clippy::too_many_arguments)]
+    fn grant_three_level_cascade(
+        proposal_id: &str,
+        parent: &str,
+        parent_ids: &[i64],
+        child: &str,
+        child_ids: &[i64],
+        grandchild: &str,
+        grandchild_ids: &[i64],
+        duration_ms: u64,
+    ) -> BlastRadius {
+        // Start from a normal parent→child (DIRECT) cascade grant.
+        let mut g = grant_with_cascade(
+            proposal_id,
+            parent,
+            parent_ids,
+            child,
+            child_ids,
+            duration_ms,
+        );
+        // The grandchild is in the MEASURED full footprint (`effect_by_table`, via
+        // the dry-run's `full_effect`) as a DELETE — but NOT in `cascade_by_table`,
+        // because apply discovery walks DIRECT children only (#48). We deliberately
+        // do NOT add it to `cascade_by_table`/`pk_set_checksum`.
+        g.affected.effect_by_table.insert(
+            grandchild.to_string(),
+            OpCounts::new(0, 0, grandchild_ids.len() as u64),
+        );
+        g.affected.total_rows = g
+            .affected
+            .total_rows
+            .saturating_add(grandchild_ids.len() as u64);
+        g
+    }
+
+    #[test]
+    fn multilevel_grandchild_cascade_delete_aborts_fail_closed() {
+        // THE BLOCKER (#48): parent → child → grandchild ON DELETE CASCADE.
+        //
+        // - parent `public.orders` deletes {2,4}                  (target, captured)
+        // - child  `public.entries` deletes {20,21,40,41}   (DIRECT cascade, captured)
+        // - grandchild `public.entry_lines` deletes 8 rows  (in effect_by_table ONLY,
+        //                                                     NOT in cascade_by_table)
+        //
+        // Reconciliation passes for the grandchild (it IS in effect_by_table and
+        // actual == predicted), the grandchild PK-set is never recomputed, and
+        // `build_inverse` captures NO pre-image for it. Step 8 MUST notice that the
+        // grandchild destroyed 8 rows with 0 captured pre-images → IrreversibleChange
+        // ABORT. Before the fix this COMMITTED → 8 grandchild rows silently lost on
+        // revert.
+        let child = "public.entries";
+        let grandchild = "public.entry_lines";
+        let mut conn = MockConn::new(REL, &[2, 4]);
+        // Step-5 recompute matches for target + DIRECT child (the only relations the
+        // engine rechecks — the grandchild is never recomputed, per #48).
+        conn.inner()
+            .recompute_ids
+            .insert(child.to_string(), vec![20, 21, 40, 41]);
+        // The DIRECT child's pre-images ARE captured (1-level capture works).
+        conn.inner()
+            .cascade_preimage_ids
+            .insert(child.to_string(), vec![20, 21, 40, 41]);
+        // The ACTUAL apply footprint: target del=2, child del=4, AND grandchild
+        // del=8 — exactly what the dry-run measured into effect_by_table, so the
+        // per-op-type reconciliation (step 6) PASSES for every relation.
+        conn.inner().tuple_deltas = Some(vec![
+            RelationChange {
+                relation: REL.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 2,
+            },
+            RelationChange {
+                relation: child.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 4,
+            },
+            RelationChange {
+                relation: grandchild.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 8, // 8 grandchildren destroyed, ZERO pre-images captured
+            },
+        ]);
+        let probe = conn.clone();
+        let grant = grant_three_level_cascade(
+            "p-grandchild",
+            REL,
+            &[2, 4],
+            child,
+            &[20, 21, 40, 41],
+            grandchild,
+            &[100, 101, 102, 103, 104, 105, 106, 107],
+            5,
+        );
+        let err = guarded_apply(
+            "p-grandchild",
+            WriteKind::Delete,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .unwrap_err();
+        // The grandchild's destruction has no captured pre-image → fail-closed ABORT.
+        match err {
+            ApplyError::IrreversibleChange { relation, .. } => {
+                assert_eq!(
+                    relation, grandchild,
+                    "the UNCAPTURED grandchild cascade must be the relation that aborts"
+                );
+            }
+            other => panic!(
+                "a multi-level grandchild cascade with no captured pre-image MUST \
+                 ABORT (IrreversibleChange), got {other:?}"
+            ),
+        }
+        let p = probe.inner();
+        assert!(
+            p.rolled_back,
+            "the un-revertable multi-level cascade must ROLLBACK"
+        );
+        assert!(
+            !p.committed,
+            "it must NOT commit — the 8 grandchild rows are intact, primary unchanged"
+        );
+    }
+
+    #[test]
+    fn multilevel_grandchild_with_captured_preimages_commits() {
+        // No-regression / completeness: if the grandchild's pre-images WERE captured
+        // (i.e. a future N-level capture supplies them via cascade_preimages, even
+        // though it is not in `cascade_by_table`), step 8 is satisfied and the apply
+        // commits. This proves the guard keys on CAPTURED COVERAGE, not merely on
+        // membership in `predicted.cascades` — so it does not over-fire.
+        let child = "public.entries";
+        let grandchild = "public.entry_lines";
+        let mut conn = MockConn::new(REL, &[2, 4]);
+        conn.inner()
+            .recompute_ids
+            .insert(child.to_string(), vec![20, 21, 40, 41]);
+        conn.inner()
+            .cascade_preimage_ids
+            .insert(child.to_string(), vec![20, 21, 40, 41]);
+        // Supply the grandchild's pre-images too (8 rows) — full coverage.
+        conn.inner().cascade_preimage_ids.insert(
+            grandchild.to_string(),
+            vec![100, 101, 102, 103, 104, 105, 106, 107],
+        );
+        conn.inner().tuple_deltas = Some(vec![
+            RelationChange {
+                relation: REL.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 2,
+            },
+            RelationChange {
+                relation: child.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 4,
+            },
+            RelationChange {
+                relation: grandchild.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 8,
+            },
+        ]);
+        let probe = conn.clone();
+        let mut grant = grant_three_level_cascade(
+            "p-gc-ok",
+            REL,
+            &[2, 4],
+            child,
+            &[20, 21, 40, 41],
+            grandchild,
+            &[100, 101, 102, 103, 104, 105, 106, 107],
+            5,
+        );
+        // For the forward op to capture the grandchild's pre-images, the engine must
+        // hand it to `apply_forward` as a cascade relation. Model the N-level capture
+        // seam: register the grandchild in cascade_by_table + pk_set_checksum so it
+        // is in `predicted.cascades` and the MockConn captures it.
+        grant
+            .affected
+            .cascade_by_table
+            .insert(grandchild.to_string(), 8);
+        grant.affected.pk_set_checksum.insert(
+            grandchild.to_string(),
+            checksum_of(grandchild, &[100, 101, 102, 103, 104, 105, 106, 107]).as_prefixed(),
+        );
+        conn.inner().recompute_ids.insert(
+            grandchild.to_string(),
+            vec![100, 101, 102, 103, 104, 105, 106, 107],
+        );
+        guarded_apply(
+            "p-gc-ok",
+            WriteKind::Delete,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .expect("a fully-captured multi-level cascade may COMMIT");
+        assert!(probe.inner().committed);
+        assert!(!probe.inner().rolled_back);
+    }
+
+    /// A trigger that DELETEs rows in a relation present in `effect_by_table` (so it
+    /// is in-radius and reconciles) but is **not** the target and not a captured
+    /// cascade — same structural hole as the grandchild, reached via a trigger
+    /// rather than a declarative cascade. Must ABORT fail-closed.
+    #[test]
+    fn trigger_deleted_inradius_relation_without_preimage_aborts() {
+        let side = "public.audit_shadow";
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        conn.inner().tuple_deltas = Some(vec![
+            RelationChange {
+                relation: REL.to_string(),
+                ins: 0,
+                upd: 4,
+                del: 0,
+            },
+            RelationChange {
+                relation: side.to_string(),
+                ins: 0,
+                upd: 0,
+                del: 3, // trigger destroyed 3 rows; predicted del=3 so reconcile PASSES
+            },
+        ]);
+        let probe = conn.clone();
+        let mut grant = grant_for("p-shadow", REL, &[2, 4, 6, 8], 5);
+        // The side relation is in the measured footprint as a DELETE of 3 (so the
+        // per-op-type reconciliation passes) but is NOT a captured cascade.
+        grant
+            .affected
+            .effect_by_table
+            .insert(side.to_string(), OpCounts::new(0, 0, 3));
+        let err = guarded_apply(
+            "p-shadow",
+            WriteKind::Update,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::IrreversibleChange { relation, .. } => assert_eq!(relation, side),
+            other => {
+                panic!("expected IrreversibleChange on the uncaptured side relation, got {other:?}")
+            }
+        }
         assert!(probe.inner().rolled_back);
         assert!(!probe.inner().committed);
     }

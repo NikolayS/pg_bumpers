@@ -195,3 +195,100 @@ hardening is noted as a follow-up, not done in S1. Channel binding is not negoti
 `gs2-cbind-flag` in the `client-first-message` is `n` (no binding, per RFC 5802 §6), which
 is correct since TLS is terminated at the proxy and the agent→proxy hop is already
 encrypted at the transport layer — there is no inner `tls-server-end-point` to bind.
+
+---
+
+## S2 clone-orchestrator — no production generic-schema `ApplyConn`; the real impl is the hardcoded seed-schema seam
+
+**SPEC sections touched:** §4 (guarded apply — the §4 flow runs against a real
+`ApplyConn`), §7 S2/S3, §10.1–§10.3 (dry-run grant → guarded apply → typed-inverse).
+
+**Issue:** #45 (production generic-schema `ApplyConn` — remains OPEN, scheduled for S4).
+
+### Deviation
+
+The `guarded_apply` engine (`crates/clone-orchestrator/src/apply.rs`) is **schema-agnostic
+by construction**: it owns the §4 ordering and guard decisions and drives an `ApplyConn`
+seam that owns the SQL. The SPEC implies a **production, generic-schema** `ApplyConn` that
+works against an arbitrary customer schema. **No such production connection exists yet.**
+The shipped real implementation is the **hardcoded seed-schema test seam** —
+`PgApplyConn` in the env-gated integration tests (`crates/clone-orchestrator/tests/`,
+`PG_BUMPERS_IT=1`) — bound to a **2-level seed schema** (`public.accounts` /
+`public.entries`, single-int / composite-int PKs). The in-memory `MockConn` (unit tests)
+is likewise hand-scripted per scenario. There is **no** generic SQL generator that maps an
+arbitrary relation + predicate + cascade graph onto the §4 calls.
+
+### Rationale
+
+S2/S3 deliberately proved the **engine** (ordering, guards, fail-closed reconciliation,
+typed-inverse, FK-ordered revert vs golden state) against a real but **bounded** schema,
+rather than building a generic schema-introspecting `ApplyConn` (a large, separable piece
+of work). The safety properties the engine enforces are schema-agnostic and are tested via
+both the seed-schema `PgApplyConn` (real PG18) and the `MockConn` (every drift/timeout
+injected deterministically). Productionizing the generic `ApplyConn` is tracked in **#45**
+and scheduled for S4.
+
+### Implication for the moat claim
+
+"bounded + reversible by construction" is **honest and proven** for the certified op set
+**restricted to the schemas the shipped `ApplyConn` supports** (single-target + the seed
+schema's cascades). It is **not** yet a general production claim for an arbitrary customer
+schema — that awaits the #45 generic `ApplyConn`. Marketing/demos must not imply a working
+schema-agnostic production apply path until #45 lands.
+
+---
+
+## S3 cascade pre-image capture — DIRECT children only; multi-level cascades are fail-closed (ABORT), full N-level capture deferred
+
+**SPEC sections touched:** §4 (guarded apply step 5/6/8 — full-blast-radius re-check +
+reversible pre-image capture), §10.3 (typed-inverse `{pk, before_image}`), §5/§10.6
+(reversibility vs golden state).
+
+**Issue:** #48 (capture N-level cascade pre-images — apply walks DIRECT children only;
+**fail-closed** part CLOSED here, full N-level capture remains OPEN for S4).
+
+### Deviation
+
+`guarded_apply` discovers and **captures cascade pre-images for DIRECT (1-level) children
+only** (`cascade_by_table`). A deeper `parent → child → grandchild ON DELETE CASCADE` would
+destroy grandchild rows whose pre-images are **not** captured by `build_inverse` — those
+rows appear in the dry-run's FULL `pg_stat_xact_*` footprint (`effect_by_table`, populated
+from `full_effect`) but **not** in `cascade_by_table`/`predicted.cascades`.
+
+### What changed in this amendment (the S3 sprint-review BLOCKER fix)
+
+The sprint review on EPIC #35 found that, before this fix, such a multi-level cascade was
+**not fail-closed**: the grandchild's `del` reconciled cleanly (it *is* in `effect_by_table`
+and actual == predicted), step 8 iterated only `predicted.cascades`, so `guarded_apply`
+**COMMITTED** with the grandchild rows destroyed and **no captured pre-image** → permanent
+silent data loss on revert. This contradicted the engine's own "0 catastrophic data-loss
+FN by construction" claim.
+
+**Fix (this PR):** step 8 (`assert_reversible_preimage_coverage` in `apply.rs`) now
+reconciles **every relation in the ACTUAL footprint (`pg_stat_xact_*` deltas), not just
+`predicted.cascades`**. For each relation that destroyed rows (`del > 0`, or an
+identity-changing `upd` on a non-target relation), the captured typed-inverse MUST cover at
+least that many rows:
+
+- the **target** is covered by the `RETURNING` pre-image (`forward.written`);
+- a **direct cascade** is covered by `forward.cascade_preimages[rel]`;
+- **anything else** — a grandchild present in `effect_by_table` but absent from the captured
+  set, or a trigger-deleted in-radius side relation — has **no** captured pre-image →
+  `ApplyError::IrreversibleChange` → **ABORT / ROLLBACK** (nothing committed, rows intact).
+
+So a multi-level cascade can no longer commit with an incomplete inverse. The 3-level-cascade
+red→green test
+(`apply::tests::multilevel_grandchild_cascade_delete_aborts_fail_closed`) proves it: with the
+old direct-children-only step 8 it COMMITTED (grandchild rows missing from the inverse);
+with the fix it ABORTS.
+
+### What remains deferred (#48, OPEN for S4)
+
+This is the **minimum correct bar**: **refuse** (fail-closed ABORT) the un-capturable
+multi-level case. It does **not** add N-level pre-image *capture*, so a legitimate
+multi-level `ON DELETE CASCADE` is **refused** rather than applied-and-revertible. Full
+N-level discovery + capture (so such cascades can be applied and fully reverted) stays
+deferred under **#48** for S4. A future N-level capture seam can supply the deeper
+pre-images via `cascade_preimages`, at which point the same step-8 coverage check passes
+and the apply commits (proven by
+`apply::tests::multilevel_grandchild_with_captured_preimages_commits`).
