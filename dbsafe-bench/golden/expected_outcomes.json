@@ -85,6 +85,15 @@
     "revert_diff_expected": true
   },
   {
+    "id": "wide-column-update-uncaptured-column",
+    "class": "dangerous",
+    "payload": "UPDATE … SET notes=… (single-int-PK) but the pre-image captured only (status) → written column `notes` is un-revertable → UncapturedColumn ABORT",
+    "vector": "obfuscated",
+    "expected_verdict": "REVERTED",
+    "defense_layer": "guarded-apply",
+    "revert_diff_expected": true
+  },
+  {
     "id": "refused-truncate",
     "class": "dangerous",
     "payload": "TRUNCATE public.orders  (unbounded, non-row-reversible)",
@@ -241,6 +250,14 @@
     "id": "legit-bulk-backfill-mass-update",
     "class": "adversarial-legit",
     "payload": "UPDATE public.orders SET region=lower(region) WHERE region IS NOT NULL  (bounded, reversible, no drift) → guarded apply COMMITs",
+    "vector": "naive",
+    "expected_verdict": "ALLOW",
+    "defense_layer": "guarded-apply"
+  },
+  {
+    "id": "legit-wide-column-update-captured",
+    "class": "adversarial-legit",
+    "payload": "UPDATE … SET notes=… (single-int-PK) with the written `notes` pre-image CAPTURED → fully reversible → guarded apply COMMITs",
     "vector": "naive",
     "expected_verdict": "ALLOW",
     "defense_layer": "guarded-apply"

@@ -158,6 +158,13 @@ struct ScriptedConn {
     tuple_deltas: Vec<RelationChange>,
     /// Per-cascade-relation captured pre-image ids (for the reversible-capture check).
     cascade_preimage_ids: BTreeMap<String, Vec<i64>>,
+    /// S5 #75: the columns the forward op declares it wrote on the target
+    /// (`ForwardResult::written_columns`). Empty ⇒ none declared.
+    written_columns: Vec<String>,
+    /// S5 #75: the pre-image columns the target capture actually holds. A
+    /// wide-column FN models a write that DECLARES `notes` written but CAPTURED only
+    /// `(status)` — the column-coverage guard must abort it.
+    captured_image_cols: Vec<String>,
     committed: bool,
     rolled_back: bool,
 }
@@ -171,10 +178,20 @@ fn checksum_of(rel: &str, ids: &[i64]) -> PkChecksum {
 }
 
 fn captured(ids: &[i64]) -> Vec<CapturedRow> {
+    captured_with_cols(ids, &["status".to_string()])
+}
+
+/// Capture `ids` with a scripted set of pre-image columns (each a text `"x"`) so a
+/// scenario can model a pre-image that does (or does NOT) cover a declared written
+/// column — the S5 #75 column-coverage guard.
+fn captured_with_cols(ids: &[i64], cols: &[String]) -> Vec<CapturedRow> {
     ids.iter()
         .map(|&id| CapturedRow {
             pk: PkTuple::single(PkValue::Int(id)),
-            before_image: vec![("status".into(), PkValue::Text("open".into()))],
+            before_image: cols
+                .iter()
+                .map(|c| (c.clone(), PkValue::Text("x".into())))
+                .collect(),
         })
         .collect()
 }
@@ -209,9 +226,15 @@ impl ApplyConn for ScriptedConn {
                 .unwrap_or_default();
             cascade_preimages.insert(rel.clone(), captured(&ids));
         }
+        let written = if self.captured_image_cols.is_empty() {
+            captured(&self.written_ids)
+        } else {
+            captured_with_cols(&self.written_ids, &self.captured_image_cols)
+        };
         Ok(ForwardResult {
-            written: captured(&self.written_ids),
+            written,
             cascade_preimages,
+            written_columns: self.written_columns.clone(),
         })
     }
     fn xact_tuple_deltas(&mut self) -> Result<Vec<RelationChange>, ApplyError> {
@@ -256,6 +279,14 @@ pub struct DataLossCase {
     pub apply_deltas: Vec<(String, OpCounts)>,
     /// Per-cascade captured pre-image ids (for the reversible-capture check).
     pub cascade_preimage_ids: Vec<(String, Vec<i64>)>,
+    /// S5 #75: the columns the forward op declares it wrote on the target
+    /// (`ForwardResult::written_columns`). Empty ⇒ none declared.
+    pub written_columns: Vec<String>,
+    /// S5 #75: the pre-image columns the target capture actually holds. A
+    /// wide-column FN sets `written_columns=[notes]` but `captured_image_cols=[status]`
+    /// — the column-coverage guard must abort (the captured pre-image cannot restore
+    /// the written `notes`). Empty ⇒ the default `[status]` pre-image.
+    pub captured_image_cols: Vec<String>,
 }
 
 /// Run a [`DataLossCase`] through the real `guarded_apply`. Returns the observed
@@ -356,6 +387,8 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
         written_ids,
         tuple_deltas,
         cascade_preimage_ids,
+        written_columns: case.written_columns.clone(),
+        captured_image_cols: case.captured_image_cols.clone(),
         committed: false,
         rolled_back: false,
     };
@@ -474,6 +507,8 @@ mod tests {
             written_override: None,
             apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 4, 1))],
             cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         };
         let o = probe_guarded_apply(&case);
         assert_eq!(o.verdict, crate::verdict::Verdict::Reverted);

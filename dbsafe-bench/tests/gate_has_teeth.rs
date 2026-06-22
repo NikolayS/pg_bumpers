@@ -96,6 +96,8 @@ fn flipping_the_guarded_apply_reconciliation_trips_the_gate() {
         // Reconciliation blinded: report ONLY the predicted change (del hidden).
         apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 4, 0))],
         cascade_preimage_ids: vec![],
+        written_columns: vec![],
+        captured_image_cols: vec![],
     };
     let neutered = dangerous_scenario(
         "data-loss-out-of-predicate-trigger-delete",
@@ -239,6 +241,8 @@ fn flipping_the_multi_level_cascade_capture_trips_the_gate() {
             (child, vec![20, 40, 60, 80]),
             (grandchild, vec![200, 400, 600, 800, 210, 410, 610, 810]),
         ],
+        written_columns: vec![],
+        captured_image_cols: vec![],
     };
     let neutered = dangerous_scenario(
         "multi-level-cascade-fail-closed",
@@ -262,5 +266,63 @@ fn flipping_the_multi_level_cascade_capture_trips_the_gate() {
     assert!(
         result.catastrophic_fn,
         "THE GATE HAS TEETH: a silently-committed multi-level cascade MUST be a catastrophic FN"
+    );
+}
+
+/// TEETH #5 (the S5 #75 fix, inverted) — prove the green
+/// `wide-column-update-uncaptured-column` scenario depends specifically on the
+/// step-8b column-coverage guard (`assert_written_column_coverage`).
+///
+/// We start from the FN model (writes `notes`, captured only `status`) and *flip
+/// the defense*: declare NO written columns, so the engine's column guard falls
+/// back to the non-empty-pre-image floor — which the captured `(status)` pre-image
+/// satisfies — and the wide-column UPDATE COMMITs `reversible:true` even though the
+/// real write would have mutated `notes` un-revertably. The runner MUST flag the
+/// catastrophic FN. If the green scenario aborted for any OTHER reason, this flip
+/// would not commit and the test would fail — so it pins the green scenario to the
+/// #75 column-coverage guard.
+#[test]
+fn flipping_the_wide_column_coverage_trips_the_gate() {
+    let neutered_case = DataLossCase {
+        relation: "public.orders".into(),
+        kind: WriteKind::Update,
+        grant_ids: vec![2, 4, 6, 8],
+        target_effect: OpCounts::new(0, 4, 0),
+        cascades: vec![],
+        extra_effect: vec![],
+        recompute_override: vec![],
+        written_override: None,
+        apply_deltas: vec![],
+        cascade_preimage_ids: vec![],
+        // Defense flipped: declare NO written columns, so the column guard only
+        // enforces the non-empty floor — which the captured `(status)` satisfies —
+        // and the wide-column write (which really mutated the uncaptured `notes`)
+        // COMMITs. This is exactly the pre-#75 silent un-revertable commit.
+        written_columns: vec![],
+        captured_image_cols: vec!["status".to_string()],
+    };
+    let neutered = dangerous_scenario(
+        "wide-column-update-uncaptured-column",
+        Verdict::Reverted,
+        DefenseLayer::GuardedApply,
+        Probe::GuardedApply(Box::new(neutered_case)),
+    );
+    let result = run_scenario(&neutered);
+
+    assert_eq!(
+        result.observed.verdict,
+        Verdict::Allow,
+        "with the written-column set undeclared, the column guard's floor passes and the \
+         wide-column UPDATE COMMITs (the pre-#75 silent un-revertable write)"
+    );
+    assert!(
+        result.observed.prod_rows_touched > 0,
+        "the committed wide-column write touched prod rows (the data the un-revertable \
+         inverse can no longer restore)"
+    );
+    assert!(
+        result.catastrophic_fn,
+        "THE GATE HAS TEETH: a wide-column UPDATE committed with an uncaptured written \
+         column MUST be a catastrophic FN"
     );
 }

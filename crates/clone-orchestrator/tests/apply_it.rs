@@ -327,9 +327,17 @@ impl ApplyConn for PgApplyConn<'_> {
                 before_image,
             });
         }
+        // The local fixture captures the full `(id, owner, balance)` image; declare
+        // the written columns so the S5 #75 column-coverage guard is exercised here
+        // too (a `SET balance = …` whose `balance` pre-image is captured passes).
+        let written_columns = match kind {
+            WriteKind::Update => vec!["owner".to_string(), "balance".to_string()],
+            WriteKind::Delete => vec![],
+        };
         Ok(ForwardResult {
             written,
             cascade_preimages,
+            written_columns,
         })
     }
 
@@ -1408,6 +1416,187 @@ fn t_before_trigger_value_hijack_inverse_captures_actual_old_values() {
     eprintln!(
         "T-before-trigger-hijack PASS: committed hijacked value, but the inverse captured the \
          ACTUAL OLD values → revert is correct"
+    );
+    drop_db(&admin, &dbname);
+}
+
+// ===========================================================================
+//  (3c) S5 BLOCKER (#75) — WIDE-COLUMN UPDATE column coverage. A single-int-PK
+//       UPDATE that writes a column the OLD hardcoded `(owner, balance)` pre-image
+//       never captured. Before the fix this committed `reversible:true` but the
+//       revert SILENTLY did not restore the written column — a catastrophic,
+//       un-revertable write. After the fix the apply captures the EXACT SET-clause
+//       columns' pre-image and the revert restores ALL written columns
+//       byte-for-byte (driven through the PRODUCTION conn.rs conns, not the local
+//       fixture, so this exercises exactly what `pgb-applyd` runs).
+// ===========================================================================
+
+/// Seed a `(id, owner, balance, notes)` wide table on a fresh DB and return its
+/// pre-state `id -> (owner, balance, notes)`.
+fn seed_wide(url: &str) -> BTreeMap<i32, (String, i64, String)> {
+    let mut c = Client::connect(url, NoTls).expect("wide seed connect");
+    c.batch_execute(
+        "CREATE TABLE public.wide (\
+            id int PRIMARY KEY, \
+            owner text NOT NULL, \
+            balance bigint NOT NULL, \
+            notes text NOT NULL); \
+         INSERT INTO public.wide(id, owner, balance, notes) \
+         SELECT g, 'owner-' || g, (g * 1000)::bigint, 'note-' || g \
+         FROM generate_series(1, 8) g;",
+    )
+    .expect("seed wide");
+    read_wide(url)
+}
+
+/// Read the full `(owner, balance, notes)` image of `public.wide` per id.
+fn read_wide(url: &str) -> BTreeMap<i32, (String, i64, String)> {
+    let mut c = Client::connect(url, NoTls).expect("wide read connect");
+    c.query(
+        "SELECT id, owner, balance, notes FROM public.wide ORDER BY id",
+        &[],
+    )
+    .expect("read wide")
+    .iter()
+    .map(|r| {
+        (
+            r.get::<_, i32>(0),
+            (
+                r.get::<_, String>(1),
+                r.get::<_, i64>(2),
+                r.get::<_, String>(3),
+            ),
+        )
+    })
+    .collect()
+}
+
+/// Build an UPDATE grant for `public.wide` over `where_sql` by rehearsing
+/// `forward_sql` (the real symmetric `pg_stat_xact_*` measure), with the target
+/// PK-set checksum read from the live data set.
+fn grant_for_wide(
+    proposal_id: &str,
+    url: &str,
+    where_sql: &str,
+    forward_sql: &str,
+    duration_ms: u64,
+) -> BlastRadius {
+    use pgb_core::blast_radius::Affected;
+    use pgb_core::LockMode;
+
+    let mut c = Client::connect(url, NoTls).expect("wide grant connect");
+    let rows = c
+        .query(
+            &format!("SELECT id FROM public.wide WHERE {where_sql} ORDER BY id"),
+            &[],
+        )
+        .expect("wide grant select");
+    let mut b = PkSetBuilder::for_relation("public.wide");
+    for row in &rows {
+        let id: i32 = row.get(0);
+        b.push(PkTuple::single(PkValue::Int(id as i64))).unwrap();
+    }
+    let target_cs = b.finalize().unwrap();
+    let n = rows.len() as u64;
+
+    let mut pk_set_checksum = BTreeMap::new();
+    pk_set_checksum.insert("public.wide".to_string(), target_cs.as_prefixed());
+    let mut by_table = BTreeMap::new();
+    by_table.insert("public.wide".to_string(), n);
+    let effect_by_table = measure_full_effect(url, forward_sql);
+
+    BlastRadius {
+        proposal_id: proposal_id.to_string(),
+        clone_lsn: "0/0".into(),
+        staleness_lsn_bytes: 0,
+        affected: Affected {
+            by_table,
+            cascade_by_table: BTreeMap::new(),
+            pk_set_checksum,
+            effect_by_table,
+            total_rows: n,
+        },
+        triggers_fired: vec![],
+        locks: vec![],
+        max_lock_mode: LockMode::RowExclusiveLock,
+        duration_ms,
+        wal_bytes: 0,
+        constraint_violations: vec![],
+        reversible: true,
+        inverse_kind: WriteKind::Update.inverse_kind(),
+        predicate_volatile: false,
+    }
+}
+
+#[test]
+fn t_wide_column_update_is_fully_reversible_revert_restores_all_columns() {
+    let Some((admin, dbname, _c)) = setup("wide_column_update") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = seed_wide(&url);
+
+    // A single-int-PK UPDATE that writes ONLY the `notes` column — exactly the
+    // shape the OLD hardcoded `(owner, balance)` pre-image never captured.
+    let where_sql = "id % 2 = 0";
+    let forward = "UPDATE public.wide SET notes = 'hacked' WHERE id % 2 = 0";
+    let grant = grant_for_wide("p-wide", &url, where_sql, forward, 50);
+
+    // Drive the PRODUCTION conn.rs PgApplyConn (what pgb-applyd uses), NOT the
+    // local fixture — so this proves the daemon's real apply path is reversible.
+    let mut apply_client = Client::connect(&url, NoTls).expect("apply connect");
+    let applied = {
+        let mut conn =
+            pgb_clone_orchestrator::PgApplyConn::new(&mut apply_client, forward, where_sql);
+        guarded_apply(
+            "p-wide",
+            WriteKind::Update,
+            "public.wide",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+        .expect("a single-int-PK wide-column UPDATE must be reversibly APPLIED")
+    };
+    assert_eq!(applied.rows_written, 4);
+
+    // The committed write: even rows now carry notes='hacked'; the inverse MUST
+    // have captured the `notes` pre-image (the bug was that it did not).
+    let after_apply = read_wide(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(after_apply[&id].2, "hacked", "even {id} notes written");
+    }
+    let captured_notes = applied
+        .inverse
+        .rows
+        .iter()
+        .all(|r| r.before_image.iter().any(|(c, _)| c == "notes"));
+    assert!(
+        captured_notes,
+        "the typed-inverse MUST capture the WRITTEN `notes` column's pre-image \
+         (the S5 #75 bug: it captured only (owner,balance) and silently dropped notes)"
+    );
+
+    // REVERT via the ACTUAL captured inverse → ALL columns restored byte-for-byte,
+    // including the previously-uncaptured `notes`.
+    {
+        let mut client = Client::connect(&url, NoTls).expect("revert connect");
+        let mut rconn = pgb_clone_orchestrator::PgRevertConn::new(&mut client);
+        let report = pgb_clone_orchestrator::revert(&applied.inverse, &mut rconn)
+            .expect("revert must succeed");
+        assert_eq!(report.total_restored, 4);
+    }
+    let after_revert = read_wide(&url);
+    assert_eq!(
+        before, after_revert,
+        "revert MUST restore the FULL row (incl. the previously-uncaptured `notes`) \
+         byte-for-byte — a wide-column UPDATE is genuinely reversible, not a silent FN"
+    );
+    eprintln!(
+        "T-wide-column-update PASS: SET notes=… captured + reverted ALL columns \
+         (no silent un-revertable write)"
     );
     drop_db(&admin, &dbname);
 }

@@ -204,6 +204,23 @@ pub enum ApplyError {
         detail: String,
     },
 
+    /// **A written COLUMN has no captured pre-image** (step 8, column coverage,
+    /// S5 #75): an `UPDATE`-written row mutated a column whose OLD value the
+    /// typed-inverse never captured, so the revert cannot restore it. This is the
+    /// catastrophic, silent un-revertable write the apply-time column guard closes —
+    /// a write must NEVER commit `reversible:true` with an incomplete inverse. The
+    /// guard fails closed: any written row missing a pre-image for any written column
+    /// aborts before commit (no mutation). → ROLLBACK.
+    #[error("GUARD ABORT (uncaptured written column on `{relation}` pk={pk}): the write mutated column(s) {missing:?} but the typed-inverse captured no pre-image for them — the change is not reversible")]
+    UncapturedColumn {
+        /// The relation whose written column was not captured.
+        relation: String,
+        /// The PK of the written row missing a column pre-image (for diagnostics).
+        pk: String,
+        /// The written column(s) with no captured pre-image.
+        missing: Vec<String>,
+    },
+
     /// The apply txn exceeded its `statement_timeout` (step 2) and was aborted by
     /// the server — **no partial commit**. Surfaced distinctly so the caller can
     /// tell a timeout abort from a drift abort.
@@ -255,15 +272,35 @@ pub struct ForwardResult {
     /// `UPDATE` with no cascades. The connection populates this symmetrically with
     /// what the dry-run measured in `cascade_by_table`.
     pub cascade_preimages: BTreeMap<String, Vec<CapturedRow>>,
+    /// The **columns the forward op mutated on the target** (the UPDATE SET-clause
+    /// targets, S5 #75). The connection fills this so the engine's step-8 coverage
+    /// guard can verify — defense-in-depth, even if the dry-run column gate were
+    /// bypassed — that **every written column has a captured pre-image** in each
+    /// `written` row before commit. Empty ⇒ the connection declared no specific
+    /// written-column set (a `DELETE`, whose full-row re-insert is row-covered, or a
+    /// legacy/scripted conn); the column guard then only enforces the
+    /// non-empty-pre-image floor.
+    pub written_columns: Vec<String>,
 }
 
 impl ForwardResult {
-    /// Convenience constructor for a target-only forward result (no cascades).
+    /// Convenience constructor for a target-only forward result (no cascades, no
+    /// declared written-column set — the column guard then enforces only the
+    /// non-empty-pre-image floor).
     pub fn new(written: Vec<CapturedRow>) -> Self {
         ForwardResult {
             written,
             cascade_preimages: BTreeMap::new(),
+            written_columns: Vec::new(),
         }
+    }
+
+    /// Declare the columns the forward op mutated on the target (S5 #75). The
+    /// engine's step-8 coverage guard verifies each written row's pre-image covers
+    /// all of these before commit.
+    pub fn with_written_columns(mut self, cols: Vec<String>) -> Self {
+        self.written_columns = cols;
+        self
     }
 
     /// The checksum of the **written** PK set (the target rows the forward op
@@ -698,7 +735,90 @@ fn guarded_body(
     //     commit an unrevertable change (#48 multi-level-cascade fail-closed).
     assert_reversible_preimage_coverage(relation, &deltas, &forward)?;
 
+    // (8b) COLUMN coverage (S5 #75). The row guard above proves every changed ROW
+    //      has a pre-image, but NOT that the pre-image covers every changed COLUMN.
+    //      An UPDATE that mutates a column whose OLD value was never captured commits
+    //      `reversible:true` with an inverse that silently cannot restore it — a
+    //      catastrophic FN. Verify every target written row's pre-image covers the
+    //      written columns (the conn declares them; with none declared we enforce the
+    //      non-empty-pre-image floor). Defense-in-depth: even if the dry-run column
+    //      gate were bypassed, the apply aborts here BEFORE commit (no mutation).
+    assert_written_column_coverage(kind, relation, &forward)?;
+
     Ok(forward)
+}
+
+/// Step 8b — **fail-closed written-COLUMN coverage** (S5 #75).
+///
+/// The row-level [`assert_reversible_preimage_coverage`] proves every changed *row*
+/// has a captured pre-image, but a typed-inverse `PREIMAGE_UPSERT` only restores the
+/// *columns* present in each row's `before_image`. If an `UPDATE` mutated a column
+/// whose OLD value the conn never captured (the S5 #75 bug: a hardcoded
+/// `(owner, balance)` capture against a `SET notes = …` write), the inverse would
+/// restore the wrong/no value for that column — a silent un-revertable write that
+/// nonetheless committed `reversible:true`.
+///
+/// This guard closes that hole for the **target** of an `UPDATE`:
+/// - if the conn declared the written columns ([`ForwardResult::written_columns`]),
+///   every target written row's `before_image` MUST contain a pre-image for each of
+///   them (excluding the PK `id`, which keys the row and is not "restored");
+/// - if the conn declared none (a legacy/scripted conn), we still enforce the
+///   **non-empty-pre-image floor**: a written row whose `before_image` carries only
+///   the PK (or nothing) has nothing for the inverse to restore → abort.
+///
+/// A `DELETE`'s inverse is a whole-row re-insert (row-covered by step 8), so no
+/// per-column gate applies. Any miss aborts BEFORE commit → ROLLBACK, no mutation.
+fn assert_written_column_coverage(
+    kind: WriteKind,
+    relation: &str,
+    forward: &ForwardResult,
+) -> Result<(), ApplyError> {
+    if kind != WriteKind::Update {
+        return Ok(());
+    }
+    // The columns the inverse must be able to restore (the written columns minus the
+    // PK, which is never re-restored — it only keys the upsert).
+    let required: BTreeSet<&str> = forward
+        .written_columns
+        .iter()
+        .map(|c| c.as_str())
+        .filter(|c| *c != "id")
+        .collect();
+
+    for row in &forward.written {
+        let captured: BTreeSet<&str> = row
+            .before_image
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .filter(|c| *c != "id")
+            .collect();
+
+        if required.is_empty() {
+            // Floor: with no declared written-column set, a pre-image that carries
+            // no non-PK column cannot restore anything an UPDATE changed.
+            if captured.is_empty() {
+                return Err(ApplyError::UncapturedColumn {
+                    relation: relation.to_string(),
+                    pk: format!("{:?}", row.pk.values()),
+                    missing: vec!["<any written column>".to_string()],
+                });
+            }
+        } else {
+            let missing: Vec<String> = required
+                .iter()
+                .filter(|c| !captured.contains(*c))
+                .map(|c| c.to_string())
+                .collect();
+            if !missing.is_empty() {
+                return Err(ApplyError::UncapturedColumn {
+                    relation: relation.to_string(),
+                    pk: format!("{:?}", row.pk.values()),
+                    missing,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Step 8 — **fail-closed reversible pre-image coverage** across the FULL actual
@@ -976,10 +1096,20 @@ mod tests {
     }
 
     fn captured(ids: &[i64]) -> Vec<CapturedRow> {
+        captured_with_cols(ids, &["status"])
+    }
+
+    /// Capture `ids` with a scripted set of pre-image columns (each a text `"x"`),
+    /// so a test can model a pre-image that does (or does NOT) cover a declared
+    /// written column — the S5 #75 column-coverage guard.
+    fn captured_with_cols(ids: &[i64], cols: &[&str]) -> Vec<CapturedRow> {
         ids.iter()
             .map(|&id| CapturedRow {
                 pk: PkTuple::single(PkValue::Int(id)),
-                before_image: vec![("status".into(), PkValue::Text("open".into()))],
+                before_image: cols
+                    .iter()
+                    .map(|c| ((*c).to_string(), PkValue::Text("x".into())))
+                    .collect(),
             })
             .collect()
     }
@@ -1006,6 +1136,14 @@ mod tests {
         cascade_preimage_ids: BTreeMap<String, Vec<i64>>,
         /// If set, `apply_forward` returns Timeout.
         timeout_at_forward: Option<u64>,
+        /// S5 #75: the columns the forward op declares it wrote on the target
+        /// (`ForwardResult::written_columns`). Empty ⇒ none declared.
+        written_columns: Vec<String>,
+        /// S5 #75: override the captured target `before_image` columns (the
+        /// `(col, "x")` text image each written row carries). `None` ⇒ the default
+        /// `[("status", "open")]` — so a test can model a pre-image that does NOT
+        /// cover a declared written column (the column-coverage abort).
+        written_image_cols: Option<Vec<String>>,
         // observability
         restore_points: Vec<String>,
         began_with_timeout: Option<u64>,
@@ -1061,6 +1199,15 @@ mod tests {
                 return Err(ApplyError::Timeout { timeout_ms: t });
             }
             let ids = self.inner().written_ids.clone();
+            let image_cols = self.inner().written_image_cols.clone();
+            let written_columns = self.inner().written_columns.clone();
+            let written = match &image_cols {
+                Some(cols) => {
+                    let refs: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+                    captured_with_cols(&ids, &refs)
+                }
+                None => captured(&ids),
+            };
             let mut cascade_preimages = BTreeMap::new();
             for rel in cascade_relations {
                 let cids = self
@@ -1072,8 +1219,9 @@ mod tests {
                 cascade_preimages.insert(rel.clone(), captured(&cids));
             }
             Ok(ForwardResult {
-                written: captured(&ids),
+                written,
                 cascade_preimages,
+                written_columns,
             })
         }
         fn xact_tuple_deltas(&mut self) -> Result<Vec<RelationChange>, ApplyError> {
@@ -2112,6 +2260,110 @@ mod tests {
                 panic!("expected IrreversibleChange on the uncaptured side relation, got {other:?}")
             }
         }
+        assert!(probe.inner().rolled_back);
+        assert!(!probe.inner().committed);
+    }
+
+    // ---- S5 #75: written-COLUMN coverage (apply-time, defense-in-depth) -----
+
+    /// THE S5 #75 BLOCKER at the engine layer: an UPDATE that DECLARES it wrote the
+    /// `notes` column but whose captured pre-image holds only `status` (the old
+    /// hardcoded shape never captured `notes`). Step 8b column-coverage MUST abort
+    /// with `UncapturedColumn` BEFORE commit — even though every ROW has a pre-image
+    /// (step 8 passes) — because the inverse cannot restore the written `notes`. A
+    /// write must NEVER commit `reversible:true` with an incomplete inverse.
+    #[test]
+    fn uncaptured_written_column_aborts_before_commit() {
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        // The forward op declares it wrote `notes`, but the captured pre-image only
+        // holds `status` — `notes` is uncaptured (the silent un-revertable write).
+        conn.inner().written_columns = vec!["notes".to_string()];
+        conn.inner().written_image_cols = Some(vec!["status".to_string()]);
+        let probe = conn.clone();
+        let grant = grant_for("p-col", REL, &[2, 4, 6, 8], 5);
+        let err = guarded_apply(
+            "p-col",
+            WriteKind::Update,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::UncapturedColumn {
+                relation, missing, ..
+            } => {
+                assert_eq!(relation, REL);
+                assert_eq!(missing, vec!["notes".to_string()]);
+            }
+            other => panic!(
+                "a written column with no captured pre-image MUST abort \
+                 (UncapturedColumn), got {other:?}"
+            ),
+        }
+        let p = probe.inner();
+        assert!(
+            p.rolled_back,
+            "an uncaptured written column must ROLLBACK (no silent un-revertable commit)"
+        );
+        assert!(
+            !p.committed,
+            "it must NOT commit reversible:true with an incomplete inverse"
+        );
+    }
+
+    /// The positive companion: an UPDATE that declares `notes` written AND captured
+    /// its pre-image commits normally (the guard does not over-fire).
+    #[test]
+    fn captured_written_column_commits() {
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        conn.inner().written_columns = vec!["notes".to_string()];
+        conn.inner().written_image_cols = Some(vec!["notes".to_string()]);
+        let probe = conn.clone();
+        let grant = grant_for("p-col-ok", REL, &[2, 4, 6, 8], 5);
+        guarded_apply(
+            "p-col-ok",
+            WriteKind::Update,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .expect("a fully-captured written column must COMMIT");
+        assert!(probe.inner().committed);
+        assert!(!probe.inner().rolled_back);
+    }
+
+    /// The non-empty-pre-image FLOOR (no declared written columns): a written row
+    /// whose captured pre-image carries ONLY the PK has nothing for the inverse to
+    /// restore → abort, even without a declared written-column set.
+    #[test]
+    fn empty_preimage_floor_aborts_when_no_columns_declared() {
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        // No declared written columns; captured pre-image holds only the PK `id`.
+        conn.inner().written_image_cols = Some(vec!["id".to_string()]);
+        let probe = conn.clone();
+        let grant = grant_for("p-floor", REL, &[2, 4, 6, 8], 5);
+        let err = guarded_apply(
+            "p-floor",
+            WriteKind::Update,
+            REL,
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::UncapturedColumn { .. }),
+            "{err:?}"
+        );
         assert!(probe.inner().rolled_back);
         assert!(!probe.inner().committed);
     }

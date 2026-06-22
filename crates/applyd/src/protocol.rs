@@ -133,6 +133,12 @@ pub enum ErrorCode {
     ConfirmMismatch,
     /// The apply-time PK-set drifted from the dry-run (the §4 guard fired).
     BlastDrift,
+    /// The `_meta` audit append failed — the operation is **not certified
+    /// auditable** and so is reported as failed, fail-closed (S5 #75). The
+    /// deterministic write may have committed before the audit failure (the audit
+    /// chain is a separate connection, not co-committed in the MVP); this code says
+    /// so honestly rather than returning a clean success with no audit record.
+    AuditFailed,
 }
 
 impl ErrorCode {
@@ -147,6 +153,7 @@ impl ErrorCode {
             ErrorCode::GrantRejected => "GRANT_REJECTED",
             ErrorCode::ConfirmMismatch => "CONFIRM_MISMATCH",
             ErrorCode::BlastDrift => "BLAST_DRIFT",
+            ErrorCode::AuditFailed => "AUDIT_FAILED",
         }
     }
 
@@ -182,6 +189,11 @@ impl ErrorCode {
             ),
             ErrorCode::BlastDrift => (
                 "the data drifted since dry_run; re-run dry_run and re-approve before applying",
+                false,
+            ),
+            ErrorCode::AuditFailed => (
+                "the audit chain append failed; the deterministic write may have committed but \
+                 is not certified auditable — inspect the _meta chain and the daemon logs",
                 false,
             ),
         }

@@ -66,21 +66,44 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
 - **SPEC.amendments tie:** "S5 — MCP production wire + live Core (#67)" →
   *"Not a security boundary (the honesty contract)"*.
 
-## B3 — Generic-schema apply is DEFERRED (MVP = single-int-PK UPDATE/DELETE)
+## B3 — Generic-schema apply is DEFERRED (MVP = single-`int4`-PK UPDATE/DELETE), but **column-coverage is now ENFORCED**
 
-- **Damage class:** reversible write (write). **Defense layer:** dry-run / certify.
-- **What it is:** the bounded-reversible apply is constrained to the
-  **single-integer-PK `UPDATE`/`DELETE`** shape on an `(id, …)` table the proven
-  `PgApplyConn`/`PgRevertConn` cover. A wider shape is **not silently mis-applied**:
-  it is gated OUT, fail-closed, by the dry-run's PK-less / volatile / irreversible /
-  non-rehearsable **REFUSALs** (you get `PK_LESS` / `VOLATILE` / `NOT_REHEARSABLE`,
-  never a broken reversible write). The "bypass" is purely a *coverage* limit:
-  legitimate non-single-int-PK writes are refused rather than applied.
-- **Repro:** `dbsafe-bench` `refused-pkless-delete`, `refused-volatile-insert`,
-  `refused-insert-no-pk`, `refused-update-no-preimage` → all `REFUSED` at certify;
-  the marquee CLASS 2 only applies the supported `UPDATE … WHERE id % 2 = 0` shape.
-- **SPEC.amendments tie:** "S5 (#67) DEFERRED → Generic-schema `ApplyConn` beyond
-  single-int-PK"; "S2 clone-orchestrator — no production generic-schema `ApplyConn`".
+- **Damage class:** reversible write (write). **Defense layer:** dry-run / certify /
+  guarded-apply column-coverage.
+- **What it is (and the S5 #75 correction):** the bounded-reversible apply is
+  constrained to the **single-`int4`-PK `UPDATE`/`DELETE`** shape the proven
+  `PgApplyConn`/`PgRevertConn` cover. The PK *width/cardinality* is a coverage limit;
+  the *columns* are NOT. Two distinct boundary conditions, now both honest:
+  - **Wider / composite PK** (`int8`/`text`/`uuid`/multi-column) → **REFUSED cleanly
+    at dry-run** (`NOT_REHEARSABLE`), a `pg_index`/`pg_type` read only, **no panic**,
+    and the resident apply connection stays healthy and serves the next request. A
+    genuinely PK-less table is still the distinct `PK_LESS` refusal.
+  - **ANY column on a single-`int4`-PK table** (S5 #75 fix). The earlier claim that
+    "a wider shape is gated OUT" was **WRONG for a wider-*column* UPDATE**: an
+    `UPDATE … SET notes = …` on an `(id, owner, balance, notes)` table used to commit
+    `reversible:true` while the hardcoded `(owner, balance)` pre-image silently
+    dropped `notes` — a catastrophic, un-revertable write. **Now** the apply captures
+    the pre-image of **exactly the SET-clause columns** (a `DELETE` captures the full
+    row) and the revert restores **every written column byte-for-byte**, so such an
+    UPDATE is **genuinely reversible — accepted, not refused**. A column type the MVP
+    cannot capture losslessly (e.g. `jsonb`) is refused at dry-run
+    (`NOT_REHEARSABLE`). **Defense-in-depth:** even if the dry-run column gate were
+    bypassed, the guarded-apply step-8b **column-coverage guard** aborts before commit
+    (`UncapturedColumn`) — a write can NEVER commit `reversible:true` with an
+    incomplete inverse.
+- **Repro:** `dbsafe-bench` `refused-pkless-delete` / `refused-volatile-insert` /
+  `refused-insert-no-pk` / `refused-update-no-preimage` (REFUSED at certify),
+  `wide-column-update-uncaptured-column` (REVERTED — the column-coverage guard
+  aborts an uncaptured written column) + its legit peer
+  `legit-wide-column-update-captured` (ALLOW — a captured wide-column UPDATE
+  commits); IT: `dry_run_it::non_int4_pk_is_refused_not_rehearsable_no_panic_conn_survives`,
+  `dry_run_it::update_with_uncapturable_set_column_is_refused`,
+  `apply_it::t_wide_column_update_is_fully_reversible_revert_restores_all_columns`;
+  the marquee CLASS 2 now applies BOTH the `SET balance = 0` and the wide-column
+  `SET notes = 'audited'` shapes (each reversibly).
+- **SPEC.amendments tie:** "S5 #75 — write-floor column coverage + clean PK-type
+  refusal + applyd audit fail-closed"; "S5 (#67) DEFERRED → Generic-schema `ApplyConn`
+  beyond single-`int4`-PK".
 
 ## B4 — Cross-process session attestation is DEFERRED (T4)
 

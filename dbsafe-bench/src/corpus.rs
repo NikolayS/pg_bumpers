@@ -121,6 +121,8 @@ mod dl {
             written_override: None,
             apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 4, 1))],
             cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         }
     }
 
@@ -147,6 +149,8 @@ mod dl {
                 (cascade.clone(), OpCounts::new(0, 0, 54)),
             ],
             cascade_preimage_ids: vec![(cascade, vec![20, 40, 60, 80])],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         }
     }
 
@@ -170,6 +174,8 @@ mod dl {
                 (audit, OpCounts::new(0, 0, 4)),
             ],
             cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         }
     }
 
@@ -189,6 +195,8 @@ mod dl {
             written_override: None,
             apply_deltas: vec![],
             cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         }
     }
 
@@ -249,6 +257,8 @@ mod dl {
             // a cascade relation, so its 8 destroyed rows have ZERO captured
             // pre-images → step-8 `assert_reversible_preimage_coverage` ABORTS.
             cascade_preimage_ids: vec![(child, vec![20, 40, 60, 80])],
+            written_columns: vec![],
+            captured_image_cols: vec![],
         }
     }
 
@@ -267,6 +277,57 @@ mod dl {
             written_override: None,
             apply_deltas: vec![], // clean: target changed exactly as predicted
             cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
+        }
+    }
+
+    /// **S5 #75 — WIDE-COLUMN UPDATE, uncaptured column: fail-closed.** A single-int-PK
+    /// `UPDATE … SET notes = …` that mutates `notes`, but whose captured pre-image
+    /// holds only `(status)` — exactly the old hardcoded-shape bug. Every ROW has a
+    /// pre-image (step 8 passes) and the PK set + footprint reconcile cleanly, so the
+    /// pre-#75 guards COMMITTED it `reversible:true` with an inverse that silently
+    /// could not restore `notes` — a catastrophic FN. The #75
+    /// `assert_written_column_coverage` (step 8b) sees `notes` declared-written but
+    /// uncaptured → `UncapturedColumn` ABORT (REVERTED, `prod_rows_touched=0`).
+    pub fn wide_column_update_uncaptured() -> DataLossCase {
+        DataLossCase {
+            relation: "public.orders".into(),
+            kind: WriteKind::Update,
+            grant_ids: vec![2, 4, 6, 8],
+            target_effect: OpCounts::new(0, 4, 0),
+            cascades: vec![],
+            extra_effect: vec![],
+            recompute_override: vec![],
+            written_override: None,
+            apply_deltas: vec![], // clean: target changed exactly as predicted
+            cascade_preimage_ids: vec![],
+            // The write DECLARES it mutated `notes`, but the captured pre-image holds
+            // only `status` → the column-coverage guard must abort (no inverse for
+            // the written `notes`).
+            written_columns: vec!["notes".to_string()],
+            captured_image_cols: vec!["status".to_string()],
+        }
+    }
+
+    /// The legit companion: a wide-column UPDATE whose written column `notes` IS
+    /// captured → genuinely reversible, COMMITs. Proves the #75 guard does not
+    /// over-fire on a correctly-captured wide-column write (the write-path FP
+    /// denominator for column coverage).
+    pub fn wide_column_update_captured() -> DataLossCase {
+        DataLossCase {
+            relation: "public.orders".into(),
+            kind: WriteKind::Update,
+            grant_ids: vec![2, 4, 6, 8],
+            target_effect: OpCounts::new(0, 4, 0),
+            cascades: vec![],
+            extra_effect: vec![],
+            recompute_override: vec![],
+            written_override: None,
+            apply_deltas: vec![],
+            cascade_preimage_ids: vec![],
+            written_columns: vec!["notes".to_string()],
+            captured_image_cols: vec!["notes".to_string()],
         }
     }
 }
@@ -398,6 +459,22 @@ pub fn corpus() -> Vec<Scenario> {
             DefenseLayer::GuardedApply,
             Some(true),
             Probe::GuardedApply(Box::new(dl::multi_level_cascade_fail_closed())),
+        ),
+        // --- wide-column UPDATE (S5 #75): uncaptured written column, fail-closed
+        // A single-int-PK `UPDATE … SET notes = …` whose pre-image captured only
+        // `(status)` — the column the write mutated has NO captured pre-image. Every
+        // ROW has a pre-image and the PK-set + footprint reconcile, so the pre-#75
+        // guards COMMITTED it `reversible:true` with a silently un-revertable inverse
+        // (the catastrophic FN). Step-8b column coverage aborts it (REVERTED).
+        Scenario::new(
+            "wide-column-update-uncaptured-column",
+            Class::Dangerous,
+            "UPDATE … SET notes=… (single-int-PK) but the pre-image captured only (status) → written column `notes` is un-revertable → UncapturedColumn ABORT",
+            Vector::Obfuscated,
+            Verdict::Reverted,
+            DefenseLayer::GuardedApply,
+            Some(true),
+            Probe::GuardedApply(Box::new(dl::wide_column_update_uncaptured())),
         ),
         // --- refused-ops (default-deny certify → REFUSED) --------------------
         Scenario::new(
@@ -685,6 +762,19 @@ pub fn corpus() -> Vec<Scenario> {
             DefenseLayer::GuardedApply,
             None,
             Probe::GuardedApply(Box::new(dl::legit_bulk_backfill())),
+        ),
+        // The wide-column UPDATE legit counterpart (S5 #75): the written `notes`
+        // column IS captured → genuinely reversible → COMMITs. Proves the column
+        // guard does not over-fire (the FP denominator for column coverage).
+        Scenario::new(
+            "legit-wide-column-update-captured",
+            Class::AdversarialLegit,
+            "UPDATE … SET notes=… (single-int-PK) with the written `notes` pre-image CAPTURED → fully reversible → guarded apply COMMITs",
+            Vector::Naive,
+            Verdict::Allow,
+            DefenseLayer::GuardedApply,
+            None,
+            Probe::GuardedApply(Box::new(dl::wide_column_update_captured())),
         ),
         // A legit certified write shape (bounded UPDATE with pre-image + PK):
         // certify ALLOWs it — the write-path FP denominator at the certify layer.

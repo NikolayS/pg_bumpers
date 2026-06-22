@@ -737,3 +737,105 @@ fn full_lifecycle_is_audited_to_the_shared_chain() {
     // The chain verifies within-chain (one shared genesis).
     pgb_audit::verify_chain(&records).expect("the lifecycle chain verifies");
 }
+
+// ===========================================================================
+//  (S5 #75) APPLY-PATH AUDIT FAIL-CLOSED — an apply does NOT report success
+//  without a recorded `_meta` row. With an injected sink that fails the
+//  `apply_committed` append, the apply surfaces AUDIT_FAILED.
+// ===========================================================================
+
+/// A sink that delegates to an [`InMemorySink`] but **fails** the append whose
+/// `reason_code` matches `fail_on` — modeling a `_meta` chain that cannot persist
+/// the apply-committed record (a backend outage at the worst moment). All other
+/// appends (request_elevation / grant_signed) succeed, so the lifecycle reaches
+/// apply normally and only the apply-path audit append fails.
+#[derive(Clone)]
+struct FailOnReasonSink {
+    inner: Arc<Mutex<InMemorySink>>,
+    fail_on: String,
+}
+
+impl FailOnReasonSink {
+    fn new(fail_on: &str) -> Self {
+        FailOnReasonSink {
+            inner: Arc::new(Mutex::new(InMemorySink::new())),
+            fail_on: fail_on.to_string(),
+        }
+    }
+}
+
+impl pgb_audit::Sink for FailOnReasonSink {
+    fn append(
+        &mut self,
+        entry: pgb_audit::NewEntry,
+        timestamp_ms: u64,
+    ) -> Result<pgb_audit::AuditRecord, pgb_audit::SinkError> {
+        if entry.reason_code == self.fail_on {
+            return Err(pgb_audit::SinkError::Backend(format!(
+                "injected failure on reason_code `{}`",
+                self.fail_on
+            )));
+        }
+        self.inner.lock().unwrap().append(entry, timestamp_ms)
+    }
+
+    fn load_chain(&self) -> Result<Vec<pgb_audit::AuditRecord>, pgb_audit::SinkError> {
+        self.inner.lock().unwrap().load_chain()
+    }
+}
+
+fn service_with_sink(vk: VerifyingKey, sink: SharedSink) -> Svc {
+    let flow = ApprovalFlow::new(
+        sink.clone(),
+        RecordingWebhookSender::new(),
+        vk,
+        InMemoryNonceStore::new(),
+    );
+    Service::new(flow, sink, InMemoryNonceStore::new(), vk, policy())
+}
+
+#[test]
+fn apply_does_not_report_success_when_the_audit_append_fails() {
+    let (sk, vk) = keypair();
+    let clock = MockClock::starting_at(5_000);
+    // The sink fails ONLY the apply-committed append; everything before succeeds.
+    let sink = SharedSink::new(FailOnReasonSink::new("apply_committed"));
+    let mut svc = service_with_sink(vk, sink);
+    let a = approve_through(&mut svc, &sk, &clock, FORWARD, "sess-a", "nonce-audfail");
+
+    let mut conn = MockConn::new(REL, IDS);
+    let probe = conn.clone();
+    let err = run_apply(
+        &mut svc,
+        &a.proposal_id,
+        a.total_rows,
+        Some(&a.confirm_token),
+        &mut conn,
+        &NoopBarrier::new(),
+        &clock,
+    )
+    .expect_err("a failed apply-committed audit append MUST NOT report success");
+
+    // FAIL-CLOSED: the apply is reported as AUDIT_FAILED, not a clean success.
+    assert_eq!(
+        err.data.code,
+        ErrorCode::AuditFailed.as_str(),
+        "an apply whose audit append failed must surface AUDIT_FAILED (not Ok), got {err:?}"
+    );
+    // The deterministic write itself still committed (separate connection — the
+    // honest MVP ordering; documented in `audit_apply`). The point is the SERVICE
+    // does not silently claim success: there is NO apply_committed audit record.
+    assert!(
+        probe.inner().committed,
+        "the write committed before the audit append failed (the honest ordering caveat)"
+    );
+    let records = svc.audit_records(50);
+    let has_committed = records
+        .iter()
+        .any(|r| r.payload.reason_code == "apply_committed");
+    assert!(
+        !has_committed,
+        "no apply_committed record was persisted, yet the call did NOT report success — \
+         the fail-closed contract holds (no silent unaudited success)"
+    );
+}

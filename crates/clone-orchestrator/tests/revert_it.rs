@@ -464,6 +464,7 @@ impl ApplyConn for PgApplyConn<'_> {
         Ok(ForwardResult {
             written,
             cascade_preimages,
+            written_columns: vec![],
         })
     }
     fn xact_tuple_deltas(&mut self) -> Result<Vec<RelationChange>, ApplyError> {

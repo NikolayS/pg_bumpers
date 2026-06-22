@@ -228,6 +228,32 @@ pub trait Rehearsal {
         Volatility::Unknown
     }
 
+    /// Certify the **apply shape** of `statement` against the live catalog
+    /// **before rehearsing** (S5 #75) — a `pg_attribute` read only, no forward
+    /// execution. Returns `Some(reason)` to **REFUSE** the proposal cleanly
+    /// ([`DryRunError::NotRehearsable`]), or `None` to proceed.
+    ///
+    /// The MVP apply path (`PgApplyConn`/`PgRevertConn`) is constrained to the
+    /// **single-`int4`-PK** shape and a reversible-capturable column set. This is the
+    /// gate that makes that constraint explicit at dry-run instead of surfacing as an
+    /// apply-time backend error: a wider PK type (`int8`/`text`/`uuid`/composite) or
+    /// an `UPDATE` whose SET columns are not losslessly capturable is refused HERE,
+    /// fail-closed, so it never reaches apply.
+    ///
+    /// The default implementation returns `None` (proceed) — the DB-free mock
+    /// backends in the unit tests model the engine orchestration, not the catalog
+    /// shape; the real [`crate::conn::PgRehearsal`] overrides it and the env-gated
+    /// integration tests prove the refusal against real PG18.
+    fn certify_apply_shape(
+        &mut self,
+        statement: &str,
+        kind: WriteKind,
+        target_relation: &str,
+    ) -> Option<String> {
+        let _ = (statement, kind, target_relation);
+        None
+    }
+
     /// Rehearse `statement` (a certified `kind` write on `target_relation`) in a
     /// rolled-back transaction and return the [`Measurement`].
     ///
@@ -374,6 +400,16 @@ pub fn dry_run(
         if let Some(reason) = predicate_volatile_reason(&proposal.statement, &mut resolver) {
             return Err(DryRunError::Volatile(reason));
         }
+    }
+
+    // (3b) Apply-shape certification (S5 #75) — REFUSE, before rehearsing, a shape
+    //      the MVP apply path cannot reversibly carry: a wider-than-`int4` / composite
+    //      PK, or an `UPDATE` whose SET columns are not losslessly capturable. This is
+    //      a `pg_attribute` read only (no forward execution) and is fail-closed —
+    //      `NotRehearsable` here, never a backend error / unrevertable commit later.
+    if let Some(reason) = rehearsal.certify_apply_shape(&proposal.statement, kind, &target_relation)
+    {
+        return Err(DryRunError::NotRehearsable(reason));
     }
 
     // (4) Rehearse in a rolled-back txn (the backend owns BEGIN/ROLLBACK).

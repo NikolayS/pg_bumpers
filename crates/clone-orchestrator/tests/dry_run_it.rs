@@ -560,6 +560,126 @@ fn pk_less_table_is_refused_no_ctid_fallback() {
 }
 
 // ===========================================================================
+//  S5 #75 — apply-shape gates: a non-`int4` PK and an uncapturable SET column
+//  are refused CLEANLY at dry-run (NOT_REHEARSABLE), no panic, and the SAME
+//  connection serves the next request (the daemon stays healthy).
+// ===========================================================================
+
+#[test]
+fn non_int4_pk_is_refused_not_rehearsable_no_panic_conn_survives() {
+    let Some((admin, dbname, mut client)) = setup("non_int4_pk") else {
+        return;
+    };
+    // Wider PK types the MVP apply path cannot reversibly carry: bigint, text, uuid.
+    client
+        .batch_execute(
+            "CREATE TABLE public.big_pk(id bigint PRIMARY KEY, v int NOT NULL); \
+             INSERT INTO public.big_pk VALUES (1, 10), (2, 20); \
+             CREATE TABLE public.txt_pk(id text PRIMARY KEY, v int NOT NULL); \
+             INSERT INTO public.txt_pk VALUES ('a', 1), ('b', 2); \
+             CREATE TABLE public.uuid_pk(id uuid PRIMARY KEY, v int NOT NULL); \
+             INSERT INTO public.uuid_pk VALUES (gen_random_uuid(), 1);",
+        )
+        .expect("seed wider-PK tables");
+
+    let clock = SystemClock::new();
+    for (rel, stmt) in [
+        (
+            "public.big_pk",
+            "UPDATE public.big_pk SET v = 0 WHERE v > 0",
+        ),
+        (
+            "public.txt_pk",
+            "UPDATE public.txt_pk SET v = 0 WHERE v > 0",
+        ),
+        ("public.uuid_pk", "DELETE FROM public.uuid_pk WHERE v > 0"),
+    ] {
+        let proposal = propose(stmt, None, &clock);
+        let err = {
+            let inner = SystemClock::new();
+            let mut backend = PgRehearsal::new(&mut client, &inner);
+            dry_run(&proposal, &mut backend, &clock).unwrap_err()
+        };
+        // Clean NOT_REHEARSABLE refusal — NEVER a panic / backend abort.
+        match err {
+            DryRunError::NotRehearsable(msg) => {
+                assert!(
+                    msg.contains("int4") && msg.contains(rel),
+                    "expected a single-int4-PK refusal naming `{rel}`, got: {msg}"
+                );
+                eprintln!("[non-int4-pk] {rel}: cleanly REFUSED → {msg}");
+            }
+            other => panic!("expected NotRehearsable for `{rel}`, got {other:?}"),
+        }
+    }
+
+    // The connection is still healthy — a normal query + a valid single-int4-PK
+    // dry-run on `accounts` BOTH succeed on the SAME client (no poisoned conn).
+    let n: i64 = client
+        .query_one("SELECT count(*) FROM public.accounts", &[])
+        .expect("conn still healthy after the refusals")
+        .get(0);
+    assert_eq!(n, 8);
+    {
+        let inner = SystemClock::new();
+        let mut backend = PgRehearsal::new(&mut client, &inner);
+        let ok = propose(
+            "UPDATE public.accounts SET balance = 0 WHERE id = 2",
+            None,
+            &clock,
+        );
+        dry_run(&ok, &mut backend, &clock)
+            .expect("a valid single-int4-PK dry-run must still succeed after the refusals");
+    }
+    eprintln!("[non-int4-pk] PASS: wider-PK refused cleanly; conn healthy; next request served");
+    drop_db(&admin, &dbname);
+}
+
+#[test]
+fn update_with_uncapturable_set_column_is_refused() {
+    let Some((admin, dbname, mut client)) = setup("uncapturable_set") else {
+        return;
+    };
+    // A single-int4-PK table with a column type the MVP capture does not support
+    // losslessly (jsonb). An UPDATE writing it must be refused at dry-run.
+    client
+        .batch_execute(
+            "CREATE TABLE public.doc(id int PRIMARY KEY, body jsonb NOT NULL); \
+             INSERT INTO public.doc VALUES (1, '{}'), (2, '{}');",
+        )
+        .expect("seed jsonb table");
+
+    let clock = SystemClock::new();
+    let stmt = "UPDATE public.doc SET body = '{\"x\":1}'::jsonb WHERE id % 2 = 0";
+    let proposal = propose(stmt, None, &clock);
+    let err = {
+        let inner = SystemClock::new();
+        let mut backend = PgRehearsal::new(&mut client, &inner);
+        dry_run(&proposal, &mut backend, &clock).unwrap_err()
+    };
+    match err {
+        DryRunError::NotRehearsable(msg) => {
+            assert!(
+                msg.contains("body"),
+                "expected an uncapturable-column refusal naming `body`, got: {msg}"
+            );
+            eprintln!("[uncapturable-set] cleanly REFUSED → {msg}");
+        }
+        other => panic!("expected NotRehearsable for the jsonb SET column, got {other:?}"),
+    }
+    // The jsonb rows are untouched (refused before any execution).
+    let unchanged: i64 = client
+        .query_one(
+            "SELECT count(*) FROM public.doc WHERE body = '{}'::jsonb",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(unchanged, 2, "no rows touched (refused before rehearsal)");
+    drop_db(&admin, &dbname);
+}
+
+// ===========================================================================
 //  Field population — staleness / wal_bytes / clone_lsn are real
 // ===========================================================================
 

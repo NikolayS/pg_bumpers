@@ -13,13 +13,18 @@
 //! while looking green).
 //!
 //! # MVP scope (the #1 risk — honored here)
-//! [`PgApplyConn`] / [`PgRevertConn`] are constrained to the **single-integer-PK
-//! `UPDATE`/`DELETE`** shape on a table whose pre-image is `(id, owner, balance)`
-//! — exactly the shape the IT already proves end-to-end (commit + revert restores
-//! the pre-state). A generic-schema apply that could mis-read the PK or skip a
-//! pre-image column is **DEFERRED** (it would break reversibility invisibly).
-//! Anything wider is gated out by the dry-run's existing PK-less / volatile /
-//! irreversible REFUSALS (fail-closed). [`PgRehearsal`] is generic (it measures
+//! [`PgApplyConn`] / [`PgRevertConn`] are constrained to the **single-`int4`-PK
+//! `UPDATE`/`DELETE`** shape. The PK *width/cardinality* is the coverage limit; the
+//! *columns* are NOT (S5 #75). For an `UPDATE`, the apply captures the pre-image of
+//! **exactly the SET-clause columns** the write mutates (parsed from the forward
+//! SQL) and the revert restores exactly those — so a write to ANY column is
+//! genuinely reversible, not a silent un-revertable commit. For a `DELETE`, the
+//! full row image is captured (whole-row re-insert). A wider/composite PK
+//! (`int8`/`text`/`uuid`/multi-col) or a column type the capture cannot restore
+//! losslessly is gated out **cleanly at dry-run** by
+//! [`PgRehearsal::certify_apply_shape`] (`NOT_REHEARSABLE`, no panic);
+//! defense-in-depth, the guarded-apply step-8b column-coverage guard aborts an
+//! uncaptured written column before commit. [`PgRehearsal`] is generic (it measures
 //! whatever the rehearsal touches); only the *apply* conn is shape-constrained.
 
 use std::collections::BTreeMap;
@@ -36,6 +41,18 @@ use crate::apply::{ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationCh
 use crate::dry_run::{AffectedTable, Measurement, Rehearsal, RelationEffect, WriteKind};
 use crate::revert::{RevertConn, RevertError, RevertRow};
 use crate::Volatility;
+
+/// The primary-key shape of a target relation, for the S5 #75 apply-shape gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PkShape {
+    /// No primary key — left to the §10.2 `PkLess` refusal (a distinct message).
+    NoPk,
+    /// Exactly one `int4` PK column — the supported MVP reversible-apply shape.
+    SingleInt4,
+    /// A composite PK, or a single PK of a wider type (`int8`/`text`/`uuid`/…) the
+    /// MVP apply path cannot reversibly carry — refused `NOT_REHEARSABLE`.
+    Other,
+}
 
 // ===========================================================================
 //  PgRehearsal — the §12 baseline in-txn rehearsal (clone.provider: none).
@@ -97,6 +114,80 @@ impl<'c, C: Clock> PgRehearsal<'c, C> {
             Ok(Volatility::Stable)
         }
     }
+
+    /// Classify `relation`'s primary-key shape for the MVP reversible-apply gate
+    /// (S5 #75). Reads `pg_index`/`pg_attribute`/`pg_type` only; never executes the
+    /// candidate.
+    ///
+    /// - [`PkShape::NoPk`] — no primary key (left to the §10.2 `PkLess` refusal);
+    /// - [`PkShape::SingleInt4`] — exactly one `int4` PK column (the supported shape);
+    /// - [`PkShape::Other`] — a composite PK, or a single PK of a wider type
+    ///   (`int8`/`text`/`uuid`/…) the apply path cannot reversibly carry.
+    fn target_pk_int4_shape(&mut self, relation: &str) -> Result<PkShape, String> {
+        let (schema, table) = split_relation(relation);
+        let rows = self
+            .client
+            .query(
+                r#"
+                SELECT t.typname
+                FROM pg_index i
+                JOIN pg_class c   ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+                JOIN pg_type t ON t.oid = a.atttypid
+                WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
+                ORDER BY array_position(i.indkey, a.attnum)
+                "#,
+                &[&schema, &table],
+            )
+            .map_err(|e| e.to_string())?;
+        match rows.len() {
+            0 => Ok(PkShape::NoPk),
+            1 if rows[0].get::<_, String>(0) == "int4" => Ok(PkShape::SingleInt4),
+            _ => Ok(PkShape::Other),
+        }
+    }
+
+    /// Of `columns`, those on `relation` whose type the MVP reversible-capture does
+    /// **not** support losslessly (S5 #75). A column not found in `pg_attribute` is
+    /// also returned (refuse rather than guess). Supported: `int2/4/8`,
+    /// `text/varchar/bpchar/name`, `bytea`.
+    fn uncapturable_columns(
+        &mut self,
+        relation: &str,
+        columns: &[String],
+    ) -> Result<Vec<String>, String> {
+        let (schema, table) = split_relation(relation);
+        let mut bad = Vec::new();
+        for col in columns {
+            let rows = self
+                .client
+                .query(
+                    r#"
+                    SELECT t.typname
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    JOIN pg_type t ON t.oid = a.atttypid
+                    WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                    "#,
+                    &[&schema, &table, col],
+                )
+                .map_err(|e| e.to_string())?;
+            let supported = match rows.first() {
+                Some(r) => matches!(
+                    r.get::<_, String>(0).as_str(),
+                    "int2" | "int4" | "int8" | "text" | "varchar" | "bpchar" | "name" | "bytea"
+                ),
+                None => false, // unknown column → refuse
+            };
+            if !supported {
+                bad.push(col.clone());
+            }
+        }
+        Ok(bad)
+    }
 }
 
 impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
@@ -105,6 +196,68 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
             Ok(v) => v,
             Err(_) => Volatility::Unknown,
         }
+    }
+
+    fn certify_apply_shape(
+        &mut self,
+        statement: &str,
+        kind: WriteKind,
+        target_relation: &str,
+    ) -> Option<String> {
+        // (a) PK must be exactly ONE column of type `int4` (the MVP shape the
+        //     PgApplyConn/PgRevertConn prove). A wider PK type / composite PK is
+        //     refused cleanly here rather than surfacing as an apply-time backend
+        //     error. A genuinely PK-LESS target is left to the existing §10.2
+        //     `PkLess` refusal (a distinct, more specific message), so we do NOT
+        //     refuse it here. A `pg_index`/`pg_attribute` read only — never the
+        //     candidate.
+        match self.target_pk_int4_shape(target_relation) {
+            Ok(PkShape::SingleInt4) | Ok(PkShape::NoPk) => {}
+            Ok(PkShape::Other) => {
+                return Some(format!(
+                    "target relation `{target_relation}` does not have a single `int4` \
+                     primary key — the MVP reversible apply path is constrained to a \
+                     single-`int4`-PK `UPDATE`/`DELETE` (a wider/composite PK is DEFERRED, \
+                     fail-closed)"
+                ));
+            }
+            Err(e) => {
+                return Some(format!(
+                    "could not resolve PK shape of `{target_relation}`: {e}"
+                ))
+            }
+        }
+
+        // (b) For an UPDATE, every SET-clause column must be losslessly capturable
+        //     (so the typed-inverse can restore it byte-for-byte). A non-plain SET
+        //     target or an unsupported column type is refused here, fail-closed.
+        if kind == WriteKind::Update {
+            let set_cols = match update_set_columns(statement) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Some(format!(
+                        "cannot determine the UPDATE SET-clause columns (so reversibility \
+                         cannot be certified): {e}"
+                    ));
+                }
+            };
+            match self.uncapturable_columns(target_relation, &set_cols) {
+                Ok(bad) if !bad.is_empty() => {
+                    return Some(format!(
+                        "UPDATE writes column(s) {bad:?} on `{target_relation}` whose type the \
+                         MVP reversible-capture does not support losslessly — refusing rather \
+                         than commit an unrevertable write (S5 #75, fail-closed)"
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Some(format!(
+                        "could not resolve SET-column types on `{target_relation}`: {e}"
+                    ));
+                }
+            }
+        }
+        None
     }
 
     fn rehearse(
@@ -169,9 +322,21 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
 // ===========================================================================
 
 /// The real-PG18 [`ApplyConn`] for the guarded-apply engine, constrained to the
-/// **single-integer-PK `UPDATE`/`DELETE`** shape on a `(id, owner, balance)`
-/// table (the MVP scope #66 already proves end-to-end). The engine owns the §4
-/// ordering + guard decisions; this conn owns the SQL run inside ONE apply txn.
+/// **single-integer-PK `UPDATE`/`DELETE`** shape (the MVP scope #66 already proves
+/// end-to-end). The engine owns the §4 ordering + guard decisions; this conn owns
+/// the SQL run inside ONE apply txn.
+///
+/// # Column-coverage (S5 #75)
+/// The typed-inverse must restore **every column the write actually mutates**. For
+/// an `UPDATE` this conn parses the **SET-clause target columns** out of
+/// `forward_sql` and captures the pre-image of exactly those columns (+ the PK) by
+/// name — so a `SET notes = …` is genuinely reversible, not a silent FN that
+/// captured only a hardcoded `(owner, balance)`. For a `DELETE` it captures the
+/// **full row image** (every column from `pg_attribute`) so the re-insert restores
+/// the whole row. If the SET targets cannot be parsed (a non-plain-column
+/// assignment, e.g. `SET (a,b)=(…)` or a sub-select tuple), the apply **fails
+/// closed** ([`ApplyError::Backend`]) rather than commit an incompletely-captured
+/// write.
 ///
 /// `forward_sql` is the exact write (e.g. `UPDATE … SET balance = 0 WHERE
 /// id % 2 = 0`); `where_sql` is its predicate, used to recompute the affected-PK
@@ -196,6 +361,29 @@ impl<'a> PgApplyConn<'a> {
             in_txn: false,
             statement_timeout_ms: 0,
         }
+    }
+
+    /// The full ordered column list of `relation` from `pg_attribute` (live,
+    /// dropped/system columns excluded). Used to capture a DELETE's full-row
+    /// pre-image so the re-insert restores every column.
+    fn all_columns(&mut self, relation: &str) -> Result<Vec<String>, ApplyError> {
+        let (schema, table) = split_relation(relation);
+        let rows = self
+            .client
+            .query(
+                r#"
+                SELECT a.attname
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1 AND c.relname = $2
+                  AND a.attnum > 0 AND NOT a.attisdropped
+                ORDER BY a.attnum
+                "#,
+                &[&schema, &table],
+            )
+            .map_err(|e| ApplyError::Backend(e.to_string()))?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     fn read_xact_raw(&mut self) -> Result<BTreeMap<String, (i64, i64, i64)>, ApplyError> {
@@ -260,7 +448,12 @@ impl ApplyConn for PgApplyConn<'_> {
             .map_err(|e| ApplyError::Backend(e.to_string()))?;
         let mut b = PkSetBuilder::for_relation(relation);
         for row in &rows {
-            let id: i32 = row.get(0);
+            // Fail-closed on a non-int4 PK rather than panic: a wider PK type is
+            // gated at dry_run (NOT_REHEARSABLE); if one ever reaches here, surface
+            // a typed Backend error so the apply aborts cleanly (no poisoned conn).
+            let id: i32 = row
+                .try_get(0)
+                .map_err(|e| ApplyError::Backend(format!("non-int4 PK on `{relation}`: {e}")))?;
             b.push(PkTuple::single(PkValue::Int(id as i64)))
                 .map_err(|e| ApplyError::Backend(e.to_string()))?;
         }
@@ -269,15 +462,43 @@ impl ApplyConn for PgApplyConn<'_> {
 
     fn apply_forward(
         &mut self,
-        _kind: WriteKind,
+        kind: WriteKind,
         relation: &str,
         _cascade: &[String],
     ) -> Result<ForwardResult, ApplyError> {
+        // The pre-image columns the typed-inverse must restore (S5 #75 column
+        // coverage). For an UPDATE: exactly the SET-clause target columns the write
+        // mutates (parsed from `forward_sql`), so the inverse restores precisely what
+        // changed regardless of which columns. For a DELETE: every column (full-row
+        // re-insert). The PK column `id` is always captured (the inverse keys on it).
+        let image_cols: Vec<String> = match kind {
+            WriteKind::Update => update_set_columns(&self.forward_sql).map_err(|e| {
+                ApplyError::Backend(format!(
+                    "cannot determine the UPDATE SET-clause columns to capture a \
+                     reversible pre-image (fail-closed; S5 #75): {e}"
+                ))
+            })?,
+            WriteKind::Delete => self.all_columns(relation)?,
+        };
+        // The select list is `id` (the PK) + each written column, de-duplicated and
+        // quoted. `id` first so the PK read is positional + cheap.
+        let mut select_cols: Vec<String> = vec!["id".to_string()];
+        for c in &image_cols {
+            if c != "id" && !select_cols.contains(c) {
+                select_cols.push(c.clone());
+            }
+        }
+        let select_list = select_cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         let preimage_rows = self
             .client
             .query(
                 &format!(
-                    "SELECT id, owner, balance FROM {relation} WHERE {} ORDER BY id FOR UPDATE",
+                    "SELECT {select_list} FROM {relation} WHERE {} ORDER BY id FOR UPDATE",
                     self.where_sql
                 ),
                 &[],
@@ -285,17 +506,14 @@ impl ApplyConn for PgApplyConn<'_> {
             .map_err(|e| classify_apply(&e, self.statement_timeout_ms))?;
         let mut preimage: BTreeMap<i64, Vec<(String, ImageValue)>> = BTreeMap::new();
         for row in &preimage_rows {
-            let id: i32 = row.get(0);
-            let owner: String = row.get(1);
-            let balance: i64 = row.get(2);
-            preimage.insert(
-                id as i64,
-                vec![
-                    ("id".into(), PkValue::Int(id as i64)),
-                    ("owner".into(), PkValue::Text(owner)),
-                    ("balance".into(), PkValue::Int(balance)),
-                ],
-            );
+            let id: i32 = row
+                .try_get(0)
+                .map_err(|e| ApplyError::Backend(format!("non-int4 PK on `{relation}`: {e}")))?;
+            let mut image: Vec<(String, ImageValue)> = Vec::with_capacity(select_cols.len());
+            for (i, col) in select_cols.iter().enumerate() {
+                image.push((col.clone(), image_value_at(row, i)?));
+            }
+            preimage.insert(id as i64, image);
         }
         let sql = format!("{} RETURNING id", self.forward_sql);
         let returned = self
@@ -304,7 +522,9 @@ impl ApplyConn for PgApplyConn<'_> {
             .map_err(|e| classify_apply(&e, self.statement_timeout_ms))?;
         let mut written = Vec::with_capacity(returned.len());
         for row in &returned {
-            let id: i32 = row.get(0);
+            let id: i32 = row
+                .try_get(0)
+                .map_err(|e| ApplyError::Backend(format!("non-int4 PK on `{relation}`: {e}")))?;
             let before_image = preimage
                 .get(&(id as i64))
                 .cloned()
@@ -314,7 +534,15 @@ impl ApplyConn for PgApplyConn<'_> {
                 before_image,
             });
         }
-        Ok(ForwardResult::new(written))
+        // Declare the written-column set so the engine's step-8b column-coverage
+        // guard can verify every written column has a captured pre-image (S5 #75).
+        // For an UPDATE this is the SET-clause targets; a DELETE re-inserts the whole
+        // row (row-covered), so it declares none.
+        let result = match kind {
+            WriteKind::Update => ForwardResult::new(written).with_written_columns(image_cols),
+            WriteKind::Delete => ForwardResult::new(written),
+        };
+        Ok(result)
     }
 
     fn xact_tuple_deltas(&mut self) -> Result<Vec<RelationChange>, ApplyError> {
@@ -371,10 +599,13 @@ fn classify_apply(e: &postgres::Error, timeout_ms: u64) -> ApplyError {
 //  PgRevertConn — the UPDATE pre-image upsert + DELETE re-insert revert conn.
 // ===========================================================================
 
-/// The real-PG18 [`RevertConn`] for the typed-inverse revert (#37), constrained
-/// to the same `(id, owner, balance)` MVP shape. An `UPDATE` inverse
-/// re-applies the captured OLD `(owner, balance)` per PK (PreimageUpsert); a
-/// `DELETE` inverse re-inserts the captured `(id, owner, balance)` rows.
+/// The real-PG18 [`RevertConn`] for the typed-inverse revert (#37), generic over
+/// the **captured pre-image columns** (S5 #75). An `UPDATE` inverse re-applies the
+/// captured OLD values of exactly the columns the forward op wrote (`PreimageUpsert`,
+/// keyed on the single-int PK); a `DELETE` inverse re-inserts the captured full-row
+/// image. The columns are read from each [`RevertRow::before_image`] — NOT
+/// hardcoded — so any single-int-PK write is restored regardless of which columns it
+/// touched.
 pub struct PgRevertConn<'a> {
     client: &'a mut Client,
     in_txn: bool,
@@ -403,13 +634,31 @@ impl RevertConn for PgRevertConn<'_> {
         let mut n = 0u64;
         for row in rows {
             let id = pk_int(row)?;
-            let (owner, balance) = owner_balance(row)?;
+            // Restore EXACTLY the captured columns (the SET-clause columns the
+            // forward op wrote), excluding the PK `id` (it keys the row, never
+            // changes). Empty ⇒ a malformed inverse with no columns to restore.
+            let cols: Vec<&(String, ImageValue)> =
+                row.before_image.iter().filter(|(c, _)| c != "id").collect();
+            if cols.is_empty() {
+                return Err(RevertError::Backend(format!(
+                    "inverse row for `{relation}` id={id} has no non-PK pre-image columns \
+                     to restore (S5 #75: a reversible UPDATE must capture every written column)"
+                )));
+            }
+            let mut bind = BindBuilder::new();
+            let mut set_list = Vec::with_capacity(cols.len());
+            for (col, val) in cols.iter().map(|p| (&p.0, &p.1)) {
+                let ph = bind.push(val.into());
+                set_list.push(format!("\"{col}\" = {ph}"));
+            }
+            let id_ph = bind.push(SqlVal::Int(id).into());
+            let sql = format!(
+                "UPDATE {relation} SET {} WHERE id = {id_ph}",
+                set_list.join(", ")
+            );
             let updated = self
                 .client
-                .execute(
-                    &format!("UPDATE {relation} SET owner = $1, balance = $2 WHERE id = $3"),
-                    &[&owner, &balance, &(id as i32)],
-                )
+                .execute(&sql, &bind.params())
                 .map_err(|e| RevertError::Backend(e.to_string()))?;
             n += updated;
         }
@@ -419,14 +668,28 @@ impl RevertConn for PgRevertConn<'_> {
     fn restore_insert(&mut self, relation: &str, rows: &[RevertRow]) -> Result<u64, RevertError> {
         let mut n = 0u64;
         for row in rows {
-            let id = pk_int(row)?;
-            let (owner, balance) = owner_balance(row)?;
+            // Re-insert EXACTLY the captured columns (the full-row image a DELETE
+            // captured). Must be non-empty (the PK `id` is always present).
+            if row.before_image.is_empty() {
+                return Err(RevertError::Backend(format!(
+                    "inverse row for `{relation}` has no pre-image columns to re-insert"
+                )));
+            }
+            let mut bind = BindBuilder::new();
+            let mut cols = Vec::with_capacity(row.before_image.len());
+            let mut placeholders = Vec::with_capacity(row.before_image.len());
+            for (col, val) in &row.before_image {
+                placeholders.push(bind.push(val.into()));
+                cols.push(format!("\"{col}\""));
+            }
+            let sql = format!(
+                "INSERT INTO {relation}({}) VALUES ({})",
+                cols.join(", "),
+                placeholders.join(", ")
+            );
             let inserted = self
                 .client
-                .execute(
-                    &format!("INSERT INTO {relation}(id, owner, balance) VALUES ($1, $2, $3)"),
-                    &[&(id as i32), &owner, &balance],
-                )
+                .execute(&sql, &bind.params())
                 .map_err(|e| RevertError::Backend(e.to_string()))?;
             n += inserted;
         }
@@ -450,37 +713,114 @@ impl RevertConn for PgRevertConn<'_> {
     }
 }
 
+/// A typed pre-image value owned for the duration of a revert statement, bound as
+/// a libpq parameter. Reuses the typed [`ImageValue`] vocabulary (no stringly
+/// re-encoding) so the restored value is byte-identical to the captured OLD tuple.
+enum SqlVal {
+    Int(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl SqlVal {
+    /// Convert a captured non-NULL [`ImageValue`] into an owned, bindable parameter.
+    /// A NULL is handled by [`BindBuilder::push`] as a SQL literal (not a param), so
+    /// this is only reached for the three concrete kinds.
+    fn from_concrete(v: &ImageValue) -> SqlVal {
+        match v {
+            PkValue::Int(i) => SqlVal::Int(*i),
+            PkValue::Text(s) => SqlVal::Text(s.clone()),
+            PkValue::Bytes(b) => SqlVal::Bytes(b.clone()),
+            PkValue::Null => unreachable!("NULL is rendered as a literal, never a SqlVal"),
+        }
+    }
+
+    /// Borrow as a `ToSql` parameter.
+    fn as_sql(&self) -> &(dyn postgres::types::ToSql + Sync) {
+        match self {
+            SqlVal::Int(i) => i,
+            SqlVal::Text(s) => s,
+            SqlVal::Bytes(b) => b,
+        }
+    }
+}
+
+/// Accumulates the owned bound parameters of one revert statement and renders each
+/// captured value's SQL placeholder, keeping parameter numbering and the owned
+/// `Vec<SqlVal>` in lock-step. A NULL is emitted as the literal `NULL` (a constant,
+/// no value binding) so it assigns to a column of any type; a concrete value is
+/// bound as `$n`, with integers cast `$n::int8` so the server infers an `int8`
+/// parameter type (which `i64` serializes to) and then assignment-casts it down to
+/// the column's own width — without the cast, `i64` is rejected against the `int4`
+/// parameter type the server would infer from an `int4` column.
+struct BindBuilder {
+    owned: Vec<SqlVal>,
+}
+
+impl BindBuilder {
+    fn new() -> Self {
+        BindBuilder { owned: Vec::new() }
+    }
+
+    /// Push a captured value, returning its SQL placeholder fragment.
+    fn push(&mut self, v: ImageValueOrOwned) -> String {
+        match v.into_image_or_sqlval() {
+            None => "NULL".to_string(),
+            Some(sql_val) => {
+                let is_int = matches!(sql_val, SqlVal::Int(_));
+                self.owned.push(sql_val);
+                let n = self.owned.len();
+                if is_int {
+                    format!("${n}::int8")
+                } else {
+                    format!("${n}")
+                }
+            }
+        }
+    }
+
+    /// The borrowed parameter slice for `Client::execute`.
+    fn params(&self) -> Vec<&(dyn postgres::types::ToSql + Sync)> {
+        self.owned.iter().map(|v| v.as_sql()).collect()
+    }
+}
+
+/// Either a captured [`ImageValue`] reference or a directly-built [`SqlVal`] (the PK
+/// `id`), accepted by [`BindBuilder::push`] so a NULL image becomes a literal while
+/// concrete values are bound.
+enum ImageValueOrOwned<'a> {
+    Image(&'a ImageValue),
+    Owned(SqlVal),
+}
+
+impl ImageValueOrOwned<'_> {
+    fn into_image_or_sqlval(self) -> Option<SqlVal> {
+        match self {
+            ImageValueOrOwned::Image(PkValue::Null) => None,
+            ImageValueOrOwned::Image(v) => Some(SqlVal::from_concrete(v)),
+            ImageValueOrOwned::Owned(v) => Some(v),
+        }
+    }
+}
+
+impl<'a> From<&'a ImageValue> for ImageValueOrOwned<'a> {
+    fn from(v: &'a ImageValue) -> Self {
+        ImageValueOrOwned::Image(v)
+    }
+}
+
+impl From<SqlVal> for ImageValueOrOwned<'_> {
+    fn from(v: SqlVal) -> Self {
+        ImageValueOrOwned::Owned(v)
+    }
+}
+
 /// Extract the single integer PK value from a revert row (fail-closed on a
 /// non-int / multi-col PK — outside the MVP shape).
 fn pk_int(row: &RevertRow) -> Result<i64, RevertError> {
     match &row.pk.values()[0] {
         PkValue::Int(i) => Ok(*i),
         other => Err(RevertError::Backend(format!("bad pk {other:?}"))),
-    }
-}
-
-/// Extract the captured `(owner, balance)` pre-image (fail-closed on a missing
-/// column — outside the MVP shape).
-fn owner_balance(row: &RevertRow) -> Result<(String, i64), RevertError> {
-    let owner = row
-        .before_image
-        .iter()
-        .find(|(c, _)| c == "owner")
-        .and_then(|(_, v)| match v {
-            PkValue::Text(s) => Some(s.clone()),
-            _ => None,
-        });
-    let balance = row
-        .before_image
-        .iter()
-        .find(|(c, _)| c == "balance")
-        .and_then(|(_, v)| match v {
-            PkValue::Int(i) => Some(*i),
-            _ => None,
-        });
-    match (owner, balance) {
-        (Some(owner), Some(balance)) => Ok((owner, balance)),
-        _ => Err(RevertError::Backend("missing pre-image cols".into())),
     }
 }
 
@@ -569,6 +909,97 @@ fn pk_value_at(row: &Row, i: usize) -> PkValue {
 fn text_fallback(row: &Row, i: usize) -> String {
     row.try_get::<_, String>(i)
         .unwrap_or_else(|_| format!("<unprintable col {i}>"))
+}
+
+/// Capture column `i`'s value as a **lossless** typed [`ImageValue`] for the
+/// reversible pre-image (S5 #75). Unlike [`pk_value_at`] (which is only ever used
+/// for the PK and may text-fold an exotic key type for the checksum), a pre-image
+/// value will be **written back** by the revert, so a lossy capture would silently
+/// corrupt the restore. We therefore capture only types we can restore exactly
+/// (`int2/4/8`, `text/varchar/bpchar/name`, `bytea`) and **fail closed**
+/// ([`ApplyError::Backend`]) on anything else — refusing to commit a write whose
+/// pre-image we cannot certifiably restore. A SQL `NULL` is captured faithfully as
+/// [`PkValue::Null`] (the revert writes NULL back). (Widening the captured type set
+/// is a separate, tested change — fail-closed until then.)
+fn image_value_at(row: &Row, i: usize) -> Result<ImageValue, ApplyError> {
+    let col = &row.columns()[i];
+    let ty = col.type_().clone();
+    let name = col.name().to_string();
+    let v = match ty {
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(i)
+            .map(|o| o.map(|x| PkValue::Int(x as i64)).unwrap_or(PkValue::Null)),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(i)
+            .map(|o| o.map(|x| PkValue::Int(x as i64)).unwrap_or(PkValue::Null)),
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(i)
+            .map(|o| o.map(PkValue::Int).unwrap_or(PkValue::Null)),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row
+            .try_get::<_, Option<String>>(i)
+            .map(|o| o.map(PkValue::Text).unwrap_or(PkValue::Null)),
+        Type::BYTEA => row
+            .try_get::<_, Option<Vec<u8>>>(i)
+            .map(|o| o.map(PkValue::Bytes).unwrap_or(PkValue::Null)),
+        other => {
+            return Err(ApplyError::Backend(format!(
+                "column `{name}` has type `{other}` which the MVP reversible-capture \
+                 does not support losslessly — fail-closed (S5 #75): refusing to commit a \
+                 write whose pre-image cannot be certifiably restored"
+            )));
+        }
+    };
+    v.map_err(|e| ApplyError::Backend(format!("reading pre-image column `{name}`: {e}")))
+}
+
+/// Parse the **SET-clause target columns** of an `UPDATE` from `forward_sql`
+/// (S5 #75 column coverage). Returns the column names the write mutates, so the
+/// apply captures the pre-image of exactly those columns.
+///
+/// Fail-closed: a non-plain-column assignment target (a `SET (a,b) = (…)` tuple or
+/// a sub-select form we cannot map to discrete columns), a parse failure, or a
+/// non-UPDATE statement all return `Err` so the caller refuses to commit a write
+/// whose written columns it cannot enumerate. AST-derived (not a text slice) so a
+/// `SET` inside a string literal / sub-query cannot fool it.
+fn update_set_columns(forward_sql: &str) -> Result<Vec<String>, String> {
+    use sqlparser::ast::{AssignmentTarget, Statement};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = PostgreSqlDialect {};
+    let parsed =
+        Parser::parse_sql(&dialect, forward_sql).map_err(|e| format!("parse error: {e}"))?;
+    let update = match parsed.first() {
+        Some(Statement::Update(u)) => u,
+        _ => return Err("forward statement is not a plain UPDATE".to_string()),
+    };
+    if update.assignments.is_empty() {
+        return Err("UPDATE has no SET assignments".to_string());
+    }
+    let mut cols = Vec::with_capacity(update.assignments.len());
+    for a in &update.assignments {
+        match &a.target {
+            AssignmentTarget::ColumnName(name) => {
+                // `schema.col` / `col` — the last identifier is the column.
+                let col = name
+                    .0
+                    .last()
+                    .map(|p| p.to_string())
+                    .ok_or_else(|| "empty SET column name".to_string())?;
+                // sqlparser renders an unquoted identifier bare and a quoted one with
+                // quotes; strip surrounding quotes so the name matches pg_attribute.
+                cols.push(col.trim_matches('"').to_string());
+            }
+            AssignmentTarget::Tuple(_) => {
+                return Err(
+                    "tuple SET target `(a, b) = (…)` is not supported by the MVP \
+                     reversible-capture (fail-closed)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(cols)
 }
 
 /// Capture cascade-deleted child PKs for `ON DELETE CASCADE` FKs referencing

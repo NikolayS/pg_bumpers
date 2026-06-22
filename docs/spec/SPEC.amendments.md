@@ -760,13 +760,19 @@ reads go through the live proxy. Concretely:
 
 ### DEFERRED (honest scope — disclosed, not silently dropped)
 
-- **Generic-schema `ApplyConn` beyond single-int-PK** — `pgb-applyd`'s apply is constrained
-  to the **single-integer-PK `UPDATE`/`DELETE`** shape on a `(id, owner, balance)` table the
-  existing IT impl already proves (the lifted `PgApplyConn`/`PgRevertConn`). This is the #1
-  risk honored deliberately: a hand-rolled generic-schema apply could mis-read the PK or
-  skip a pre-image column and silently break reversibility while looking green. Anything
-  wider is gated out by the dry-run's existing PK-less / volatile / irreversible REFUSALS
-  (fail-closed). Generic-schema apply is DEFERRED.
+- **Generic-schema `ApplyConn` beyond single-`int4`-PK** — `pgb-applyd`'s apply is
+  constrained to the **single-`int4`-PK `UPDATE`/`DELETE`** shape the lifted
+  `PgApplyConn`/`PgRevertConn` prove. A wider/composite PK (`int8`/`text`/`uuid`/multi-col)
+  is gated out **cleanly at dry-run** (`NOT_REHEARSABLE`, no panic) — see the S5 #75
+  amendment below. Generic-schema apply (wider PK types/cardinalities) is DEFERRED.
+  **CORRECTION (S5 #75):** the prior wording — "skip a pre-image column and silently break
+  reversibility … anything wider is gated out" — conflated PK *width* with the *columns* a
+  write touches. A single-`int4`-PK `UPDATE` that writes ANY column was **not** gated out;
+  the hardcoded `(id, owner, balance)` capture silently dropped any other written column (a
+  catastrophic FN). That hole is **CLOSED** in the S5 #75 amendment: the apply now captures
+  the exact SET-clause columns and a defense-in-depth column-coverage guard aborts an
+  uncaptured written column before commit. Such a write is genuinely reversible — accepted,
+  not refused.
 
 - **Cross-process session attestation (T4)** — the proxy read session and the applyd
   proposal are tied by the `session_id` the shell PASSES, not by a cryptographic binding
@@ -876,3 +882,84 @@ bound what the guarantees COVER.
 - **The reads point straight at PG18** standing in for the proxied backend (same honest split
   as `integration.test.ts`): the full Apache Rust proxy binary in front (SCRAM/TLS/WALL) is
   covered by `crates/proxy/tests/`. The MCP layer is cooperative, not the boundary.
+
+---
+
+## S5 #75 — write-floor column coverage + clean PK-type refusal + applyd audit fail-closed
+
+**SPEC sections touched:** §3/§4 (deterministic floor, guarded apply, "0 catastrophic
+data-loss FN by construction"), §10.2 (PK-set identity), §10.3 (typed-inverse
+`{pk, before_image}`), §5/§10.6 (reversibility vs golden state).
+
+**Issue:** #75 (S5 release blocker — the one undisclosed hole in the write-safety moat).
+
+### The bug (a write escaped the floor)
+
+The apply-time PK-set checksum (`guarded_apply`) caught *which-rows* (identity) drift but
+**not** *which-columns* drift. The production `PgApplyConn`/`PgRevertConn`
+(`crates/clone-orchestrator/src/conn.rs`) hardcoded the pre-image to `(id, owner, balance)`
+and the revert to `SET owner = …, balance = …`. So a single-`int4`-PK
+`UPDATE t SET notes = 'x' WHERE id = …` on a `(id, owner, balance, notes)` table **committed
+`reversible:true` but was permanently un-revertable** — the captured inverse held no `notes`
+pre-image, so the revert silently left the written column unchanged. A silent catastrophic
+false-negative. `KNOWN_BYPASSES.md` B3 and the DEFERRED note above affirmatively (and
+falsely) claimed "wider shapes are gated out, fail-closed". Two adjacent footguns shared the
+root cause: an unguarded `let id: i32 = row.get(0)` would **panic** on a non-`int4` PK, and
+the applyd apply-path `_meta` append was best-effort (`let _ =`), so a committed write whose
+audit append failed returned success with **no** record.
+
+### What changed (fail-closed, tighten-only — every change only ADDS a refusal/abort)
+
+1. **Column coverage — captured + restored by name (the fix, not a refusal).** `apply_forward`
+   now parses the **SET-clause target columns** out of the forward `UPDATE` and captures the
+   pre-image of **exactly those columns** (a `DELETE` captures the full row from
+   `pg_attribute`); `PgRevertConn::{restore_update,restore_insert}` restore **exactly the
+   captured columns** (no hardcoded list). So a single-`int4`-PK UPDATE is **genuinely
+   reversible regardless of which columns it writes** — accepted, not refused. The pre-image is
+   captured **losslessly** (typed `int2/4/8` / `text`/`varchar`/`bpchar`/`name` / `bytea`,
+   NULLs faithful); an unsupported column type fails closed.
+2. **Defense-in-depth apply-time COLUMN-coverage guard (step 8b).**
+   `assert_written_column_coverage` (`apply.rs`) verifies **every written column has a captured
+   pre-image** in each written row; a declared-but-uncaptured column (or, with none declared, an
+   empty non-PK pre-image) → `ApplyError::UncapturedColumn` → **ABORT / ROLLBACK** before
+   commit. Even if the dry-run column gate were bypassed, a write can **never** commit
+   `reversible:true` with an incomplete inverse.
+3. **Clean wider-PK-type refusal, no panic (dry-run gate).** `PgRehearsal::certify_apply_shape`
+   (a `pg_index`/`pg_type`/`pg_attribute` read only, before any rehearsal) refuses a target
+   whose PK is **not a single `int4`** (`int8`/`text`/`uuid`/composite) with a clean
+   `NOT_REHEARSABLE`, and refuses an UPDATE whose SET columns are not losslessly capturable. A
+   genuinely PK-less target stays the distinct `PK_LESS` refusal. The unguarded `row.get(0)`
+   calls became `try_get → ApplyError::Backend`, so even a PK that slips past the gate aborts
+   the open apply txn cleanly (rolled back) rather than panicking — the resident applyd apply
+   `Client` is never poisoned, and the daemon serves the next request (asserted by IT).
+4. **applyd apply-path audit fail-closed.** `Service::audit_apply` now surfaces the `_meta`
+   append `Result` (was `let _ =`), matching the warden ("fatal") and proxy (`?`). On both the
+   success and block paths a failed append returns `AUDIT_FAILED` rather than a silent
+   unaudited success.
+
+### Honest ordering caveat (NOT atomic co-commit)
+
+The `_meta` chain is a **separate connection** from the apply txn, so the audit record is
+**NOT co-committed** atomically with the write in the MVP. The apply-committed append runs
+**after** `guarded_apply_with_grant` returns, so on the success path the row write has already
+committed before the append; if the append then fails, the caller is told `AUDIT_FAILED`
+(honest: "the write may have committed but is not certified auditable") rather than a clean
+success. Atomic co-commit (the audit row inside the apply txn) is a documented follow-up.
+
+### Red→green evidence
+
+- **(a) column coverage:** `apply_it::t_wide_column_update_is_fully_reversible_revert_restores_all_columns`
+  (real PG18) — a `SET notes = …` UPDATE: RED captured only `(owner, balance)` so the inverse
+  dropped `notes`; GREEN captures + reverts **every** written column byte-for-byte. Engine-level
+  unit tests `apply::tests::{uncaptured_written_column_aborts_before_commit,
+  captured_written_column_commits, empty_preimage_floor_aborts_when_no_columns_declared}`.
+- **(b) PK type:** `dry_run_it::non_int4_pk_is_refused_not_rehearsable_no_panic_conn_survives`
+  (bigint/text/uuid → clean `NOT_REHEARSABLE`, NO panic, the conn serves the next request) and
+  `dry_run_it::update_with_uncapturable_set_column_is_refused` (jsonb SET → refused).
+- **(c) audit fail-closed:** `service_unit::apply_does_not_report_success_when_the_audit_append_fails`
+  (an injected failing `_meta` sink → the apply returns `AUDIT_FAILED`, no silent success).
+- **Bench:** the golden corpus gains `wide-column-update-uncaptured-column` (REVERTED) +
+  `legit-wide-column-update-captured` (ALLOW); `gate_has_teeth::flipping_the_wide_column_coverage_trips_the_gate`
+  proves the green scenario depends on the #75 guard. The catastrophic-FN ledger stays empty.
+- **Marquee:** CLASS 2 now applies the wide-column `SET notes = 'audited'` shape end-to-end
+  through the assembled stack (bounded, approval-gated, reversibly committed).

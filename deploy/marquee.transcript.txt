@@ -1,10 +1,10 @@
 ================================================================================
  pg_bumpers — S5 MARQUEE TRANSCRIPT (issue #68)  [recorded by deploy/marquee.sh]
- generated: 2026-06-22T11:13:56Z  port: 54341  pg: initdb (PostgreSQL) 18.4 (Homebrew)
+ generated: 2026-06-22T12:32:50Z  port: 54350  pg: initdb (PostgreSQL) 18.4 (Homebrew)
 ================================================================================
 
 --- per-damage-class transcript ---
-SAFETY: using dedicated port 54341; the founder's 5432 is NEVER touched.
+SAFETY: using dedicated port 54350; the founder's 5432 is NEVER touched.
 pgb-applyd up (write path: socket → guarded_apply_with_grant → PG18).
 pgb-warden up (live watchdog: 1s runtime ceiling, auditing to _meta).
 pgb-mcp up; a REAL MCP client is connected to the stdio shell.
@@ -17,23 +17,25 @@ CLASS 2: dry_run → blast radius BOUNDED to 4 rows, reversible=true.
 CLASS 2: apply WITHOUT a grant → APPROVAL_REQUIRED (retryable).
 CLASS 2: operator approve (CLI-minted §14.3 grant, verified at apply).
 CLASS 2: apply WITH the grant → COMMITTED, bounded (4 even zeroed, 4 odd untouched), reversible=true.
+CLASS 2 (wide-column #75): dry_run → BOUNDED to 4 rows, reversible=true.
+CLASS 2 (wide-column #75): apply WITH the grant → COMMITTED, bounded (4 even notes='audited', odd untouched), reversible=true — the written column is captured (no silent un-revertable write).
 CLASS 2 (drift): apply over drifted data → GRANT_REJECTED ABORT, row count unchanged (9), NO mutation.
-CLASS 3: launched agent-tagged runaway (pid 66495) + shared sleep (pid 66496).
-CLASS 3: warden TERMINATED the agent-tagged runaway (pid 66495 gone).
-CLASS 3: shared backend (pid 66496) SPARED (still present) — no false-positive kill.
-CLASS 3: the kill is AUDITED to _meta (WARDEN_TERMINATE naming pid 66495).
+CLASS 3: launched agent-tagged runaway (pid 90835) + shared sleep (pid 90836).
+CLASS 3: warden TERMINATED the agent-tagged runaway (pid 90835 gone).
+CLASS 3: shared backend (pid 90836) SPARED (still present) — no false-positive kill.
+CLASS 3: the kill is AUDITED to _meta (WARDEN_TERMINATE naming pid 90835).
 CLASS 4: pgb-cli verify — ONE anchored _meta chain, verify_chain OK, anchored head matches.
 --- pgb-cli verify output ---
-pgb-cli verify: the shared `_meta` chain VERIFIES (7 records) and the durable anchored head MATCHES the chain head.
-  head = 7cc48fe78afaa17ffd966f609a037b34020da1612ccda599f5a94a93ddadf3f3
-  anchored_seq = 6
+pgb-cli verify: the shared `_meta` chain VERIFIES (10 records) and the durable anchored head MATCHES the chain head.
+  head = 9821965a0391b67611554b17b3efe90a640887a945f0971af894a1a322be51d8
+  anchored_seq = 9
   decisions by reason_code:
     GRANT_REJECTED                   x1
     WARDEN_TERMINATE                 x1
-    apply_committed                  x1
-    approval_required                x2
-    grant_signed                     x2
+    apply_committed                  x2
+    approval_required                x3
+    grant_signed                     x3
 =============================
 
 vitest result line:
-      Tests  7 passed (7)
+      Tests  8 passed (8)

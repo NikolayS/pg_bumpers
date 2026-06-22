@@ -188,10 +188,13 @@ beforeAll(async () => {
   // Seed accounts (single-int-PK, the MVP-supported write shape) + the `_meta`
   // schema + the WALL roles (the audit migration creates pgb_audit_writer + pgb_agent).
   psql(`CREATE DATABASE ${DB}`);
+  // `accounts` carries a `notes` column the OLD hardcoded `(owner, balance)`
+  // pre-image never captured — the S5 #75 wide-column-UPDATE case writes it to
+  // prove the apply path captures + reverts EVERY written column, not a fixed set.
   psql(
-    `CREATE TABLE public.accounts (id int PRIMARY KEY, owner text NOT NULL, balance bigint NOT NULL);
-     INSERT INTO public.accounts(id, owner, balance)
-       SELECT g, 'owner-' || g, (g * 1000)::bigint FROM generate_series(1, 8) AS g;`,
+    `CREATE TABLE public.accounts (id int PRIMARY KEY, owner text NOT NULL, balance bigint NOT NULL, notes text NOT NULL DEFAULT '');
+     INSERT INTO public.accounts(id, owner, balance, notes)
+       SELECT g, 'owner-' || g, (g * 1000)::bigint, 'note-' || g FROM generate_series(1, 8) AS g;`,
     DB,
   );
   // Apply the canonical _meta schema into the SAME DB the daemon + warden anchor
@@ -378,9 +381,9 @@ suite("S5 marquee: delete-a-DB-through-the-MCP, per damage class, on the assembl
       expect(proposed.code).toBe("NOT_REHEARSABLE");
       log(`CLASS 1 (structural): propose_write("${sql}") → REFUSED ${proposed.code}.`);
     }
-    // accounts survives intact: 8 rows, all 3 columns present.
+    // accounts survives intact: 8 rows, all 4 columns present (id/owner/balance/notes).
     expect(psql("SELECT count(*)::int FROM public.accounts", DB).trim()).toBe("8");
-    expect(psql("SELECT count(*)::int FROM information_schema.columns WHERE table_name='accounts'", DB).trim()).toBe("3");
+    expect(psql("SELECT count(*)::int FROM information_schema.columns WHERE table_name='accounts'", DB).trim()).toBe("4");
   });
 
   it("a DROP on the read tool is a READ_ONLY block (the table survives)", async () => {
@@ -437,6 +440,52 @@ suite("S5 marquee: delete-a-DB-through-the-MCP, per damage class, on the assembl
     expect(psql("SELECT count(*)::int FROM public.accounts WHERE id % 2 = 0 AND balance = 0", DB).trim()).toBe("4");
     expect(psql("SELECT count(*)::int FROM public.accounts WHERE id % 2 = 1 AND balance <> 0", DB).trim()).toBe("4");
     log(`CLASS 2: apply WITH the grant → COMMITTED, bounded (4 even zeroed, 4 odd untouched), reversible=true.`);
+  });
+
+  // S5 #75: a WIDE-COLUMN UPDATE — writes the `notes` column the old hardcoded
+  // `(owner, balance)` pre-image never captured. End-to-end through the assembled
+  // stack it is bounded, approval-gated, and applied REVERSIBLY (the apply now
+  // captures the EXACT SET-clause column). Before the fix this committed
+  // `reversible:true` with an inverse that could not restore `notes` — a silent FN.
+  it("a WIDE-COLUMN UPDATE (SET notes=…) is bounded + applied REVERSIBLY (S5 #75 column coverage)", { timeout: 40_000 }, async () => {
+    const FORWARD = "UPDATE public.accounts SET notes = 'audited' WHERE id % 2 = 0";
+    // Pre-state: even rows carry their seeded notes (note-2 … note-8), not 'audited'.
+    expect(psql("SELECT count(*)::int FROM public.accounts WHERE id % 2 = 0 AND notes = 'audited'", DB).trim()).toBe("0");
+
+    const proposed = await toolCall("propose_write", { sql: FORWARD, expected_rows: 4 });
+    expect(proposed.status, JSON.stringify(proposed)).toBe("ok");
+    const proposalId = proposed.data.proposal_id as string;
+
+    const dry = await toolCall("dry_run", { proposal_id: proposalId });
+    expect(dry.status, JSON.stringify(dry)).toBe("ok");
+    expect(dry.data.blast_radius.total_rows).toBe(4); // BOUNDED
+    expect(dry.data.blast_radius.reversible).toBe(true);
+    const confirmToken = dry.data.confirm_token as string;
+    log(`CLASS 2 (wide-column #75): dry_run → BOUNDED to ${dry.data.blast_radius.total_rows} rows, reversible=${dry.data.blast_radius.reversible}.`);
+
+    // Operator-approved grant (signing key never enters the MCP path).
+    const elev = await toolCall("request_elevation", { proposal_id: proposalId, reason: "wide-column reversible demo" });
+    const seedHex = (globalThis as any).__seedHex as string;
+    const approveResp = await applydApprove({
+      request_id: elev.data.request_id,
+      approver_id: "operator-1",
+      signing_key_hex: seedHex,
+      nonce: `nonce-wide-${Date.now()}`,
+      grant_ttl_millis: 60_000,
+    });
+    expect(approveResp.error, JSON.stringify(approveResp)).toBeUndefined();
+
+    // WITH the grant → the wide-column write COMMITs, reversibly.
+    const applied = await toolCall("apply_write", { proposal_id: proposalId, confirm_rows: 4, confirm_token: confirmToken });
+    expect(applied.status, JSON.stringify(applied)).toBe("ok");
+    expect(applied.data.applied).toBe(true);
+    expect(applied.data.reversible, "the wide-column UPDATE must be reported reversible (notes captured)").toBe(true);
+
+    // BOUNDED + the written column actually changed: 4 even rows now notes='audited',
+    // odd untouched. The point: the apply path captured the EXACT written column.
+    expect(psql("SELECT count(*)::int FROM public.accounts WHERE id % 2 = 0 AND notes = 'audited'", DB).trim()).toBe("4");
+    expect(psql("SELECT count(*)::int FROM public.accounts WHERE id % 2 = 1 AND notes = 'audited'", DB).trim()).toBe("0");
+    log(`CLASS 2 (wide-column #75): apply WITH the grant → COMMITTED, bounded (4 even notes='audited', odd untouched), reversible=true — the written column is captured (no silent un-revertable write).`);
   });
 
   it("a drifted apply ABORTS with NO mutation (the PK-set guard fires fail-closed)", { timeout: 40_000 }, async () => {

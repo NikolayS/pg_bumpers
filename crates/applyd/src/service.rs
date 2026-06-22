@@ -431,6 +431,12 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
                 self.grants.remove(proposal_id);
                 let reversible = applied.inverse.kind == pgb_core::InverseKind::PreimageUpsert
                     || !applied.inverse.rows.is_empty();
+                // FAIL-CLOSED (S5 #75): the apply-committed audit append MUST succeed.
+                // The write has already committed (separate connection — not
+                // co-committed; see `audit_apply`), so a failed append cannot un-write
+                // it, but we refuse to report a silent unaudited success: surface
+                // AUDIT_FAILED so the caller knows the operation is not certified
+                // auditable.
                 self.audit_apply(
                     &live,
                     Decision::Allow,
@@ -440,7 +446,13 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
                         applied.rows_written
                     )),
                     clock,
-                );
+                )
+                .map_err(|e| {
+                    ErrorCode::AuditFailed.error(format!(
+                        "the bounded write committed but its audit record could not be \
+                         appended to the _meta chain: {e}"
+                    ))
+                })?;
                 Ok((
                     ApplyResult {
                         applied: true,
@@ -452,21 +464,43 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
             }
             Err(e) => {
                 let rpc = granted_apply_error_to_rpc(&e);
+                // The BLOCK decision is itself evidence — its audit append is also
+                // fail-closed. A failed append surfaces AUDIT_FAILED rather than the
+                // (unrecorded) block code, so no enforcement decision is silently lost.
                 self.audit_apply(
                     &live,
                     Decision::Block,
                     &rpc.data.code,
                     Some(rpc.message.clone()),
                     clock,
-                );
+                )
+                .map_err(|ae| {
+                    ErrorCode::AuditFailed.error(format!(
+                        "an apply was blocked ({}) but the block could not be audited to \
+                         the _meta chain: {ae}",
+                        rpc.data.code
+                    ))
+                })?;
                 Err(rpc)
             }
         }
     }
 
-    /// Append one apply-path audit record to the SAME shared `_meta` chain the
-    /// flow uses (so the full lifecycle is on one chain). Fail-closed in spirit:
-    /// an in-memory sink cannot fail; a real-sink failure surfaces upstream.
+    /// Append one apply-path audit record to the SAME shared `_meta` chain the flow
+    /// uses (so the full lifecycle is on one chain). **Fail-closed (S5 #75):** the
+    /// append `Result` is surfaced (not swallowed) — a failed append is fatal to the
+    /// guarantee that every apply decision leaves tamper-evident evidence, matching
+    /// the warden (`run.rs` "fatal") and proxy (`session.rs` `?`).
+    ///
+    /// # Ordering caveat (honest disclosure)
+    /// The `_meta` chain is a **separate connection** from the apply txn, so the
+    /// audit record is **NOT co-committed** atomically with the deterministic write
+    /// in the MVP. The append runs AFTER `guarded_apply_with_grant` returns, so on
+    /// the success path the write has **already committed** before this append. If
+    /// the append then fails, the caller is told the operation failed
+    /// (`AUDIT_FAILED`) even though the row write committed — the honest fail-closed
+    /// posture is "report failure rather than a silent unaudited success". Atomic
+    /// co-commit (the audit row inside the apply txn) is a documented follow-up.
     fn audit_apply(
         &mut self,
         live: &LiveRequest,
@@ -474,7 +508,7 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
         reason_code: &str,
         reason: Option<String>,
         clock: &dyn Clock,
-    ) {
+    ) -> Result<(), pgb_audit::SinkError> {
         let entry = NewEntry {
             statement_text: live.statement_text.clone(),
             decision,
@@ -491,7 +525,7 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
                 blast_radius_ref: None,
             },
         };
-        let _ = self.sink.append(entry, clock.now_unix_millis());
+        self.sink.append(entry, clock.now_unix_millis()).map(|_| ())
     }
 
     /// Read the audit tail (oldest-first), up to `limit` (most-recent window).
