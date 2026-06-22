@@ -721,6 +721,7 @@ dependencies = [
 name = "pgb-warden"
 version = "0.0.0"
 dependencies = [
+ "pgb-audit",
  "pgb-core",
  "pgb-policy",
  "postgres",
