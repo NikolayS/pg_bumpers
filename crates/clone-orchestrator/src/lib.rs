@@ -44,6 +44,7 @@
 pub mod dry_run;
 pub mod predicate;
 pub mod proposal;
+pub mod provider;
 
 pub use dry_run::{
     classify, dry_run, AffectedTable, DryRunError, Measurement, Rehearsal, WriteKind,
@@ -53,6 +54,12 @@ pub use predicate::{
     Volatility, NONDETERMINISTIC_KEYWORDS,
 };
 pub use proposal::{propose, propose_with_ttl, Proposal, DEFAULT_TTL_MILLIS};
+pub use provider::{
+    check_parity, reap_orphans, with_clone, CloneError, CloneGovernance, CloneHandle, CloneLedger,
+    CloneProvider, ColumnGrant, DataClassification, DblabProvider, LedgerEntry, LocalCloneConfig,
+    LocalCloneProvider, NoneProvider, OrphanAlarm, ParityReport, PrimaryRef, ProviderKind,
+    ReapOutcome, RlsPolicy,
+};
 
 /// The outcome of comparing the dry-run affected-PK set against the apply-time set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

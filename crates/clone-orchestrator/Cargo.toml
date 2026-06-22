@@ -17,6 +17,9 @@ name = "pgb_clone_orchestrator"
 # typed-inverse InverseKind (§10.3), Clock (§10.4). DB-free; the orchestrator
 # drives a live connection and folds the measured facts into these types.
 pgb-core = { path = "../core" }
+# The single policy model — the `clone.provider: none|dblab` selector (§12.2) the
+# provider abstraction maps from. No cycle: policy does not depend on this crate.
+pgb-policy = { path = "../policy" }
 # Advisory SQL parse (§4 "parse advisory only"): classify the proposed write and
 # extract its target relation + volatile-function references. Apache-2.0; already
 # in the workspace tree (pgwire). Built from the SPEC + the public sqlparser AST

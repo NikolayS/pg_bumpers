@@ -624,6 +624,7 @@ name = "pgb-clone-orchestrator"
 version = "0.0.0"
 dependencies = [
  "pgb-core",
+ "pgb-policy",
  "postgres",
  "serde",
  "serde_json",

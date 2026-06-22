@@ -24,6 +24,10 @@
 //! uses a subset of its helpers, so some are unused per-binary.
 #![allow(dead_code)]
 
+/// Self-contained throwaway PG18 primary cluster bootstrap (for the
+/// clone-governance tests, which need a real on-disk primary to `pg_basebackup`).
+pub mod cluster;
+
 use std::collections::BTreeMap;
 
 use pgb_clone_orchestrator::dry_run::{AffectedTable, Measurement, Rehearsal, WriteKind};
