@@ -629,8 +629,14 @@ dependencies = [
 name = "pgb-cli"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
+ "pgb-audit",
  "pgb-core",
  "pgb-policy",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

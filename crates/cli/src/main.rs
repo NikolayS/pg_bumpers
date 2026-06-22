@@ -1,64 +1,136 @@
-//! pg_bumpers CLI binary (stub).
+//! pg_bumpers CLI binary (`pgb-cli`) — the MVP approval surface (SPEC §14).
 //!
-//! The CLI is the MVP approval surface (SPEC §14): an authorized human approves,
-//! denies, or break-glasses a blocked proposal. A grant is **signed, single-use,
-//! and bound to the exact proposal** — the agent cannot swap the SQL after
-//! approval, and can never authorize itself. This S0 stub carries the
-//! single-use grant-consumption seam + a test; the live flow lands in S4.
+//! Subcommands:
+//! - `pgb-cli approve <request-id>` — a human approver signs the §14.3
+//!   proposal-bound grant for a pending request. In a real deployment the
+//!   request store, the approver's audit-key-grade signing key (§10.9), and the
+//!   webhook target are resolved from `policy.yaml` / KMS; this binary wires the
+//!   library flow and documents the contract.
+//! - `pgb-cli demo` — runs the full request → approve → verify-at-apply flow
+//!   in-process against an in-memory store + audit chain, printing each step.
+//!   This is a runnable smoke of the §14 mechanism (no DB, no network).
+//!
+//! The cryptography is entirely `pgb_policy`'s grant token (reused, not
+//! reimplemented); this binary is glue + UX.
 
-/// A single-use grant bound to one proposal (SPEC §14).
-///
-/// Once consumed it cannot be reused — replay is refused (fail-closed).
-#[derive(Debug)]
-struct Grant {
-    proposal_id: u64,
-    consumed: bool,
-}
+use std::process::ExitCode;
 
-impl Grant {
-    fn new(proposal_id: u64) -> Self {
-        Grant {
-            proposal_id,
-            consumed: false,
+use ed25519_dalek::SigningKey;
+use rand_core::OsRng;
+
+use pgb_audit::Sink;
+use pgb_cli::{
+    ApprovalFlow, InMemoryNonceStore, Principal, Proposal, RecordingWebhookSender, RequestId,
+};
+use pgb_core::{inverse::Operation, SystemClock};
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("approve") => match args.get(2) {
+            Some(id) => {
+                // In the MVP binary the request store is per-process; a real
+                // deployment resolves it (and the signing key) from policy/KMS.
+                // We document the contract and exit non-zero because there is no
+                // standing request in this stub invocation.
+                eprintln!(
+                    "pgb-cli approve: would sign a single-use, proposal-bound grant for \
+                     request `{id}` using the approver's audit-key-grade signing key (SPEC \
+                     §10.9). The agent can never self-approve. Wire the request store + KMS \
+                     key from policy.yaml to use this against a live request; run `pgb-cli \
+                     demo` for an in-process end-to-end run."
+                );
+                ExitCode::from(2)
+            }
+            None => {
+                eprintln!("usage: pgb-cli approve <request-id>");
+                ExitCode::from(2)
+            }
+        },
+        Some("demo") => {
+            run_demo();
+            ExitCode::SUCCESS
+        }
+        _ => {
+            println!(
+                "pgb-cli — pg_bumpers approval CLI (SPEC §14 MVP).\n\
+                 usage:\n  \
+                 pgb-cli approve <request-id>   sign a proposal-bound grant (human approver)\n  \
+                 pgb-cli demo                   run request -> approve -> verify-at-apply in-process"
+            );
+            ExitCode::SUCCESS
         }
     }
-
-    /// Consume the grant for `proposal_id`. Returns `true` only if the grant is
-    /// fresh **and** bound to exactly this proposal; any reuse or mismatch fails.
-    fn consume_for(&mut self, proposal_id: u64) -> bool {
-        if self.consumed || self.proposal_id != proposal_id {
-            return false;
-        }
-        self.consumed = true;
-        true
-    }
 }
 
-fn main() {
-    // Exercise the grant seam plus the workspace deps so the stub is wired.
-    let mut grant = Grant::new(0);
-    let consumed = grant.consume_for(0);
-    let trust = pgb_core::TrustLevel::Operator;
-    let verdict = pgb_policy::StubRiskEngine.evaluate();
-    println!(
-        "pgb-cli: stub — operator approval flow lands in S4 (see SPEC.md §14). \
-         grant seam ready (sample consume={consumed}, approver_trust={trust:?}, \
-         engine_verdict={verdict:?})."
+/// Run the full §14 flow in-process and print each step (a runnable smoke).
+fn run_demo() {
+    let clock = SystemClock::new();
+
+    // The approver's audit-key-grade signing key (§10.9). In production this is
+    // KMS-held and separated from the DB operator; here it is generated for the
+    // demo and its public half seeds the flow's verifier.
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+
+    let mut flow = ApprovalFlow::new(
+        pgb_audit::InMemorySink::new(),
+        RecordingWebhookSender::new(),
+        verifying_key,
+        InMemoryNonceStore::new(),
     );
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let proposal = Proposal {
+        proposal_id: "p-demo-1".to_string(),
+        statement_text: "UPDATE public.orders SET status='fixed' WHERE id = $1".to_string(),
+        normalized_params: vec!["42".to_string()],
+        role: "app_writer".to_string(),
+        session_id: "sess-demo".to_string(),
+        dry_run_lsn: "3A/7F00C8".to_string(),
+        blast_radius_checksum: "sha256:demo".to_string(),
+    };
+    // A bounded, reversible UPDATE — eligible for elevation (not structural).
+    let op = Operation::Update {
+        has_preimage: true,
+        has_pk: true,
+    };
+    let id = RequestId("req-demo-1".to_string());
 
-    #[test]
-    fn grant_is_single_use_and_proposal_bound() {
-        let mut grant = Grant::new(42);
-        // Wrong proposal id is refused (proposal-bound).
-        assert!(!grant.consume_for(7));
-        // Correct proposal id succeeds once.
-        assert!(grant.consume_for(42));
-        // Replay of a consumed grant is refused (single-use).
-        assert!(!grant.consume_for(42));
+    // 1. The blocked write opens an APPROVAL_REQUIRED ticket + fires the webhook.
+    let outcome = flow
+        .request_elevation(id.clone(), proposal, "agent-demo", &op, 60_000, &clock)
+        .expect("eligible op should open a request");
+    println!(
+        "1) request_elevation -> {} (request {}, webhook delivered={})",
+        outcome.contract.code,
+        outcome.contract.request_id,
+        outcome.webhook.is_ok()
+    );
+
+    // 2. A human approver (NOT the agent) signs the grant.
+    let approver = Principal::approver("human-alice");
+    let approval = flow
+        .approve(&id, &approver, &signing_key, "nonce-demo-1", 30_000, &clock)
+        .expect("approver should sign a grant");
+    println!("2) approve -> grant signed by `{}`", approver.id);
+
+    // 3. At apply, re-derive the live binding and re-verify the grant.
+    let live = flow
+        .store()
+        .get(&id)
+        .expect("request exists")
+        .proposal
+        .to_binding("nonce-demo-1", approval.grant.binding.expiry_unix_millis);
+    match flow.verify_at_apply(&approval.grant, &live, &clock) {
+        Ok(()) => println!("3) verify_at_apply -> VERIFIED (grant binds to the approved proposal)"),
+        Err(e) => println!("3) verify_at_apply -> REJECTED: {e}"),
     }
+
+    // The audit chain holds every step, hash-chained + verifiable.
+    let chain_ok = flow.audit().verify().is_ok();
+    println!(
+        "audit: {} records, chain intact={}",
+        flow.audit().load_chain().map(|c| c.len()).unwrap_or(0),
+        chain_ok
+    );
 }
