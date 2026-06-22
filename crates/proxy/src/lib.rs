@@ -11,11 +11,17 @@
 //!    `COPY` traffic, which kills `COMMIT; DROP SCHEMA …` statement-stacking;
 //! 2. **read-only** — classify each `Parse` SQL; non-`Read` is blocked
 //!    (advisory — the WALL role is the un-foolable backstop);
-//! 3. **byte/row mid-stream cutoff** — count `DataRow` bytes/rows from the
+//! 3. **EXPLAIN-cost gate** ([`explain`]) — before a read executes, run
+//!    `EXPLAIN` (no `ANALYZE`) and block pre-flight if the planner's estimated
+//!    cost/rows exceed the per-role ceiling (advisory + fail-closed);
+//! 4. **byte/row mid-stream cutoff** — count `DataRow` bytes/rows from the
 //!    backend and cut the stream off at the per-role budget from `policy.yaml`;
-//! 4. **timeout injection** — `SET statement_timeout` on the backend session;
-//! 5. **fail-closed** — any parse/enforcement uncertainty denies;
-//! 6. **audit** — every statement (allow/block/reject) is recorded on a
+//! 5. **cumulative per-window volume budget** ([`window`]) — accumulate
+//!    bytes/rows streamed across statements and kill the session when the
+//!    rolling-window budget is exceeded (anti slow-drip, deterministic clock);
+//! 6. **timeout injection** — `SET statement_timeout` on the backend session;
+//! 7. **fail-closed** — any parse/enforcement uncertainty denies;
+//! 8. **audit** — every statement (allow/block/reject) is recorded on a
 //!    hash-chained [`pgb_audit`] chain.
 //!
 //! ## Threat-model note (from the pgwire review)
@@ -36,12 +42,18 @@ pub mod auth;
 pub mod budget;
 pub mod config;
 pub mod enforce;
+pub mod explain;
 pub mod recorder;
 pub mod session;
 pub mod tls;
+pub mod window;
 
 pub use budget::{Budget, BudgetOutcome};
 pub use config::ProxyConfig;
 pub use enforce::{Enforcement, GateDecision, RejectKind};
+pub use explain::{
+    explain_wrap, EstimateDecision, EstimateDim, ExplainCeiling, ExplainGate, PlanEstimate,
+};
 pub use recorder::Recorder;
 pub use session::{serve_connection, SessionError};
+pub use window::{WindowCap, WindowMeter, WindowOutcome};

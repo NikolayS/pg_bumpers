@@ -142,6 +142,8 @@ mod tests {
         RoleBudget {
             max_bytes,
             max_rows,
+            max_plan_cost: RoleBudget::DEFAULT_MAX_PLAN_COST,
+            max_plan_rows: RoleBudget::DEFAULT_MAX_PLAN_ROWS,
             per_window: WindowBudget {
                 window_secs: 60,
                 max_bytes: max_bytes * 100,

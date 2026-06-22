@@ -1,13 +1,15 @@
 # pg_bumpers — example policy.yaml  (SPEC §10.10, §12.2, §15.1)
 #
 # The single source of per-role policy: the SELECT whitelist, byte/row budgets
-# (single-shot + per-window cumulative), and the autonomy level (L0–L2 in the
-# MVP). Plus the §12.2 component config (replica / clone / pitr), the §14.3
-# approver-set placeholder (CLI signing key), and the §10.9 audit anchor.
+# (single-shot + per-window cumulative), the advisory EXPLAIN-cost/row ceiling,
+# and the autonomy level (L0–L2 in the MVP). Plus the §12.2 component config
+# (replica / clone / pitr), the §14.3 approver-set placeholder (CLI signing key),
+# and the §10.9 audit anchor.
 #
 # Validation (see `PolicyConfig::validate`) rejects:
 #   * an autonomy level above L2 (L3+ is out of MVP scope),
-#   * any zero / negative budget,
+#   * any zero / negative budget (incl. a zero/negative/NaN max_plan_cost or a
+#     zero max_plan_rows EXPLAIN ceiling),
 #   * a per-window cumulative cap below the single-shot cap.
 #
 # This file loads and validates in the crate's test-suite.
@@ -24,6 +26,8 @@ roles:
     budget:
       max_bytes: 1048576        # 1 MiB single-shot
       max_rows: 10000           # 10k rows single-shot
+      max_plan_cost: 50000.0    # EXPLAIN-cost ceiling (advisory pre-flight gate)
+      max_plan_rows: 1000000    # EXPLAIN row ceiling (advisory; independent of the cutoff)
       per_window:
         window_secs: 60         # rolling 60s window
         max_bytes: 10485760     # 10 MiB cumulative / window
@@ -41,6 +45,8 @@ roles:
     budget:
       max_bytes: 268435456      # 256 MiB single-shot
       max_rows: 5000000         # 5M rows single-shot
+      max_plan_cost: 100000000.0 # EXPLAIN-cost ceiling (large for analytics reads)
+      max_plan_rows: 100000000  # EXPLAIN row ceiling (large for analytics reads)
       per_window:
         window_secs: 300        # rolling 5m window
         max_bytes: 1073741824   # 1 GiB cumulative / window
@@ -54,6 +60,8 @@ roles:
     budget:
       max_bytes: 1048576
       max_rows: 10000
+      max_plan_cost: 10000.0    # tight EXPLAIN ceiling for the locked-down role
+      max_plan_rows: 100000     # tight EXPLAIN row ceiling for the locked-down role
       per_window:
         window_secs: 60
         max_bytes: 10485760

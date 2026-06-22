@@ -38,7 +38,12 @@ use crate::auth::{ScramServer, ScramVerifier};
 use crate::budget::{Budget, BudgetOutcome};
 use crate::config::{BackendTarget, ProxyConfig};
 use crate::enforce::{Enforcement, GateDecision};
+use crate::explain::{
+    explain_wrap, EstimateDecision, ExplainCeiling, ExplainGate, EXPLAIN_FAIL_CLOSED_CODE,
+};
 use crate::recorder::Recorder;
+use crate::window::{WindowMeter, WindowOutcome};
+use pgb_core::Clock;
 
 /// Errors the session loop can end with. Most are terminal for the connection.
 #[derive(Debug, thiserror::Error)]
@@ -462,6 +467,142 @@ async fn drain_to_ready(stream: &mut TcpStream) -> Result<(), SessionError> {
     }
 }
 
+/// Run an advisory `EXPLAIN` (no `ANALYZE`) of `sql` on the **backend** session
+/// and return the top plan line's text — the pre-flight EXPLAIN-cost gate's input
+/// (SPEC §3 EXPLAIN-cost gate). This is a self-contained extended-protocol unit
+/// (Parse/Bind/Execute/Sync on the unnamed statement+portal) that the proxy runs
+/// on the otherwise-idle backend connection *before* it forwards the agent's real
+/// statement, draining the response to `ReadyForQuery`.
+///
+/// Returns:
+/// - `Ok(Some(line))` — the first plan-line `DataRow`'s single text column;
+/// - `Ok(None)` — EXPLAIN ran but produced no plan row (treated as fail-closed by
+///   the caller, since we cannot prove the read is under the ceiling);
+/// - `Err(reason)` — EXPLAIN itself errored (the SQL doesn't plan, a permission
+///   error, …). The caller fails **closed** on this.
+///
+/// `EXPLAIN` does not execute the statement, so this is safe to run as a
+/// pre-flight probe; `statement_timeout` (already injected on the backend) also
+/// bounds a pathological planning time.
+async fn run_explain_on_backend(
+    backend: &mut TcpStream,
+    sql: &str,
+) -> Result<Result<Option<String>, String>, SessionError> {
+    send_extended_unit(backend, &explain_wrap(sql)).await?;
+
+    let mut first_line: Option<String> = None;
+    let mut explain_error: Option<String> = None;
+    loop {
+        let frame = read_tagged_frame(backend)
+            .await?
+            .ok_or_else(|| SessionError::Backend("backend closed during EXPLAIN".into()))?;
+        match frame.tag {
+            // DataRow: the first column of the first row is the top plan line.
+            b'D' if first_line.is_none() && explain_error.is_none() => {
+                if let Ok(BackendMessage::DataRow { columns }) =
+                    BackendMessage::decode(b'D', frame.body.clone())
+                {
+                    if let Some(Some(bytes)) = columns.into_iter().next() {
+                        first_line = Some(String::from_utf8_lossy(&bytes).into_owned());
+                    }
+                }
+            }
+            // An ErrorResponse means EXPLAIN failed → fail-closed for the caller.
+            b'E' => {
+                if let Ok(BackendMessage::ErrorResponse { fields }) =
+                    BackendMessage::decode(b'E', frame.body.clone())
+                {
+                    explain_error = Some(diag(&fields));
+                }
+            }
+            // ReadyForQuery terminates the EXPLAIN unit.
+            b'Z' => break,
+            // Everything else (ParseComplete/BindComplete/RowDescription/
+            // CommandComplete/remaining plan rows/NoticeResponse) is drained.
+            _ => {}
+        }
+    }
+
+    if let Some(err) = explain_error {
+        return Ok(Err(err));
+    }
+    Ok(Ok(first_line))
+}
+
+/// The advisory EXPLAIN-cost pre-flight for one read (SPEC §3 EXPLAIN-cost gate).
+///
+/// Runs `EXPLAIN <sql>` on the backend, applies the role's [`ExplainGate`], and:
+/// - **within ceiling** → `Ok(None)`: the read may proceed (the caller forwards
+///   the real Parse and continues);
+/// - **over ceiling / fail-closed** → `Ok(Some(PendingError))`: the read is
+///   blocked *before* execution; the caller defers the error to the next `Sync`
+///   (so the agent's already-pipelined Bind/Execute frames are discarded, exactly
+///   like a read-only block) and the block is audited.
+///
+/// Fail-closed: an EXPLAIN error, an empty plan, or an unparseable estimate all
+/// block. The gate is advisory (planner misestimation can defeat it) — the
+/// un-foolable backstops are `statement_timeout` + the byte/row cutoff + the
+/// per-window budget + the warden.
+async fn explain_preflight(
+    gate: &ExplainGate,
+    backend: &mut TcpStream,
+    recorder: &Recorder,
+    session_id: &str,
+    sql: &str,
+) -> Result<Option<PendingError>, SessionError> {
+    let decision = match run_explain_on_backend(backend, sql).await? {
+        // EXPLAIN errored on the backend → fail closed.
+        Err(reason) => EstimateDecision::FailClosed(format!(
+            "EXPLAIN failed on the backend (fail-closed): {reason}"
+        )),
+        // EXPLAIN produced no plan row → fail closed (cannot prove under ceiling).
+        Ok(None) => {
+            EstimateDecision::FailClosed("EXPLAIN returned no plan row (fail-closed)".to_string())
+        }
+        Ok(Some(line)) => gate.decide_plan_line(&line),
+    };
+
+    match decision {
+        EstimateDecision::Within(_) => Ok(None),
+        EstimateDecision::Exceeded { dim, estimate } => {
+            let message = format!(
+                "read blocked before execution by the EXPLAIN-cost gate: estimated \
+                 {} (cost={:.2}, rows={}) exceeds the role ceiling (cost={:.2}, \
+                 rows={}) — advisory pre-flight gate",
+                match dim {
+                    crate::explain::EstimateDim::Cost => "plan cost",
+                    crate::explain::EstimateDim::Rows => "row count",
+                },
+                estimate.total_cost,
+                estimate.rows,
+                gate.ceiling().max_cost,
+                gate.ceiling().max_rows,
+            );
+            recorder
+                .block(session_id, sql, dim.code(), Some(message.clone()))
+                .map_err(SessionError::Audit)?;
+            Ok(Some(PendingError {
+                code: "53400",
+                message,
+            }))
+        }
+        EstimateDecision::FailClosed(reason) => {
+            recorder
+                .block(
+                    session_id,
+                    sql,
+                    EXPLAIN_FAIL_CLOSED_CODE,
+                    Some(reason.clone()),
+                )
+                .map_err(SessionError::Audit)?;
+            Ok(Some(PendingError {
+                code: "42501",
+                message: reason,
+            }))
+        }
+    }
+}
+
 /// A deferred error for extended-protocol error recovery: when the proxy blocks
 /// or rejects a frame mid-pipeline, it must (like PostgreSQL) **discard every
 /// following frontend message until the next `Sync`**, then report the error and
@@ -491,6 +632,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let gate = Enforcement::new();
+    // The advisory EXPLAIN-cost gate for this connection's role ceiling, and the
+    // cumulative per-window volume meter (anti slow-drip), both driven by the
+    // injected clock so the window boundary is deterministic.
+    let explain_gate = ExplainGate::new(ExplainCeiling::for_role(&cfg.budget));
+    let mut window = WindowMeter::for_window(&cfg.budget.per_window);
+    let clock = recorder.clock();
     // When `Some`, we are skipping frames until the next Sync, then will emit it.
     let mut pending: Option<PendingError> = None;
 
@@ -539,6 +686,22 @@ where
         match gate.gate(&msg) {
             GateDecision::Allow { sql } => {
                 if let Some(sql) = sql {
+                    // (3) EXPLAIN-cost gate (advisory, fail-closed): a read frame
+                    // carries SQL — run EXPLAIN on the backend BEFORE forwarding
+                    // the real Parse, and block pre-flight if the estimate breaks
+                    // the role ceiling (or if EXPLAIN itself fails → fail-closed).
+                    if let Some(pe) = explain_preflight(
+                        &explain_gate,
+                        &mut backend.stream,
+                        recorder,
+                        session_id,
+                        &sql,
+                    )
+                    .await?
+                    {
+                        pending = Some(pe);
+                        continue;
+                    }
                     recorder
                         .allow(session_id, &sql)
                         .map_err(SessionError::Audit)?;
@@ -546,10 +709,19 @@ where
                 // Forward the original frame bytes verbatim to the backend.
                 forward_frame(&mut backend.stream, &frame).await?;
                 // A Sync flushes the pipeline: relay the backend response(s) to
-                // the agent under the byte/row budget.
+                // the agent under the single-shot byte/row budget AND the
+                // cumulative per-window volume budget (anti slow-drip).
                 if matches!(msg, FrontendMessage::Sync) {
-                    relay_until_ready(agent, &mut backend.stream, cfg, recorder, session_id)
-                        .await?;
+                    relay_until_ready(
+                        agent,
+                        &mut backend.stream,
+                        cfg,
+                        recorder,
+                        session_id,
+                        &mut window,
+                        clock.as_ref(),
+                    )
+                    .await?;
                 }
             }
             GateDecision::Block { sql, code, message } => {
@@ -604,6 +776,21 @@ fn cutoff_message(cap: crate::budget::Cap, bytes: u64, rows: u64) -> String {
     )
 }
 
+/// Build the cutoff message for an exceeded **cumulative per-window** budget
+/// (anti slow-drip), given the pre-charge cumulative totals.
+fn window_cutoff_message(cap: crate::window::WindowCap, bytes: u64, rows: u64) -> String {
+    format!(
+        "result stream cut off at the cumulative per-window {} budget after \
+         {} rows / {} bytes streamed in the window (slow-drip volume limit)",
+        match cap {
+            crate::window::WindowCap::Bytes => "byte",
+            crate::window::WindowCap::Rows => "row",
+        },
+        rows,
+        bytes
+    )
+}
+
 /// Relay backend frames to the agent until `ReadyForQuery`, applying the
 /// per-statement byte/row cutoff. **Both** `DataRow` ('D') and backend-COPY
 /// `CopyData` ('d') payloads are metered against the same per-role budget — the
@@ -613,12 +800,15 @@ fn cutoff_message(cap: crate::budget::Cap, bytes: u64, rows: u64) -> String {
 /// the budget). On a cutoff we stop forwarding, emit an `ErrorResponse` to the
 /// agent, record the block, and fail-closed (tearing down a backend COPY rather
 /// than proxying it unmetered).
+#[allow(clippy::too_many_arguments)]
 async fn relay_until_ready<S>(
     agent: &mut S,
     backend: &mut TcpStream,
     cfg: &ProxyConfig,
     recorder: &Recorder,
     session_id: &str,
+    window: &mut WindowMeter,
+    clock: &dyn Clock,
 ) -> Result<(), SessionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -665,11 +855,15 @@ where
                 }
             }
             // DataRow ('D') and backend CopyData ('d') are BOTH metered against
-            // the same budget. Before a cutoff, charge the payload bytes as one
-            // "row"; once cut off, the remaining payloads are suppressed.
+            // the same budgets. Before a cutoff, charge the payload bytes as one
+            // "row" against (a) the single-shot per-statement budget and (b) the
+            // cumulative per-window volume budget (anti slow-drip). Once cut off,
+            // the remaining payloads are suppressed.
             b'D' | b'd' if !cut_off => {
-                match budget.charge_row(frame.body.len() as u64) {
-                    BudgetOutcome::Within { .. } => forward_frame(agent, &frame).await?,
+                let row_bytes = frame.body.len() as u64;
+                // (a) Single-shot per-statement cutoff.
+                match budget.charge_row(row_bytes) {
+                    BudgetOutcome::Within { .. } => {}
                     BudgetOutcome::Exceeded { cap, bytes, rows } => {
                         cut_off = true;
                         let message = cutoff_message(cap, bytes, rows);
@@ -692,6 +886,33 @@ where
                                 "backend COPY-out cut off at the budget: {message}"
                             )));
                         }
+                        continue;
+                    }
+                }
+                // (b) Cumulative per-window volume budget (slow-drip kill). The
+                // row is within the single-shot budget; now charge it against the
+                // rolling window. A breach KILLS the session (fail-closed): the
+                // bounded-disclosure guarantee is "≤ B leaked, then stopped".
+                match window.charge(row_bytes, 1, clock) {
+                    WindowOutcome::Within { .. } => forward_frame(agent, &frame).await?,
+                    WindowOutcome::Exceeded { cap, bytes, rows } => {
+                        let message = window_cutoff_message(cap, bytes, rows);
+                        recorder
+                            .block(
+                                session_id,
+                                "<result stream>",
+                                cap.code(),
+                                Some(message.clone()),
+                            )
+                            .map_err(SessionError::Audit)?;
+                        // The breaching row is NOT forwarded; tell the agent and
+                        // fail the session closed (the cumulative budget kill).
+                        write_frame(agent, &error_response("53400", &message).encode()).await?;
+                        backend.shutdown().await.ok();
+                        return Err(SessionError::Backend(format!(
+                            "cumulative per-window volume budget exceeded — session \
+                             killed (anti slow-drip): {message}"
+                        )));
                     }
                 }
             }
@@ -813,6 +1034,8 @@ mod tests {
             budget: RoleBudget {
                 max_bytes,
                 max_rows,
+                max_plan_cost: RoleBudget::DEFAULT_MAX_PLAN_COST,
+                max_plan_rows: RoleBudget::DEFAULT_MAX_PLAN_ROWS,
                 per_window: WindowBudget {
                     window_secs: 60,
                     max_bytes: max_bytes * 100,
@@ -873,7 +1096,18 @@ mod tests {
         let (agent_proxy_side, mut agent_client_side) = tokio::io::duplex(64 * 1024);
 
         let mut agent = agent_proxy_side;
-        let result = relay_until_ready(&mut agent, &mut backend, &cfg, &rec, "copy-test").await;
+        let mut window = WindowMeter::for_window(&cfg.budget.per_window);
+        let clock = MockClock::starting_at(0);
+        let result = relay_until_ready(
+            &mut agent,
+            &mut backend,
+            &cfg,
+            &rec,
+            "copy-test",
+            &mut window,
+            &clock,
+        )
+        .await;
 
         // The session fails closed on the metered-COPY cutoff.
         let err = result.expect_err("metered COPY-out cutoff must fail the session closed");
@@ -955,10 +1189,20 @@ mod tests {
         let mut backend = TcpStream::connect(backend_addr).await.unwrap();
         let (agent_proxy_side, mut agent_client_side) = tokio::io::duplex(64 * 1024);
         let mut agent = agent_proxy_side;
+        let mut window = WindowMeter::for_window(&cfg.budget.per_window);
+        let clock = MockClock::starting_at(0);
 
-        relay_until_ready(&mut agent, &mut backend, &cfg, &rec, "copy-ok")
-            .await
-            .expect("within-budget COPY-out relays cleanly");
+        relay_until_ready(
+            &mut agent,
+            &mut backend,
+            &cfg,
+            &rec,
+            "copy-ok",
+            &mut window,
+            &clock,
+        )
+        .await
+        .expect("within-budget COPY-out relays cleanly");
 
         drop(agent);
         let mut received = Vec::new();

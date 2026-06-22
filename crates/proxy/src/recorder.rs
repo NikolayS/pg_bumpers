@@ -77,6 +77,16 @@ impl Recorder {
         Ok(())
     }
 
+    /// The injected clock backing this recorder.
+    ///
+    /// Exposed so the session loop can drive the deterministic per-window volume
+    /// meter ([`crate::window::WindowMeter`]) off the **same** injected clock the
+    /// audit chain is stamped from — one time source per session, swappable for a
+    /// [`pgb_core::MockClock`] in tests.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     /// Convenience: record an allowed statement.
     pub fn allow(&self, session_id: &str, sql: &str) -> Result<(), String> {
         self.record(session_id, sql, Decision::Allow, "ok", None)

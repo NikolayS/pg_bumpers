@@ -265,6 +265,14 @@ async fn proxy_enforcement_end_to_end_against_pg18() {
     let budget = RoleBudget {
         max_bytes: 50_000,
         max_rows: 100,
+        // Generous EXPLAIN ceiling (cost AND rows): the existing end-to-end cases
+        // gate on the byte/row mid-stream cutoff + read-only + timeout, NOT the
+        // advisory EXPLAIN gate (which has its own dedicated IT in readgates_it).
+        // Critically, max_plan_rows must NOT be coupled to the single-shot
+        // max_rows cutoff, or the planner's default estimate for an un-analyzed
+        // table would pre-empt the cutoff this test exercises.
+        max_plan_cost: 1_000_000_000.0,
+        max_plan_rows: 1_000_000_000,
         per_window: WindowBudget {
             window_secs: 60,
             max_bytes: 50_000_000,
@@ -445,6 +453,14 @@ async fn tls_is_required_when_configured() {
     let budget = RoleBudget {
         max_bytes: 50_000,
         max_rows: 100,
+        // Generous EXPLAIN ceiling (cost AND rows): the existing end-to-end cases
+        // gate on the byte/row mid-stream cutoff + read-only + timeout, NOT the
+        // advisory EXPLAIN gate (which has its own dedicated IT in readgates_it).
+        // Critically, max_plan_rows must NOT be coupled to the single-shot
+        // max_rows cutoff, or the planner's default estimate for an un-analyzed
+        // table would pre-empt the cutoff this test exercises.
+        max_plan_cost: 1_000_000_000.0,
+        max_plan_rows: 1_000_000_000,
         per_window: WindowBudget {
             window_secs: 60,
             max_bytes: 50_000_000,

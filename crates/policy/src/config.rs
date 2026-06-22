@@ -56,17 +56,53 @@ pub struct WindowBudget {
     pub max_rows: u64,
 }
 
-/// A role's budgets: a single-shot cap plus a per-window cumulative cap
-/// (SPEC §11.6 / §13.2 bounded disclosure).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A role's budgets: a single-shot cap, a per-window cumulative cap, and the
+/// EXPLAIN-cost ceiling (SPEC §3, §11.6 / §13.2 bounded disclosure).
+///
+/// `PartialEq`/`Eq` are derived manually because [`f64`] (`max_plan_cost`) is not
+/// `Eq`; the manual impls treat the cost field by bit pattern, which is exactly
+/// what the round-trip equality tests need (no NaN ceilings are valid anyway —
+/// validation rejects a non-finite / non-positive cost).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleBudget {
     /// Single-shot maximum bytes a single statement may return.
     pub max_bytes: u64,
     /// Single-shot maximum rows a single statement may return.
     pub max_rows: u64,
+    /// The **EXPLAIN-cost ceiling**: the maximum estimated *total plan cost*
+    /// (planner cost units) a read may have before the advisory EXPLAIN gate
+    /// blocks it pre-flight (SPEC §3 "EXPLAIN-cost gate (advisory)"). Defaults
+    /// (when omitted from `policy.yaml`) to [`RoleBudget::DEFAULT_MAX_PLAN_COST`].
+    #[serde(default = "RoleBudget::default_max_plan_cost")]
+    pub max_plan_cost: f64,
+    /// The **EXPLAIN row ceiling**: the maximum *estimated* row count a read's
+    /// plan may have before the advisory EXPLAIN gate blocks it pre-flight.
+    ///
+    /// Deliberately **independent** of the single-shot `max_rows` cutoff: the
+    /// EXPLAIN gate is *advisory* (planner estimates), whereas `max_rows` is the
+    /// un-foolable mid-stream cutoff. Coupling them would let an *estimate* pre-
+    /// empt the real cutoff (e.g. an un-analyzed table the planner over-estimates
+    /// would be blocked even though the actual result is tiny). So this defaults
+    /// generously high ([`RoleBudget::DEFAULT_MAX_PLAN_ROWS`]) — the cost ceiling
+    /// is the primary EXPLAIN dimension; tighten this only when a role should
+    /// refuse plans the planner predicts will be huge.
+    #[serde(default = "RoleBudget::default_max_plan_rows")]
+    pub max_plan_rows: u64,
     /// Cumulative per-window budget (slow-drip gate).
     pub per_window: WindowBudget,
 }
+
+impl PartialEq for RoleBudget {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_bytes == other.max_bytes
+            && self.max_rows == other.max_rows
+            && self.max_plan_cost.to_bits() == other.max_plan_cost.to_bits()
+            && self.max_plan_rows == other.max_plan_rows
+            && self.per_window == other.per_window
+    }
+}
+
+impl Eq for RoleBudget {}
 
 /// A role's policy: its certified read surface, budgets, and autonomy
 /// (SPEC §15.1).
@@ -231,6 +267,27 @@ impl RolePolicy {
 }
 
 impl RoleBudget {
+    /// The default EXPLAIN-cost ceiling when `max_plan_cost` is omitted from a
+    /// role's `policy.yaml` budget. Chosen as a large-but-finite cost so the
+    /// gate is *advisory-on* by default (it still blocks an obviously heavy plan)
+    /// without surprising existing configs that predate the field.
+    pub const DEFAULT_MAX_PLAN_COST: f64 = 1_000_000.0;
+
+    /// The default EXPLAIN **row** ceiling when `max_plan_rows` is omitted. Set
+    /// very high so the advisory row dimension does not pre-empt the un-foolable
+    /// single-shot row cutoff by default (see [`RoleBudget::max_plan_rows`]).
+    pub const DEFAULT_MAX_PLAN_ROWS: u64 = 1_000_000_000;
+
+    /// serde default hook for [`RoleBudget::max_plan_cost`].
+    fn default_max_plan_cost() -> f64 {
+        RoleBudget::DEFAULT_MAX_PLAN_COST
+    }
+
+    /// serde default hook for [`RoleBudget::max_plan_rows`].
+    fn default_max_plan_rows() -> u64 {
+        RoleBudget::DEFAULT_MAX_PLAN_ROWS
+    }
+
     /// Validate budgets: every cap must be positive and the per-window window
     /// must be non-zero. A zero or "negative" budget is nonsensical and, since
     /// YAML numbers can't be negative in a `u64`, a negative literal fails to
@@ -241,6 +298,21 @@ impl RoleBudget {
                 "role `{role_name}`: single-shot budget caps must be > 0 \
                  (max_bytes={}, max_rows={})",
                 self.max_bytes, self.max_rows
+            )));
+        }
+        // The EXPLAIN-cost ceiling must be a positive, finite cost (a zero /
+        // negative / NaN ceiling would either block everything or be incoherent).
+        if !(self.max_plan_cost.is_finite() && self.max_plan_cost > 0.0) {
+            return Err(PolicyError::Invalid(format!(
+                "role `{role_name}`: max_plan_cost must be a finite value > 0 \
+                 (got {})",
+                self.max_plan_cost
+            )));
+        }
+        // The EXPLAIN row ceiling must be positive (zero would block everything).
+        if self.max_plan_rows == 0 {
+            return Err(PolicyError::Invalid(format!(
+                "role `{role_name}`: max_plan_rows must be > 0"
             )));
         }
         let w = &self.per_window;
@@ -410,6 +482,99 @@ roles:
         assert_eq!(cfg.clone.provider, CloneProvider::None);
         assert!(!cfg.pitr.enabled);
         assert!(cfg.replica.dsn.is_none());
+    }
+
+    #[test]
+    fn max_plan_cost_defaults_when_omitted() {
+        // Existing configs that predate the EXPLAIN ceiling still load: the
+        // field defaults rather than failing to parse.
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.roles["app"].budget.max_plan_cost,
+            RoleBudget::DEFAULT_MAX_PLAN_COST
+        );
+    }
+
+    #[test]
+    fn explicit_max_plan_cost_parses() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      max_plan_cost: 5000.0
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).unwrap();
+        assert_eq!(cfg.roles["app"].budget.max_plan_cost, 5000.0);
+    }
+
+    #[test]
+    fn rejects_zero_or_negative_max_plan_cost() {
+        for bad in ["0", "0.0", "-1.0"] {
+            let yaml = format!(
+                r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      max_plan_cost: {bad}
+      per_window: {{ window_secs: 60, max_bytes: 10000, max_rows: 1000 }}
+"#
+            );
+            let err = PolicyConfig::load_from_yaml(&yaml).unwrap_err();
+            assert!(err.to_string().contains("max_plan_cost"), "{err} ({bad})");
+        }
+    }
+
+    #[test]
+    fn max_plan_rows_defaults_and_rejects_zero() {
+        // Defaults when omitted.
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.roles["app"].budget.max_plan_rows,
+            RoleBudget::DEFAULT_MAX_PLAN_ROWS
+        );
+        // Zero is rejected (would block everything).
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      max_plan_rows: 0
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let err = PolicyConfig::load_from_yaml(yaml).unwrap_err();
+        assert!(err.to_string().contains("max_plan_rows"), "{err}");
     }
 
     #[test]
