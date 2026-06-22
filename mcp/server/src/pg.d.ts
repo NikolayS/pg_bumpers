@@ -21,6 +21,7 @@ declare module "pg" {
     user?: string;
     password?: string;
     statement_timeout?: number;
+    application_name?: string;
   }
   export class Client {
     constructor(config?: ClientConfig);

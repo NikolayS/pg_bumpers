@@ -799,3 +799,80 @@ claim generic-schema apply works.
 alongside, so the integration tests AND `pgb-applyd` share exactly ONE implementation of
 each conn — no second, unproven copy. The existing clone-orchestrator IT tests now reuse the
 lifted impls (re-verified green: 16 IT tests).
+
+---
+
+## S5 — the MARQUEE: "delete a DB through the official MCP" repro + bench breadth + KNOWN_BYPASSES (#68)
+
+The headline demonstration of the moat **as a running system**: a REAL MCP client drives the
+deployable stdio shell against the now-assembled stack (live proxy read path + `pgb-applyd` +
+live `pgb-warden` + anchored `_meta` audit) and the system's behavior is shown **split by
+damage class** — honestly, no overclaim.
+
+### What ran LIVE (end-to-end, `PG_BUMPERS_IT=1`, dedicated high port 54341; NEVER 5432)
+
+`mcp/server/test/marquee.integration.test.ts` (run + transcript-captured by `deploy/marquee.sh`,
+evidence in `deploy/marquee.transcript.txt`) drives a REAL MCP client over `pgb-mcp` and asserts,
+per damage class:
+
+- **Irreversible / structural** (DROP DATABASE/TABLE, TRUNCATE, ALTER) → **REFUSED**,
+  default-deny (`NOT_REHEARSABLE` at the applyd classify choke); a DROP on the read tool →
+  `READ_ONLY`. The "delete a DB" headline = the attempt is **neutralized by refusal**, not run.
+- **Bounded reversible write** (no-WHERE-shaped wide UPDATE on the single-int-PK table) →
+  bounded by blast radius; no grant → `APPROVAL_REQUIRED`; operator-approved §14.3 grant →
+  **applied reversibly**; a drifted apply → `GRANT_REJECTED`/`BLAST_DRIFT` **abort, no mutation**.
+- **Runaway read** (agent-tagged long `pg_sleep`) → **killed by the live `pgb-warden` binary**,
+  a non-agent session **spared**, the kill **audited** to `_meta`.
+- **Every decision** lands on **ONE anchored `_meta` chain** — `pgb-cli verify` runs
+  `verify_chain` over the unified chain AND asserts the durable anchored head matches.
+
+### What this amendment WIRED (behavior additions, each red→green)
+
+- **The MCP read session now carries the proxy `application_name` tag** (`pgb_proxy`, env
+  `PGB_PROXY_APP_NAME`) so the out-of-band warden recognizes + can terminate an agent-tagged
+  runaway read. NOT a security control — the un-strippable anchor remains the hardened agent
+  role; this is purely the warden's tag. (`mcp/server/src/pgProxy.ts`, `bin/mcpStdio.ts`.)
+- **A propose-time structural REFUSAL is now surfaced as a recoverable BLOCK**, never an opaque
+  error: `createServer().propose_write` catches the `ApplydError` the production `ApplydCore`
+  throws when applyd's classify choke refuses a DROP/TRUNCATE/ALTER, and returns the
+  `{status:blocked, code, reason, remedy, retryable}` contract (SPEC §4: every denial is
+  recoverable). (`mcp/server/src/server.ts`; tested in `mcp/server/test/tools.test.ts`.)
+- **`pgb-cli verify`** — a new read-only subcommand (`crates/cli/src/verify.rs` + `main.rs`)
+  that loads the shared `_meta` chain, runs `verify_chain`, then `verify_then_anchor`s to a
+  caller-supplied (fresh) `PGB_ANCHOR_PATH` and asserts the durable anchored head equals the
+  chain head — the marquee's "one anchored chain" proof, reusing #64's machinery (it does NOT
+  disturb the running daemon's anchor; the verify step uses its own anchor file).
+
+### Deterministic benchmark breadth (`dbsafe-bench`)
+
+The frozen corpus grew from 22 → **35** scenarios (26 dangerous + 9 adversarial-legit) toward
+the frozen scenario set: more refused-ops (`refused-drop-database`, `refused-insert-no-pk`,
+`refused-update-no-preimage`, `refused-unknown-op`), more statement-stacking / smuggling
+(`stacking-drop-database`, `copy-on-read-path-obfuscated`, `delete-on-read-path-naive`), a
+slow-drip row-cap exfil (`exfil-slow-drip-row-cap`), the COPY…PROGRAM bypass variant, and more
+adversarial-legit FP-denominator reads/writes. The golden 0-FN / 0-FP gate stays green and
+`gate_has_teeth` is untouched (it still FAILs on a deliberately-broken engine). The
+catastrophic-FN ledger (`dbsafe-bench/golden/known_bypasses.json`) remains **empty**.
+
+### KNOWN_BYPASSES ledger
+
+`KNOWN_BYPASSES.md` (new, repo root) documents the residual, honestly-disclosed **scope**
+limits — bounded (≤ B, not zero) read disclosure; the cooperative-MCP caveat; single-int-PK
+apply; deferred T4 cross-process attestation; the file-`WormAnchor` stand-in (delete-the-file
+re-baselines); the `Allow`-stub RiskEngine — each with a repro note tied to its SPEC.amendments
+entry. These are NOT floor false-negatives (the catastrophic-FN JSON ledger stays empty); they
+bound what the guarantees COVER.
+
+### Honest scope (what was harness-gated vs. fully live)
+
+- **Fully LIVE in the marquee:** the MCP client → stdio shell → `ApplydCore` → `pgb-applyd` →
+  `guarded_apply_with_grant` write path; the live `pgb-warden` kill/spare/audit; the unified
+  `_meta` chain `verify_chain` + anchored-head match via `pgb-cli verify`; the structural
+  refusals; the bounded apply + drift abort.
+- **Proven in a sibling IT, referenced by the marquee:** the **byte-for-byte revert restores
+  the pre-state** is asserted against real PG18 in `crates/applyd/tests/applyd_it.rs`
+  (`lifecycle_apply_commits_bounded_update_and_revert_restores_prestate`); the marquee asserts
+  the bounded commit + the `reversible:true` flag (it does not re-drive the revert in TS).
+- **The reads point straight at PG18** standing in for the proxied backend (same honest split
+  as `integration.test.ts`): the full Apache Rust proxy binary in front (SCRAM/TLS/WALL) is
+  covered by `crates/proxy/tests/`. The MCP layer is cooperative, not the boundary.

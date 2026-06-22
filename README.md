@@ -76,7 +76,7 @@ the live, fully-tested implementation.
 | **S2** | Clone-orchestrator dry-run (blast-radius preview) · clone governance | **merged · green on PG18** |
 | **S3** | Guarded apply + typed-inverse (PITR fence · apply-time PK-set re-check · `RETURNING` written-set) | **in progress** ([#35](https://github.com/NikolayS/pg_bumpers/issues/35)) |
 | **S4** | Warden · MCP server · `policy.yaml` wiring · external audit anchor · deferred read gates · CLI approval | **upcoming** |
-| **S5** | Focused deterministic benchmark + marquee MCP statement-stacking bypass repro | **upcoming** |
+| **S5** | Focused deterministic benchmark breadth + the marquee "delete a DB through the official MCP" end-to-end repro (per damage class, live stack) + `KNOWN_BYPASSES.md` | **in progress** ([#68](https://github.com/NikolayS/pg_bumpers/issues/68)) — run `deploy/marquee.sh`; evidence in `deploy/marquee.transcript.txt` |
 | — | **LLM gating engine** (the risk model that tightens) | **fast-follow** |
 
 **Substrate:** live integration tests run against **local Postgres 18** (Homebrew

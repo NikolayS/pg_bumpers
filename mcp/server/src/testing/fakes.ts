@@ -16,6 +16,25 @@
 import type { BlockBody } from "../blockContract.js";
 import { isReadOnly } from "../classifier.js";
 import type { IntentTiers } from "../intent.js";
+
+/**
+ * A propose-time refusal carrying the recoverable-block fields, modeling the
+ * production `ApplydError` the real `ApplydCore.propose` throws when applyd's
+ * classify choke refuses a structural/non-rehearsable shape. The server's
+ * `proposeWrite` converts an error of this shape into a block contract.
+ */
+export class ProposeRefusedError extends Error {
+  readonly code: string;
+  readonly remedy: string;
+  readonly retryable: boolean;
+  constructor(body: BlockBody) {
+    super(body.reason);
+    this.name = "ProposeRefusedError";
+    this.code = body.code;
+    this.remedy = body.remedy;
+    this.retryable = body.retryable ?? false;
+  }
+}
 import type {
   ApplyResult,
   AuditRecord,
@@ -146,6 +165,7 @@ export class FakeCore implements Core {
   private idCounter = 0;
   private approvalBlock: BlockBody | undefined;
   private lastIntentLogged: IntentTiers | undefined;
+  private proposeRefusal: BlockBody | undefined;
 
   /** Advance the deterministic clock (drives TTL expiry in tests). */
   advance(millis: number): void {
@@ -160,6 +180,22 @@ export class FakeCore implements Core {
       // Recoverable: name request_elevation as the next step (SPEC §14.3).
       remedy: "open an approval ticket via request_elevation, then await the grant",
       retryable: true,
+    };
+  }
+
+  /**
+   * Make the next `propose` REFUSE with a recoverable block — modeling the
+   * production `ApplydCore.propose`, which throws an `ApplydError` carrying
+   * `{code, message, remedy, retryable}` when applyd's classify choke refuses a
+   * structural/non-rehearsable shape (DROP/TRUNCATE/ALTER). The server must turn
+   * that into a structured block, never an opaque error (SPEC §4).
+   */
+  refuseOnPropose(code: string, reason: string): void {
+    this.proposeRefusal = {
+      code,
+      reason,
+      remedy: "only single-statement UPDATE/DELETE are certified writes; structural ops are refused",
+      retryable: false,
     };
   }
 
@@ -183,6 +219,14 @@ export class FakeCore implements Core {
     expectedRows: number | undefined,
     intent: IntentTiers,
   ): Promise<ProposalHandle> {
+    if (this.proposeRefusal) {
+      // Mirror ApplydCore.propose: a refusal is THROWN as an error carrying the
+      // recoverable-block fields. The server converts it into a block contract.
+      const b = this.proposeRefusal;
+      this.proposeRefusal = undefined;
+      this.record("PROPOSE", intent);
+      throw new ProposeRefusedError(b);
+    }
     const id = this.mintId("p");
     this.proposals.set(id, {
       id,

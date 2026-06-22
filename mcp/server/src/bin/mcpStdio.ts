@@ -85,12 +85,16 @@ async function main(): Promise<void> {
   const socketPath = env("PGB_APPLYD_SOCKET");
 
   // Reads go through the LIVE proxy (a real libpq client to the proxy endpoint).
+  // The session carries the proxy `application_name` tag so the out-of-band warden
+  // (SPEC §3 layer 2) recognizes + can terminate an agent-tagged runaway read. NOT
+  // a security control — the un-strippable anchor is the hardened agent role.
   const transport = await PgProxyTransport.connect({
     host: env("PGB_PROXY_HOST", "127.0.0.1"),
     port: Number(env("PGB_PROXY_PORT", "6432")),
     database: env("PGB_PROXY_DB", "postgres"),
     user: env("PGB_PROXY_USER", role),
     password: process.env.PGB_PROXY_PASSWORD,
+    applicationName: env("PGB_PROXY_APP_NAME", "pgb_proxy"),
   });
 
   // Writes go through the production ApplydCore → pgb-applyd (the real floor).
