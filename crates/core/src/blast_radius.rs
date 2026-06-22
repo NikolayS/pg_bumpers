@@ -31,6 +31,20 @@ pub struct Affected {
     pub cascade_by_table: BTreeMap<String, u64>,
     /// Per-table affected-PK-set checksum (`"sha256:…"`); see SPEC §10.2.
     pub pk_set_checksum: BTreeMap<String, String>,
+    /// The **full** per-relation in-txn change footprint the dry-run measured via
+    /// `pg_stat_xact_n_tup_{ins,upd,del}` deltas (SPEC §4) — the target, every
+    /// cascade child, **and every relation a fired trigger wrote to** (e.g. an
+    /// audit table). This is the symmetric prediction the guarded apply reconciles
+    /// its own `pg_stat_xact_*` deltas against: a write to a relation **not** in
+    /// this map, or **more** changes than recorded here, is drift and aborts. It is
+    /// the apply-time "0 catastrophic data-loss FN by construction" mechanism.
+    ///
+    /// `#[serde(default)]` keeps the §10.1 wire contract backward-compatible: an
+    /// older record without this field deserializes to an empty map (a guarded
+    /// apply then has no predicted footprint to reconcile and must refuse — a
+    /// stale grant cannot authorize a write, fail-closed).
+    #[serde(default)]
+    pub effect_by_table: BTreeMap<String, u64>,
     /// Total rows affected across target + cascade.
     pub total_rows: u64,
 }
@@ -235,6 +249,7 @@ mod tests {
             "by_table",
             "cascade_by_table",
             "pk_set_checksum",
+            "effect_by_table",
             "total_rows",
         ] {
             assert!(
@@ -242,6 +257,18 @@ mod tests {
                 "missing affected.{key} spec field"
             );
         }
+    }
+
+    /// The new `effect_by_table` field is backward-compatible: an older §10.1
+    /// record without it deserializes to an empty map (and a guarded apply then
+    /// refuses the stale grant, fail-closed).
+    #[test]
+    fn effect_by_table_defaults_to_empty_for_a_legacy_record() {
+        let br: BlastRadius = serde_json::from_str(SAMPLE_JSON).expect("sample must parse");
+        assert!(
+            br.affected.effect_by_table.is_empty(),
+            "a record without effect_by_table deserializes to an empty footprint"
+        );
     }
 
     #[test]

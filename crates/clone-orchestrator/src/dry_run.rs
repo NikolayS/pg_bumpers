@@ -134,6 +134,22 @@ pub struct AffectedTable {
     pub rows: u64,
 }
 
+/// One relation's full in-txn change footprint, measured from the rehearsal txn's
+/// `pg_stat_xact_n_tup_{ins,upd,del}` deltas (SPEC §4). This captures the **FULL**
+/// effect of the forward op — target, cascades, **and every relation a fired
+/// trigger wrote to** (e.g. an audit table) — which the guarded apply reconciles
+/// its own deltas against (the "0 catastrophic data-loss FN by construction"
+/// mechanism). A relation the apply touches that is absent here, or with more
+/// changes than recorded here, is drift and aborts the apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationEffect {
+    /// `schema.table`.
+    pub relation: String,
+    /// Total rows changed in the relation within the rehearsal txn
+    /// (`n_tup_ins + n_tup_upd + n_tup_del`).
+    pub changed: u64,
+}
+
 /// Everything the rehearsal measured for one proposed write, before the engine
 /// folds it into a [`BlastRadius`]. The backend produces this **inside the
 /// rolled-back txn**; the engine adds no DB facts of its own.
@@ -144,6 +160,10 @@ pub struct Measurement {
     /// Cascade-affected relations (`ON DELETE/UPDATE CASCADE`), each with its
     /// own affected-PK set.
     pub cascades: Vec<AffectedTable>,
+    /// The FULL per-relation change footprint (`pg_stat_xact_*` deltas) — target,
+    /// cascades, and trigger-written tables. Empty ⇒ the backend did not measure it
+    /// (older mock); the engine then synthesizes a footprint from target+cascades.
+    pub full_effect: Vec<RelationEffect>,
     /// Triggers the write fired, with per-trigger row counts.
     pub triggers_fired: Vec<TriggerFired>,
     /// Locks the write took (from `pg_locks`, held during the rehearsal).
@@ -387,10 +407,28 @@ fn assemble(
         total_rows = total_rows.saturating_add(cascade.rows);
     }
 
+    // The FULL per-relation change footprint the guarded apply reconciles against
+    // (SPEC §4 `pg_stat_xact_*`): prefer the backend's measured `full_effect`
+    // (target + cascades + trigger-written tables); if the backend did not measure
+    // it, synthesize it from target+cascades so the field is never empty for a
+    // real record (an empty footprint makes the apply refuse, fail-closed).
+    let mut effect_by_table: BTreeMap<String, u64> = BTreeMap::new();
+    if m.full_effect.is_empty() {
+        effect_by_table.insert(m.target.relation.clone(), m.target.rows);
+        for cascade in &m.cascades {
+            effect_by_table.insert(cascade.relation.clone(), cascade.rows);
+        }
+    } else {
+        for e in &m.full_effect {
+            effect_by_table.insert(e.relation.clone(), e.changed);
+        }
+    }
+
     let affected = Affected {
         by_table,
         cascade_by_table,
         pk_set_checksum,
+        effect_by_table,
         total_rows,
     };
 
@@ -460,6 +498,7 @@ mod tests {
                         rows: ids.len() as u64,
                     },
                     cascades: vec![],
+                    full_effect: vec![],
                     triggers_fired: vec![TriggerFired {
                         name: "orders_audit_ai".into(),
                         rows: ids.len() as u64,
@@ -699,5 +738,40 @@ mod tests {
             .affected
             .pk_set_checksum
             .contains_key("public.order_items"));
+        // With no measured full_effect, the footprint is synthesized from
+        // target+cascades so the guarded apply always has something to reconcile.
+        assert_eq!(br.affected.effect_by_table["public.orders"], 2);
+        assert_eq!(br.affected.effect_by_table["public.order_items"], 4);
+    }
+
+    #[test]
+    fn full_effect_footprint_is_recorded_when_measured() {
+        // When the backend measures the full pg_stat_xact_* footprint (target +
+        // cascade + a trigger-written audit table), assemble records it verbatim
+        // into effect_by_table — the symmetric prediction the apply reconciles.
+        let clock = MockClock::new();
+        let p = propose("DELETE FROM public.orders WHERE id = 1", None, &clock);
+        let mut backend = MockRehearsal::with_target("public.orders", &[1]);
+        backend.measurement.full_effect = vec![
+            RelationEffect {
+                relation: "public.orders".into(),
+                changed: 1,
+            },
+            RelationEffect {
+                relation: "public.order_items".into(),
+                changed: 3,
+            },
+            RelationEffect {
+                relation: "public.orders_audit".into(),
+                changed: 1,
+            },
+        ];
+        let br = dry_run(&p, &mut backend, &clock).unwrap();
+        assert_eq!(br.affected.effect_by_table["public.orders"], 1);
+        assert_eq!(br.affected.effect_by_table["public.order_items"], 3);
+        assert_eq!(
+            br.affected.effect_by_table["public.orders_audit"], 1,
+            "the trigger-written audit table is in the measured footprint"
+        );
     }
 }

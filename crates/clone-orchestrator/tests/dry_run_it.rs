@@ -178,6 +178,22 @@ fn delete_cascade_measures_child_pk_set() {
     assert!(br.affected.pk_set_checksum.contains_key("public.entries"));
     assert_eq!(br.inverse_kind, pgb_core::InverseKind::Insert);
 
+    // The FULL per-relation footprint (pg_stat_xact_*) is recorded — target,
+    // cascade child, AND the audit table the DELETE trigger wrote to. This is the
+    // symmetric prediction the guarded apply reconciles its own deltas against.
+    assert_eq!(
+        br.affected.effect_by_table["public.accounts"], 4,
+        "4 parent deletes measured in the full footprint"
+    );
+    assert_eq!(
+        br.affected.effect_by_table["public.entries"], 8,
+        "8 cascade-child deletes measured in the full footprint"
+    );
+    assert_eq!(
+        br.affected.effect_by_table["public.account_audit"], 4,
+        "the AFTER DELETE trigger's 4 audit inserts are in the measured footprint"
+    );
+
     // Primary unchanged — rolled back.
     assert_eq!(row_count(&mut client, "public.accounts"), 8);
     assert_eq!(row_count(&mut client, "public.entries"), 16);

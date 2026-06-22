@@ -30,7 +30,9 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::{base_pgurl, create_seeded_db, drop_db, it_enabled};
-use pgb_clone_orchestrator::apply::{ApplyConn, ApplyError, CapturedRow, ForwardResult};
+use pgb_clone_orchestrator::apply::{
+    ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationChange,
+};
 use pgb_clone_orchestrator::{guarded_apply, PitrConfig, RecoveryFence, WriteKind};
 use pgb_core::inverse::ImageValue;
 use pgb_core::{
@@ -71,10 +73,37 @@ struct PgApplyConn<'a> {
     forward_sql: String,
     /// The recompute predicate (WHERE body) for the apply-time PK-set re-check.
     where_sql: String,
+    /// Per-cascade-relation: a SQL snippet selecting the child PK + pre-image rows
+    /// (those whose parent matches `where_sql`). Keyed by `schema.table`. Used to
+    /// recompute the cascade PK-set checksum AND capture the cascade pre-image for
+    /// the full inverse. For the seed this is `entries` whose `account_id` is in
+    /// the matched-accounts set.
+    cascade_selects: BTreeMap<String, CascadeSelect>,
+    /// Per-relation BASELINE of `pg_stat_xact_n_tup_{ins,upd,del}` captured at the
+    /// START of the apply txn (before the forward op). `pg_stat_xact_*` accumulates
+    /// across the session (it does NOT reset on `BEGIN`), so the forward op's true
+    /// footprint is the `after − baseline` DELTA. Without this, prior-session writes
+    /// (the seed) would masquerade as the apply's effect.
+    xact_baseline: BTreeMap<String, (i64, i64, i64)>,
     /// Set once `begin` runs; cleared by commit/rollback (rollback idempotency).
     in_txn: bool,
     /// The `statement_timeout` the txn runs under (so a cancel maps to `Timeout`).
     statement_timeout_ms: u64,
+}
+
+/// How to read a cascade child relation's PK set + pre-image, scoped to the
+/// children whose parent matches the target predicate.
+#[derive(Clone)]
+struct CascadeSelect {
+    /// The child relation `schema.table`.
+    relation: String,
+    /// Comma-separated PK column list (e.g. `account_id, line_no`).
+    pk_cols: String,
+    /// Comma-separated full pre-image column list (e.g. `account_id, line_no, memo, amount`).
+    image_cols: String,
+    /// A WHERE body scoping the child rows to the matched parents (e.g.
+    /// `account_id IN (SELECT id FROM public.accounts WHERE id % 2 = 0)`).
+    where_sql: String,
 }
 
 impl<'a> PgApplyConn<'a> {
@@ -83,9 +112,45 @@ impl<'a> PgApplyConn<'a> {
             client,
             forward_sql: forward_sql.to_string(),
             where_sql: where_sql.to_string(),
+            cascade_selects: BTreeMap::new(),
+            xact_baseline: BTreeMap::new(),
             in_txn: false,
             statement_timeout_ms: 0,
         }
+    }
+
+    /// Read the raw per-relation `pg_stat_xact_n_tup_{ins,upd,del}` counters for
+    /// every user relation (cumulative within the session). The DELTA against the
+    /// baseline taken at txn start is the forward op's true footprint.
+    fn read_xact_raw(&mut self) -> Result<BTreeMap<String, (i64, i64, i64)>, ApplyError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT schemaname || '.' || relname AS rel, \
+                        n_tup_ins, n_tup_upd, n_tup_del \
+                 FROM pg_stat_xact_user_tables",
+                &[],
+            )
+            .map_err(|e| classify_pg_err(&e, self.statement_timeout_ms))?;
+        let mut out = BTreeMap::new();
+        for row in &rows {
+            out.insert(
+                row.get::<_, String>(0),
+                (
+                    row.get::<_, i64>(1),
+                    row.get::<_, i64>(2),
+                    row.get::<_, i64>(3),
+                ),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Register a cascade child relation for the full-blast-radius re-check +
+    /// inverse capture (the seed's `entries → accounts ON DELETE CASCADE`).
+    fn with_cascade(mut self, c: CascadeSelect) -> Self {
+        self.cascade_selects.insert(c.relation.clone(), c);
+        self
     }
 }
 
@@ -110,12 +175,39 @@ impl ApplyConn for PgApplyConn<'_> {
             .map_err(|e| ApplyError::Backend(e.to_string()))?;
         self.in_txn = true;
         self.statement_timeout_ms = timeout_ms;
+        // Capture the pg_stat_xact baseline at txn start (it accumulates across the
+        // session, so the forward op's footprint is the delta against this).
+        self.xact_baseline = self.read_xact_raw()?;
         Ok(())
     }
 
     fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
         // Recompute the affected-PK set on the SAME predicate, INSIDE the txn,
         // BEFORE the forward op (the 0-tolerance drift check's apply-time side).
+        // A cascade relation (composite PK) is recomputed via its registered
+        // CascadeSelect; the target via the single-int-PK `where_sql`.
+        if let Some(c) = self.cascade_selects.get(relation).cloned() {
+            let rows = self
+                .client
+                .query(
+                    &format!(
+                        "SELECT {} FROM {} WHERE {} ORDER BY {}",
+                        c.pk_cols, c.relation, c.where_sql, c.pk_cols
+                    ),
+                    &[],
+                )
+                .map_err(|e| ApplyError::Backend(e.to_string()))?;
+            let mut b = PkSetBuilder::for_relation(relation);
+            for row in &rows {
+                // entries PK = (account_id int, line_no int).
+                let a: i32 = row.get(0);
+                let l: i32 = row.get(1);
+                b.push(PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap())
+                    .map_err(|e| ApplyError::Backend(e.to_string()))?;
+            }
+            return b.finalize().map_err(|e| ApplyError::Backend(e.to_string()));
+        }
+
         let rows = self
             .client
             .query(
@@ -139,11 +231,51 @@ impl ApplyConn for PgApplyConn<'_> {
         &mut self,
         kind: WriteKind,
         relation: &str,
+        cascade_relations: &[String],
     ) -> Result<ForwardResult, ApplyError> {
-        // Capture the full pre-image of the matching rows FOR UPDATE (locks them),
-        // then run the forward op with RETURNING id (the actual written-PK set).
-        // The pre-image SELECT and the forward op are in the same txn, so the
-        // RETURNING set and the pre-image describe the same rows.
+        // Capture the cascade children's pre-image BEFORE the forward op deletes
+        // them (so the typed-inverse can re-insert every cascade-destroyed row).
+        let mut cascade_preimages: BTreeMap<String, Vec<CapturedRow>> = BTreeMap::new();
+        for rel in cascade_relations {
+            if let Some(c) = self.cascade_selects.get(rel).cloned() {
+                let rows = self
+                    .client
+                    .query(
+                        &format!(
+                            "SELECT {} FROM {} WHERE {} ORDER BY {} FOR UPDATE",
+                            c.image_cols, c.relation, c.where_sql, c.pk_cols
+                        ),
+                        &[],
+                    )
+                    .map_err(|e| classify_pg_err(&e, self.statement_timeout_ms))?;
+                let mut captured = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    // entries(account_id, line_no, memo, amount).
+                    let a: i32 = row.get(0);
+                    let l: i32 = row.get(1);
+                    let memo: String = row.get(2);
+                    let amount: i64 = row.get(3);
+                    captured.push(CapturedRow {
+                        pk: PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)])
+                            .unwrap(),
+                        before_image: vec![
+                            ("account_id".into(), PkValue::Int(a as i64)),
+                            ("line_no".into(), PkValue::Int(l as i64)),
+                            ("memo".into(), PkValue::Text(memo)),
+                            ("amount".into(), PkValue::Int(amount)),
+                        ],
+                    });
+                }
+                cascade_preimages.insert(rel.clone(), captured);
+            }
+        }
+
+        // Capture the full pre-image of the matching TARGET rows FOR UPDATE (locks
+        // them), then run the forward op with RETURNING id (the actual written-PK
+        // set). The pre-image SELECT and the forward op are in the same txn, so the
+        // RETURNING set and the pre-image describe the same rows. The pre-image is
+        // the ACTUAL old values (so a BEFORE-trigger value rewrite cannot desync
+        // the inverse — we restore the OLD tuple regardless of the NEW one).
         let preimage_rows = self
             .client
             .query(
@@ -187,7 +319,7 @@ impl ApplyConn for PgApplyConn<'_> {
                 // wrote a row OUTSIDE the FOR UPDATE pre-image snapshot (e.g. a
                 // trigger inserted/touched an out-of-predicate row). We still
                 // surface the PK so the written-set checksum catches the drift;
-                // the pre-image is best-effort (the row will trip step 6 anyway).
+                // the pre-image is best-effort (the row will trip the guards anyway).
                 vec![("id".into(), PkValue::Int(id as i64))]
             });
             written.push(CapturedRow {
@@ -195,7 +327,38 @@ impl ApplyConn for PgApplyConn<'_> {
                 before_image,
             });
         }
-        Ok(ForwardResult { written })
+        Ok(ForwardResult {
+            written,
+            cascade_preimages,
+        })
+    }
+
+    fn xact_tuple_deltas(&mut self) -> Result<Vec<RelationChange>, ApplyError> {
+        // The symmetric FULL-effect measure: per-relation in-txn tuple deltas from
+        // pg_stat_xact_user_tables, as the DELTA against the baseline taken at txn
+        // start. This sees rows a trigger wrote in another statement / table that
+        // RETURNING never reports (the AFTER-trigger DELETE id=7 / mirror wipe), and
+        // cascade drift (more children than predicted) — while cancelling any
+        // prior-session writes (the seed) that also sit in the cumulative counter.
+        let after = self.read_xact_raw()?;
+        let mut out = Vec::new();
+        for (rel, (ins, upd, del)) in &after {
+            let (b_ins, b_upd, b_del) = self.xact_baseline.get(rel).copied().unwrap_or((0, 0, 0));
+            let d_ins = (ins - b_ins).max(0) as u64;
+            let d_upd = (upd - b_upd).max(0) as u64;
+            let d_del = (del - b_del).max(0) as u64;
+            if d_ins + d_upd + d_del == 0 {
+                continue;
+            }
+            out.push(RelationChange {
+                relation: rel.clone(),
+                ins: d_ins,
+                upd: d_upd,
+                del: d_del,
+            });
+        }
+        out.sort_by(|a, b| a.relation.cmp(&b.relation));
+        Ok(out)
     }
 
     fn commit(&mut self) -> Result<(), ApplyError> {
@@ -249,36 +412,97 @@ fn grant_checksum(url: &str, where_sql: &str) -> PkChecksum {
     b.finalize().unwrap()
 }
 
-/// Build a minimal [`BlastRadius`] grant for `public.accounts` over `where_sql`,
-/// with the given predicted `duration_ms`.
+/// Build a [`BlastRadius`] grant for `public.accounts` over `where_sql` for an
+/// UPDATE (target only, no cascade). The full `effect_by_table` footprint is
+/// MEASURED by rehearsing `forward_sql` in a rolled-back txn — the same symmetric
+/// `pg_stat_xact_*` measure the real dry-run records — so the grant is honest
+/// (what the dry-run would actually produce, audit trigger writes included).
 fn grant_for(proposal_id: &str, url: &str, where_sql: &str, duration_ms: u64) -> BlastRadius {
+    let forward = format!("UPDATE public.accounts SET balance = 0 WHERE {where_sql}");
+    grant_for_forward(
+        proposal_id,
+        url,
+        where_sql,
+        &forward,
+        WriteKind::Update,
+        duration_ms,
+    )
+}
+
+/// Build a grant whose full footprint is measured by rehearsing `forward_sql`
+/// (UPDATE or DELETE) in a rolled-back txn. Captures the target PK-set checksum,
+/// every cascade child's PK-set checksum (composite PK), and the full per-relation
+/// `effect_by_table` footprint (target + cascades + trigger-written audit table).
+fn grant_for_forward(
+    proposal_id: &str,
+    url: &str,
+    where_sql: &str,
+    forward_sql: &str,
+    kind: WriteKind,
+    duration_ms: u64,
+) -> BlastRadius {
     use pgb_core::blast_radius::Affected;
     use pgb_core::LockMode;
-    let cs = grant_checksum(url, where_sql);
-    let n = {
-        let mut c = Client::connect(url, NoTls).expect("count connect");
-        let row = c
-            .query_one(
-                &format!("SELECT count(*) FROM public.accounts WHERE {where_sql}"),
-                &[],
-            )
-            .unwrap();
-        let cnt: i64 = row.get(0);
-        cnt as u64
-    };
+
+    let target_cs = grant_checksum(url, where_sql);
+    let mut c = Client::connect(url, NoTls).expect("grant connect");
+    let n: i64 = c
+        .query_one(
+            &format!("SELECT count(*) FROM public.accounts WHERE {where_sql}"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let n = n as u64;
+
     let mut pk_set_checksum = BTreeMap::new();
-    pk_set_checksum.insert("public.accounts".to_string(), cs.as_prefixed());
+    pk_set_checksum.insert("public.accounts".to_string(), target_cs.as_prefixed());
     let mut by_table = BTreeMap::new();
     by_table.insert("public.accounts".to_string(), n);
+    let mut cascade_by_table: BTreeMap<String, u64> = BTreeMap::new();
+
+    // For a DELETE, capture the cascade child (`entries`) PK-set + count (children
+    // whose parent matches the predicate), BEFORE the rolled-back forward op.
+    if kind == WriteKind::Delete {
+        let child_rows = c
+            .query(
+                &format!(
+                    "SELECT account_id, line_no FROM public.entries \
+                     WHERE account_id IN (SELECT id FROM public.accounts WHERE {where_sql}) \
+                     ORDER BY account_id, line_no"
+                ),
+                &[],
+            )
+            .expect("cascade child select");
+        let mut b = PkSetBuilder::for_relation("public.entries");
+        for r in &child_rows {
+            let a: i32 = r.get(0);
+            let l: i32 = r.get(1);
+            b.push(PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap())
+                .unwrap();
+        }
+        let child_cs = b.finalize().unwrap();
+        cascade_by_table.insert("public.entries".to_string(), child_rows.len() as u64);
+        pk_set_checksum.insert("public.entries".to_string(), child_cs.as_prefixed());
+    }
+
+    // MEASURE the full per-relation footprint by rehearsing the forward op in a
+    // rolled-back txn (the symmetric pg_stat_xact_* measure). This records the
+    // audit-table trigger writes too, so the apply does not flag them as drift.
+    let effect_by_table = measure_full_effect(url, forward_sql);
+
+    let total_rows = by_table.values().sum::<u64>() + cascade_by_table.values().sum::<u64>();
+
     BlastRadius {
         proposal_id: proposal_id.to_string(),
         clone_lsn: "0/0".into(),
         staleness_lsn_bytes: 0,
         affected: Affected {
             by_table,
-            cascade_by_table: BTreeMap::new(),
+            cascade_by_table,
             pk_set_checksum,
-            total_rows: n,
+            effect_by_table,
+            total_rows,
         },
         triggers_fired: vec![],
         locks: vec![],
@@ -287,8 +511,54 @@ fn grant_for(proposal_id: &str, url: &str, where_sql: &str, duration_ms: u64) ->
         wal_bytes: 0,
         constraint_violations: vec![],
         reversible: true,
-        inverse_kind: InverseKind::PreimageUpsert,
+        inverse_kind: kind.inverse_kind(),
         predicate_volatile: false,
+    }
+}
+
+/// Rehearse `forward_sql` in a `BEGIN … ROLLBACK` txn and return the full
+/// per-relation change footprint from `pg_stat_xact_user_tables` (SPEC §4). This
+/// is exactly what the dry-run measures; it captures the audit-table trigger
+/// writes that are a deterministic, predicted side-effect (so they are NOT drift).
+fn measure_full_effect(url: &str, forward_sql: &str) -> BTreeMap<String, u64> {
+    let read_raw = |txn: &mut postgres::Transaction| -> BTreeMap<String, i64> {
+        txn.query(
+            "SELECT schemaname || '.' || relname AS rel, \
+                    (n_tup_ins + n_tup_upd + n_tup_del) AS changed \
+             FROM pg_stat_xact_user_tables",
+            &[],
+        )
+        .expect("measure stat")
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+        .collect()
+    };
+    let mut c = Client::connect(url, NoTls).expect("measure connect");
+    let mut txn = c.transaction().expect("measure begin");
+    // Baseline (pg_stat_xact accumulates across the session) → delta = footprint.
+    let baseline = read_raw(&mut txn);
+    txn.batch_execute(forward_sql).expect("measure forward");
+    let after = read_raw(&mut txn);
+    txn.rollback().expect("measure rollback");
+    let mut out = BTreeMap::new();
+    for (rel, changed) in after {
+        let base = baseline.get(&rel).copied().unwrap_or(0);
+        let delta = (changed - base).max(0) as u64;
+        if delta > 0 {
+            out.insert(rel, delta);
+        }
+    }
+    out
+}
+
+/// A cascade-child registration for the seed's `entries → accounts` FK, scoped to
+/// the children whose parent matches `where_sql`.
+fn entries_cascade(where_sql: &str) -> CascadeSelect {
+    CascadeSelect {
+        relation: "public.entries".to_string(),
+        pk_cols: "account_id, line_no".to_string(),
+        image_cols: "account_id, line_no, memo, amount".to_string(),
+        where_sql: format!("account_id IN (SELECT id FROM public.accounts WHERE {where_sql})"),
     }
 }
 
@@ -408,12 +678,13 @@ fn dry_run_validated_delete_commits_and_captures_insert_inverse() {
     let url = url_for(&admin, &dbname);
     let before = read_accounts(&url);
 
-    let grant = grant_for("p-del", &url, EVEN_WHERE, 50);
     let forward = "DELETE FROM public.accounts WHERE id % 2 = 0";
+    let grant = grant_for_forward("p-del", &url, EVEN_WHERE, forward, WriteKind::Delete, 50);
 
     let mut client = Client::connect(&url, NoTls).expect("apply connect");
     let applied = {
-        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Delete);
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Delete)
+            .with_cascade(entries_cascade(EVEN_WHERE));
         guarded_apply(
             "p-del",
             WriteKind::Delete,
@@ -429,15 +700,50 @@ fn dry_run_validated_delete_commits_and_captures_insert_inverse() {
 
     assert_eq!(applied.rows_written, 4);
     assert_eq!(applied.inverse.kind, InverseKind::Insert);
-    assert_eq!(applied.inverse.rows.len(), 4);
+    // The inverse covers the 4 parent rows AND the 8 cascade-destroyed children
+    // (each even account has 2 entries) = 12 pre-images, FK-ordered.
+    assert_eq!(
+        applied.inverse.fk_order,
+        vec!["public.accounts".to_string(), "public.entries".to_string()]
+    );
+    assert_eq!(
+        applied.inverse.rows.len(),
+        12,
+        "full inverse: 4 parents + 8 cascade children captured"
+    );
+    let child_pre = applied
+        .inverse
+        .rows
+        .iter()
+        .filter(|r| {
+            r.before_image
+                .iter()
+                .any(|(c, v)| c == "__relation" && *v == PkValue::Text("public.entries".into()))
+        })
+        .count();
+    assert_eq!(child_pre, 8, "every cascade child pre-image captured");
     // The even accounts are gone; cascade removed their entries too.
     let after = read_accounts(&url);
     assert!(
         [2, 4, 6, 8].iter().all(|id| !after.contains_key(id)),
         "even accounts must be deleted"
     );
-    // Pre-image of each deleted row matches the golden state (so revert can reinsert).
+    let entries_left: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one(
+            "SELECT count(*) FROM public.entries WHERE account_id % 2 = 0",
+            &[],
+        )
+        .unwrap()
+        .get(0)
+    };
+    assert_eq!(entries_left, 0, "cascade removed the children");
+    // Pre-image of each deleted PARENT row matches the golden state (revert reinserts).
     for row in &applied.inverse.rows {
+        // skip cascade-child rows (stamped with __relation)
+        if row.before_image.iter().any(|(c, _)| c == "__relation") {
+            continue;
+        }
         let id = match &row.pk.values()[0] {
             PkValue::Int(i) => *i as i32,
             other => panic!("{other:?}"),
@@ -445,7 +751,7 @@ fn dry_run_validated_delete_commits_and_captures_insert_inverse() {
         assert_eq!(col_text(&row.before_image, "owner"), before[&id].0);
         assert_eq!(col_int(&row.before_image, "balance"), before[&id].1);
     }
-    eprintln!("[delete-commit] PASS: deleted + INSERT inverse pre-image captured");
+    eprintln!("[delete-commit] PASS: deleted + FULL FK-ordered INSERT inverse (parents + cascade children) captured");
 
     drop_db(&admin, &dbname);
 }
@@ -646,32 +952,349 @@ fn t_drift_trigger_amplification_aborts() {
 }
 
 // ===========================================================================
-//  (3) RETURNING written-set check — post-snapshot trigger writes OUTSIDE the
-//      predicate. The pre-op recompute MATCHES, but the forward op writes an
-//      extra row → step 6 ABORTS (the carry-forward a pre-op-only guard misses).
+//  (3) THE DATA-LOSS BLOCKERS — a post-snapshot trigger / cascade that writes
+//      rows the TARGET's RETURNING can NEVER surface. The symmetric
+//      `pg_stat_xact_*` full-effect reconciliation catches them → ABORT, the
+//      out-of-predicate rows / other tables stay intact.
 // ===========================================================================
 
+/// BLOCKER 1 (the reviewer's EXACT repro): an AFTER UPDATE trigger installed
+/// post-snapshot `DELETE FROM accounts WHERE id=7` — id=7 is ODD, OUTSIDE the
+/// predicate `id%2=0`. The target's `RETURNING id` = {2,4,6,8} == grant, so the
+/// pre-op recompute AND the written-set check both PASS. Only the `pg_stat_xact_*`
+/// reconciliation (the target shows 4 upd + 1 del = 5 > predicted 4) catches the
+/// irreversible destruction of id=7 → ABORT, id=7 INTACT.
 #[test]
-fn t_returning_written_set_mismatch_outside_predicate_aborts() {
-    let Some((admin, dbname, _c)) = setup("returning_outside") else {
+fn t_after_trigger_deletes_out_of_predicate_row_aborts_id7_intact() {
+    let Some((admin, dbname, _c)) = setup("trigger_kill7") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+
+    // Install the out-of-predicate killer trigger POST-snapshot (the grant is
+    // measured BEFORE this, so it predicts only the 4 even-row updates + audit).
+    let grant = grant_for("p-kill7", &url, EVEN_WHERE, 50);
+    {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.batch_execute(
+            "CREATE FUNCTION public.kill7() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN DELETE FROM public.accounts WHERE id = 7; RETURN NEW; END; $$; \
+             CREATE TRIGGER accounts_kill7 AFTER UPDATE ON public.accounts \
+               FOR EACH ROW WHEN (pg_trigger_depth() = 0) \
+               EXECUTE FUNCTION public.kill7();",
+        )
+        .expect("install kill7 trigger");
+    }
+    let before = read_accounts(&url);
+    assert!(before.contains_key(&7), "id=7 present before apply");
+
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Update);
+        guarded_apply(
+            "p-kill7",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    // The out-of-predicate DELETE id=7 makes `accounts` change 5 rows (>4) AND the
+    // audit trigger fire 5 times (>4 predicted). Either over-write ABORTS — both
+    // are the same irreversible drift; what matters is id=7 survives.
+    match result {
+        Err(ApplyError::RelationOverWrite {
+            relation,
+            predicted,
+            actual,
+            ..
+        }) => {
+            assert!(
+                relation == "public.accounts" || relation == "public.account_audit",
+                "abort on the over-written relation, got {relation}"
+            );
+            assert!(
+                actual > predicted,
+                "the trigger's out-of-predicate DELETE made a relation change MORE than predicted"
+            );
+            eprintln!(
+                "T-after-trigger-kill7 PASS: out-of-predicate trigger DELETE id=7 caught by \
+                 pg_stat_xact reconciliation on `{relation}` (predicted={predicted} actual={actual}) → ABORTED"
+            );
+        }
+        other => panic!("expected RelationOverWrite (out-of-predicate trigger), got {other:?}"),
+    }
+
+    // id=7 is INTACT and the whole apply rolled back (DB byte-for-byte unchanged).
+    let after = read_accounts(&url);
+    assert!(after.contains_key(&7), "id=7 MUST survive (apply aborted)");
+    assert_eq!(
+        before, after,
+        "the whole apply rolled back — DB byte-for-byte unchanged, id=7 destroyed-and-restored never happened"
+    );
+    drop_db(&admin, &dbname);
+}
+
+/// BLOCKER 1 (other-table repro): an AFTER UPDATE trigger wipes a SEPARATE
+/// `mirror` table — a relation NOT in the blast radius. RETURNING can never see
+/// another table; the `pg_stat_xact_*` delta does → ABORT, `mirror` intact.
+#[test]
+fn t_after_trigger_wipes_separate_table_aborts_mirror_intact() {
+    let Some((admin, dbname, _c)) = setup("trigger_mirror") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE public.mirror(id int PRIMARY KEY, v int NOT NULL); \
+             INSERT INTO public.mirror SELECT g, g FROM generate_series(1, 5) g;",
+        )
+        .unwrap();
+    }
+    // Grant measured BEFORE the mirror-wiping trigger exists.
+    let grant = grant_for("p-mirror", &url, EVEN_WHERE, 50);
+    {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.batch_execute(
+            "CREATE FUNCTION public.wipe_mirror() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN DELETE FROM public.mirror; RETURN NEW; END; $$; \
+             CREATE TRIGGER accounts_wipe_mirror AFTER UPDATE ON public.accounts \
+               FOR EACH STATEMENT EXECUTE FUNCTION public.wipe_mirror();",
+        )
+        .unwrap();
+    }
+    let mirror_before: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one("SELECT count(*) FROM public.mirror", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(mirror_before, 5);
+
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Update);
+        guarded_apply(
+            "p-mirror",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    match result {
+        Err(ApplyError::UnpredictedRelationWrite { relation, del, .. }) => {
+            assert_eq!(relation, "public.mirror");
+            assert_eq!(del, 5, "the trigger wiped all 5 mirror rows");
+            eprintln!(
+                "T-after-trigger-mirror PASS: write to UNPREDICTED relation public.mirror caught → ABORTED"
+            );
+        }
+        other => panic!("expected UnpredictedRelationWrite on public.mirror, got {other:?}"),
+    }
+    // mirror is INTACT (apply aborted).
+    let mirror_after: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one("SELECT count(*) FROM public.mirror", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(mirror_after, 5, "mirror MUST be intact (apply aborted)");
+    drop_db(&admin, &dbname);
+}
+
+/// BLOCKER 2 (the reviewer's EXACT repro): +N child rows added post-snapshot under
+/// an in-predicate parent. The parent PK set is UNCHANGED ({2,4,6,8}), so the
+/// parent RETURNING + pre-op recompute PASS, but the DELETE cascade destroys MORE
+/// children than predicted. The cascade PK-set re-check AND the `pg_stat_xact_*`
+/// reconciliation catch the over-destruction → ABORT, children intact.
+#[test]
+fn t_cascade_drift_more_children_than_predicted_aborts() {
+    let Some((admin, dbname, _c)) = setup("cascade_drift") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+
+    let forward = "DELETE FROM public.accounts WHERE id % 2 = 0";
+    // Grant measured BEFORE the post-snapshot child rows are added.
+    let grant = grant_for_forward("p-cdrift", &url, EVEN_WHERE, forward, WriteKind::Delete, 50);
+    let predicted_children: u64 = grant.affected.cascade_by_table["public.entries"];
+
+    // Drift: add 50 NEW child rows under an in-predicate parent (id=2), AFTER the
+    // grant was measured. The parent set is untouched.
+    {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.batch_execute(
+            "INSERT INTO public.entries(account_id, line_no, memo, amount) \
+             SELECT 2, g, 'drift-' || g, g FROM generate_series(100, 149) g;",
+        )
+        .unwrap();
+    }
+    let children_before: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one("SELECT count(*) FROM public.entries", &[])
+            .unwrap()
+            .get(0)
+    };
+
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Delete)
+            .with_cascade(entries_cascade(EVEN_WHERE));
+        guarded_apply(
+            "p-cdrift",
+            WriteKind::Delete,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    // The cascade child PK-set drifted (new rows under id=2) — caught at the
+    // pre-op cascade re-check (step 5) OR the stat-delta over-write (step 6).
+    match result {
+        Err(ApplyError::PkSetDrift { relation, .. }) => {
+            assert_eq!(relation, "public.entries");
+            eprintln!(
+                "T-cascade-drift PASS: cascade child PK-set drift (predicted {predicted_children} \
+                 children, +50 added post-snapshot) caught at the cascade re-check → ABORTED"
+            );
+        }
+        Err(ApplyError::RelationOverWrite {
+            relation,
+            predicted,
+            actual,
+            ..
+        }) => {
+            assert_eq!(relation, "public.entries");
+            assert!(actual > predicted);
+            eprintln!(
+                "T-cascade-drift PASS: cascade destroyed {actual} children > predicted {predicted} \
+                 (pg_stat_xact reconciliation) → ABORTED"
+            );
+        }
+        other => panic!("expected cascade PkSetDrift / RelationOverWrite, got {other:?}"),
+    }
+    // Children + parents INTACT.
+    let children_after: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one("SELECT count(*) FROM public.entries", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(
+        children_before, children_after,
+        "no child rows destroyed (apply aborted)"
+    );
+    let parents: i64 = {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.query_one("SELECT count(*) FROM public.accounts", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(parents, 8, "no parent rows destroyed (apply aborted)");
+    drop_db(&admin, &dbname);
+}
+
+/// MAJOR (BEFORE-trigger value hijack): a BEFORE UPDATE trigger rewrites
+/// `NEW.balance` to a value different from the rehearsed one. The change stays
+/// reversible because the inverse captures the ACTUAL OLD tuple (the FOR UPDATE
+/// pre-image), so revert restores the true pre-state regardless of the hijack. The
+/// apply commits (same PK set + same footprint) and the inverse pre-image equals
+/// the real OLD values.
+#[test]
+fn t_before_trigger_value_hijack_inverse_captures_actual_old_values() {
+    let Some((admin, dbname, _c)) = setup("before_hijack") else {
         return;
     };
     let url = url_for(&admin, &dbname);
     let before = read_accounts(&url);
 
-    // The carry-forward (gate (a)) the pre-op recompute CANNOT see:
-    //
-    // The engine's apply-time PK-set re-check (step 5) recomputes on the predicate
-    // `id % 2 = 0` → {2,4,6,8}, which MATCHES the grant → step 5 PASSES. But the
-    // forward statement actually written touches a row OUTSIDE that predicate
-    // (id=1) — modelling a post-snapshot trigger/migration that widened what the
-    // op writes. The forward op's `RETURNING id` set is therefore {1,2,4,6,8},
-    // which differs from the predicted {2,4,6,8}. Only the RETURNING written-set
-    // check (step 6) catches this; a pre-op-only guard misses it.
-    let grant = grant_for("p-ret", &url, EVEN_WHERE, 50);
+    let grant = grant_for("p-hijack", &url, EVEN_WHERE, 50);
+    {
+        let mut c = Client::connect(&url, NoTls).unwrap();
+        c.batch_execute(
+            "CREATE FUNCTION public.hijack() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN NEW.balance := 777777; RETURN NEW; END; $$; \
+             CREATE TRIGGER accounts_hijack BEFORE UPDATE ON public.accounts \
+               FOR EACH ROW EXECUTE FUNCTION public.hijack();",
+        )
+        .unwrap();
+    }
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let applied = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Update);
+        guarded_apply(
+            "p-hijack",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+        .expect("hijack apply still commits (same PK set + footprint, reversible)")
+    };
+    // The committed value is the HIJACKED one (777777), not the rehearsed 0 — but
+    // the inverse pre-image is the ACTUAL OLD value, so revert restores truth.
+    let after = read_accounts(&url);
+    assert_eq!(
+        after[&2].1, 777_777,
+        "the BEFORE trigger hijacked the value"
+    );
+    for row in &applied.inverse.rows {
+        let id = match &row.pk.values()[0] {
+            PkValue::Int(i) => *i as i32,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            col_int(&row.before_image, "balance"),
+            before[&id].1,
+            "inverse pre-image MUST be the actual OLD value (so revert undoes even a hijack)"
+        );
+    }
+    eprintln!(
+        "T-before-trigger-hijack PASS: committed hijacked value, but the inverse captured the \
+         ACTUAL OLD values → revert is correct"
+    );
+    drop_db(&admin, &dbname);
+}
 
-    // recompute predicate = EVEN_WHERE (matches grant); forward op writes one more.
-    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0 OR id = 1";
+// ===========================================================================
+//  (3b) RETURNING written-set check — same-relation, same-COUNT identity drift
+//       that the stat-delta count check cannot see. The forward op writes a
+//       DIFFERENT set of the SAME size in the target → step 7 ABORTS.
+// ===========================================================================
+
+#[test]
+fn t_returning_written_set_mismatch_same_count_aborts() {
+    let Some((admin, dbname, _c)) = setup("returning_samecount") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    // The grant is for {2,4,6,8} (the EVEN_WHERE predicate the recompute uses). The
+    // forward op writes a DIFFERENT set of the SAME cardinality 4 — {2,4,6,1}
+    // (id=8 OUT via `id<>8`, id=1 IN). The pre-op recompute on EVEN_WHERE → {2,4,6,8}
+    // == grant (PASS), and the txn changes exactly 4 target rows (stat-delta count
+    // matches), but the RETURNING set {1,2,4,6} differs from the predicted {2,4,6,8}.
+    // Only the written-set checksum (step 7) catches this same-count identity drift.
+    let grant = grant_for("p-ret", &url, EVEN_WHERE, 50);
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE (id % 2 = 0 AND id <> 8) OR id = 1";
 
     let mut apply_client = Client::connect(&url, NoTls).expect("apply connect");
     let result = {
@@ -687,29 +1310,23 @@ fn t_returning_written_set_mismatch_outside_predicate_aborts() {
             &SystemClock::new(),
         )
     };
-
     match result {
         Err(ApplyError::WrittenSetMismatch {
             predicted, written, ..
         }) => {
             assert_ne!(predicted, written);
             eprintln!(
-                "T-returning-written-set PASS: pre-op recompute matched, but the forward op \
-                 wrote OUTSIDE the predicate (predicted={predicted} written={written}) → ABORTED"
+                "T-returning-written-set PASS: same-count identity drift in the target \
+                 (predicted={predicted} written={written}) → ABORTED"
             );
         }
-        other => panic!("expected WrittenSetMismatch (carry-forward), got {other:?}"),
+        other => panic!("expected WrittenSetMismatch, got {other:?}"),
     }
-
-    // No partial commit: even the in-predicate rows were NOT zeroed — the WHOLE
-    // apply rolled back, so the DB is byte-for-byte unchanged.
     let after = read_accounts(&url);
     assert_eq!(
         before, after,
         "the whole apply rolled back — DB byte-for-byte unchanged"
     );
-    eprintln!("T-returning-written-set: DB byte-for-byte unchanged after the abort");
-
     drop_db(&admin, &dbname);
 }
 
