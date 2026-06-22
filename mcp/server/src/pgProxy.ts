@@ -45,6 +45,14 @@ export interface PgProxyConfig {
   password?: string;
   /** Statement timeout (ms) set on the session — defence-in-depth, not THE floor. */
   statementTimeoutMs?: number;
+  /**
+   * The `application_name` stamped on the wire session. In production the proxy
+   * stamps `pgb_proxy` on every backend it brokers so the out-of-band warden can
+   * recognize + terminate an agent-tagged runaway (SPEC §3 layer 2; the
+   * un-strippable anchor is the `pgb_agent` role). Defaults unset (the server's
+   * own default applies). NOT a security control — purely the warden's tag.
+   */
+  applicationName?: string;
 }
 
 /**
@@ -65,6 +73,10 @@ export class PgProxyTransport implements ProxyTransport {
       user: config.user,
       password: config.password,
       statement_timeout: config.statementTimeoutMs ?? 5_000,
+      // The warden tags every brokered backend with this `application_name`
+      // (SPEC §3 layer 2). When set, the live MCP read session is recognizable to
+      // the out-of-band watchdog as an agent-tagged session.
+      application_name: config.applicationName,
     });
     await client.connect();
     return new PgProxyTransport(client);

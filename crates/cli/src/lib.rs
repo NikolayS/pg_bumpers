@@ -33,6 +33,7 @@ pub mod flow;
 pub mod principal;
 pub mod refuse;
 pub mod request;
+pub mod verify;
 pub mod webhook;
 
 pub use flow::{ApprovalFlow, ApprovalOutcome, ApproveError, ElevationError, ElevationOutcome};
@@ -42,6 +43,7 @@ pub use request::{
     ApprovalRequest, ApprovalRequired, ApprovalStore, Proposal, RequestError, RequestId,
     RequestStatus, APPROVAL_REQUIRED_CODE,
 };
+pub use verify::{verify_meta_chain, ChainSummary};
 pub use webhook::{
     HttpWebhookSender, RecordingWebhookSender, WebhookError, WebhookPayload, WebhookSender,
     WEBHOOK_EVENT,

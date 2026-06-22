@@ -20,7 +20,8 @@ use rand_core::OsRng;
 
 use pgb_audit::{AuditBoot, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID};
 use pgb_cli::{
-    ApprovalFlow, InMemoryNonceStore, Principal, Proposal, RecordingWebhookSender, RequestId,
+    verify_meta_chain, ApprovalFlow, InMemoryNonceStore, Principal, Proposal,
+    RecordingWebhookSender, RequestId,
 };
 use pgb_core::{inverse::Operation, Clock, SystemClock};
 
@@ -54,20 +55,110 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Some("verify") => match run_verify() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("pgb-cli verify FAILED (fail-closed): {e}");
+                ExitCode::from(1)
+            }
+        },
         _ => {
             println!(
                 "pgb-cli — pg_bumpers approval CLI (SPEC §14 MVP).\n\
                  usage:\n  \
                  pgb-cli approve <request-id>   sign a proposal-bound grant (human approver)\n  \
-                 pgb-cli demo                   run request -> approve -> verify-at-apply\n\
+                 pgb-cli demo                   run request -> approve -> verify-at-apply\n  \
+                 pgb-cli verify                 load + verify the shared `_meta` chain + anchored head\n\
                  \n\
                  Set PGB_META_DSN (audit-writer DSN) + PGB_AUDIT_SIGNING_KEY to run the demo\n\
                  against the SHARED, persistent, anchored `_meta` chain (the one the proxy\n\
-                 also writes); otherwise the demo runs in-process on an in-memory chain."
+                 also writes); otherwise the demo runs in-process on an in-memory chain.\n\
+                 `verify` needs PGB_META_DSN + PGB_AUDIT_SIGNING_KEY + PGB_ANCHOR_PATH."
             );
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `pgb-cli verify` — load the shared, persistent `_meta` chain and **fail-closed
+/// verify** it, then prove the **anchored-head** guarantee over the unified chain:
+///
+/// 1. load every record the assembled stack wrote (proxy block, refuse, approval,
+///    apply, warden kill) — one chain, written by multiple components;
+/// 2. [`verify_meta_chain`] — the within-chain hash links are intact (one genesis,
+///    contiguous, un-tampered) → this is the cross-component UNITY proof;
+/// 3. `verify_then_anchor` over the caller-supplied `PGB_ANCHOR_PATH` — the same
+///    fail-closed boot sequence #64 ships: verify-within-chain, then pin the
+///    current head to the durable external WORM; we then assert the durable
+///    anchored head EQUALS the chain head (the full-chain-rewrite backstop, proven
+///    exactly as `crates/cli/tests/shared_meta_it.rs` does).
+///
+/// The verify step uses its OWN anchor file (distinct from the running applyd's),
+/// so re-anchoring here pins the FINAL unified head without disturbing the
+/// daemon's anchor. Any break exits non-zero (fail-closed). Prints the head + a
+/// per-reason-code histogram so a reviewer sees every expected decision is present.
+fn run_verify() -> Result<(), String> {
+    let clock = SystemClock::new();
+    let dsn = std::env::var("PGB_META_DSN").map_err(|_| {
+        "PGB_META_DSN is required (the `_meta` audit DSN to verify the shared chain)".to_string()
+    })?;
+    if dsn.is_empty() {
+        return Err("PGB_META_DSN is set but empty; refusing (fail-closed)".to_string());
+    }
+    let key = std::env::var("PGB_AUDIT_SIGNING_KEY").map_err(|_| {
+        "PGB_AUDIT_SIGNING_KEY is required (the anchor signing key) and has no default".to_string()
+    })?;
+    let anchor_path = std::env::var("PGB_ANCHOR_PATH").map_err(|_| {
+        "PGB_ANCHOR_PATH is required (the durable WORM anchor path for the verify step; use a \
+         FRESH path distinct from the running daemon's) and has no default"
+            .to_string()
+    })?;
+    if anchor_path.is_empty() {
+        return Err("PGB_ANCHOR_PATH is set but empty; refusing (fail-closed)".to_string());
+    }
+    let interval_ms: u64 = std::env::var("PGB_ANCHOR_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+
+    let mut store = LocalSecretStore::new();
+    store
+        .put(AUDIT_SIGNING_KEY_ID, key.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut boot = AuditBoot::connect_with_anchor(&dsn, &store, interval_ms, &anchor_path)
+        .map_err(|e| format!("audit `_meta` boot failed (fail-closed): {e}"))?;
+
+    // (1)+(2) Load + within-chain verification, with the head/per-code summary.
+    let records = boot
+        .load_chain()
+        .map_err(|e| format!("load `_meta` chain: {e}"))?;
+    let summary = verify_meta_chain(&records)
+        .map_err(|brk| format!("within-chain verification failed at {brk:?}"))?;
+
+    // (3) Anchor the unified head to the durable WORM (fail-closed boot sequence)
+    //     and assert the durable anchored head equals the chain head.
+    boot.verify_then_anchor(clock.monotonic_millis())
+        .map_err(|e| format!("verify_then_anchor over the unified chain failed: {e}"))?;
+    let anchored = boot
+        .worm()
+        .latest()
+        .ok_or_else(|| "no anchor was published (fail-closed)".to_string())?;
+    if anchored.head_hash != summary.head {
+        return Err(format!(
+            "anchored head {} != chain head {} (full-chain rewrite?)",
+            anchored.head_hash, summary.head
+        ));
+    }
+
+    println!(
+        "pgb-cli verify: the shared `_meta` chain VERIFIES ({} records) and the durable anchored \
+         head MATCHES the chain head.\n  head = {}\n  anchored_seq = {}\n  decisions by reason_code:",
+        summary.len, summary.head, anchored.seq
+    );
+    for (code, n) in &summary.reason_code_counts {
+        println!("    {code:32} x{n}");
+    }
+    Ok(())
 }
 
 /// Run the full §14 flow + print each step. When `PGB_META_DSN` +

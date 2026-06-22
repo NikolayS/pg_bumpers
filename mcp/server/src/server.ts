@@ -237,8 +237,19 @@ export function createServer(config: ServerConfig): McpServer {
     application_name?: string;
   }): Promise<ToolResult<ProposeData>> {
     const intent = intentFor(args.sql, args.application_name);
-    const handle = await core.propose(args.sql, args.expected_rows, intent);
-    return ok<ProposeData>({ proposal_id: handle.proposal_id, ttl_millis: handle.ttl_millis });
+    try {
+      const handle = await core.propose(args.sql, args.expected_rows, intent);
+      return ok<ProposeData>({ proposal_id: handle.proposal_id, ttl_millis: handle.ttl_millis });
+    } catch (err) {
+      // The production Core (ApplydCore) THROWS a recoverable-block-bearing error
+      // when applyd's classify choke REFUSES a structural / non-rehearsable shape
+      // (DROP/TRUNCATE/ALTER — the "delete a DB through the MCP" headline). Convert
+      // it into a structured block so the agent gets a recoverable contract, never
+      // an opaque error (SPEC §4). A non-recoverable-shaped error is re-thrown.
+      const recoverable = asRecoverableBlock(err);
+      if (recoverable) return blockFrom(recoverable);
+      throw err;
+    }
   }
 
   async function dryRun(args: { proposal_id: string }): Promise<ToolResult<DryRunData>> {
@@ -339,6 +350,26 @@ export function createServer(config: ServerConfig): McpServer {
   return {
     listTools: () => TOOL_NAMES.map((name) => ({ name, description: TOOL_DESCRIPTIONS[name] })),
     call: call as McpServer["call"],
+  };
+}
+
+/**
+ * If `err` carries the recoverable-block fields (`code` + `remedy`, like the
+ * production `ApplydError` a refused propose throws), return them as a
+ * [`BlockBody`]; otherwise `undefined` (a genuine, non-recoverable failure the
+ * caller should re-throw). The `reason` is the error's message. This is the seam
+ * that turns a transport-layer refusal into the SPEC §4 recoverable contract
+ * without coupling the server to a concrete transport (`ApplydCore`).
+ */
+function asRecoverableBlock(err: unknown): import("./blockContract.js").BlockBody | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const e = err as { code?: unknown; remedy?: unknown; retryable?: unknown; message?: unknown };
+  if (typeof e.code !== "string" || typeof e.remedy !== "string") return undefined;
+  return {
+    code: e.code,
+    reason: typeof e.message === "string" ? e.message : e.code,
+    remedy: e.remedy,
+    retryable: typeof e.retryable === "boolean" ? e.retryable : false,
   };
 }
 

@@ -168,6 +168,26 @@ describe("propose_write → dry_run → apply_write (the write path)", () => {
     expect(core.hasProposal(res.data.proposal_id)).toBe(true);
   });
 
+  it("a structural/non-rehearsable propose REFUSAL becomes a recoverable block, never an opaque error", async () => {
+    // The production ApplydCore.propose THROWS an ApplydError when applyd's
+    // classify choke refuses a DROP/TRUNCATE/ALTER. The server MUST convert that
+    // into a structured block contract (SPEC §4: every denial is a recoverable
+    // block, never an unhandled throw). This is the marquee's "delete a DB through
+    // the MCP is neutralized by refusal" behavior at the propose layer.
+    const { server, core } = newServer();
+    core.refuseOnPropose("NOT_REHEARSABLE", "DROP DATABASE is not a certified rehearsable write");
+    const res = await server.call("propose_write", {
+      sql: "DROP DATABASE app",
+      expected_rows: 0,
+    });
+    expect(isBlock(res)).toBe(true);
+    if (!isBlock(res)) return;
+    expect(res.code).toBe("NOT_REHEARSABLE");
+    expect(res.reason).toContain("DROP DATABASE");
+    expect(res.retryable).toBe(false);
+    // No proposal was minted (the refusal is terminal).
+  });
+
   it("dry_run returns the blast radius incl. the affected PK-set checksum", async () => {
     const { server } = newServer();
     const proposed = await server.call("propose_write", {
