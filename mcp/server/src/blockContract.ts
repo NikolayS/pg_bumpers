@@ -37,3 +37,42 @@ export function block(
 ): BlockContract {
   return { status: "blocked", code, reason, remedy, retryable };
 }
+
+/** The non-block fields of a block, as the proxy/core hand them up the stack. */
+export type BlockBody = Omit<BlockContract, "status">;
+
+/** Re-wrap a raw block body (e.g. from the proxy boundary) as a full contract. */
+export function blockFrom(body: BlockBody): BlockContract {
+  return {
+    status: "blocked",
+    code: body.code,
+    reason: body.reason,
+    remedy: body.remedy,
+    retryable: body.retryable ?? false,
+  };
+}
+
+/**
+ * Success envelope returned by an MCP tool. The payload is parameterized so each
+ * tool declares its own typed `data`. Result data lives ONLY under `data` and is
+ * never hoisted into the envelope — that separation is the structural half of the
+ * prompt-injection-via-data defense (SPEC §4): a row can never masquerade as a
+ * control field of the response.
+ */
+export interface Ok<T> {
+  readonly status: "ok";
+  readonly data: T;
+}
+
+/** Build a success envelope around an opaque, untrusted-data payload. */
+export function ok<T>(data: T): Ok<T> {
+  return { status: "ok", data };
+}
+
+/** Every MCP tool returns either a success envelope or a structured block. */
+export type ToolResult<T> = Ok<T> | BlockContract;
+
+/** Narrowing guard: is this tool result a structured block (a denial)? */
+export function isBlock<T>(r: ToolResult<T>): r is BlockContract {
+  return r.status === "blocked";
+}
