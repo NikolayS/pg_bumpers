@@ -16,6 +16,12 @@
 //!   provisions a clone and is then **SIGKILLed mid-rehearsal** (its teardown
 //!   never runs); the reaper, driven from the shared ledger, destroys the
 //!   orphan — **no clone cluster / process / dir survives**.
+//! - **BLOCKER fix — SIGKILL *during* `pg_basebackup` (§10.7):** an orchestrator
+//!   is killed while the (throttled) base backup is still streaming; the
+//!   ledger-FIRST breadcrumb means the reaper still finds and destroys the
+//!   half-written prod-PII datadir — no dir/process survives.
+//! - **Ledger-independent sweep (§10.7):** a prod-PII datadir on disk with **no**
+//!   ledger entry (lost ledger) is reaped by the filesystem sweep alone.
 //! - **RLS/column-grant parity (§4):** capture `pg_policies` + column grants from
 //!   prod and from the clone and assert full parity (the clone enforces the same
 //!   RLS + column grants as prod).
@@ -32,8 +38,9 @@ use common::cluster::{pg_bin, scratch_root, Primary, GOV_SEED_SQL};
 use common::PgRehearsal;
 use pgb_clone_orchestrator::provider::local::{LocalCloneConfig, LocalCloneProvider, PrimaryRef};
 use pgb_clone_orchestrator::{
-    check_parity, dry_run, propose, reap_orphans, with_clone, CloneError, CloneLedger, ColumnGrant,
-    ProviderKind, RlsPolicy,
+    check_parity, dry_run, propose, reap_orphans, reap_orphans_with_sweep, with_clone,
+    write_owner_marker, CloneError, CloneLedger, ColumnGrant, OwnerIdentity, ProviderKind,
+    RlsPolicy,
 };
 use pgb_core::SystemClock;
 use postgres::{Client, NoTls};
@@ -274,6 +281,201 @@ fn killed_orchestrator_leaves_no_surviving_clone() {
     assert!(
         ledger.entries().unwrap().is_empty(),
         "the reaped clone must be removed from the ledger"
+    );
+
+    drop(primary);
+    cleanup(&root);
+}
+
+// ===========================================================================
+//  BLOCKER FIX — SIGKILL *DURING* pg_basebackup leaves NO surviving clone (§10.7)
+// ===========================================================================
+//
+//  The headline regression for the #33 review: the prod-PII datadir is written by
+//  pg_basebackup BEFORE the ledger breadcrumb under the old ordering, so a crash
+//  mid-backup left a PII datadir the ledger-only reaper could not see. With the
+//  ledger-FIRST ordering the breadcrumb always precedes the PII, so killing the
+//  orchestrator while basebackup is still streaming still leaves a reapable
+//  orphan. We throttle basebackup so the kill reliably lands mid-stream.
+
+#[test]
+fn sigkill_during_basebackup_leaves_no_surviving_clone() {
+    if skip("sigkill_during_basebackup") {
+        return;
+    }
+    let root = scratch_root("crash-bb");
+    let primary = Primary::start(&root, 54363, "prod", GOV_SEED_SQL);
+
+    let ledger_dir = root.join("ledger");
+    let clone_root = root.join("clones");
+    let clone_port = 54373u16;
+
+    // Spawn an orchestrator that records the ledger entry (ledger-FIRST), starts a
+    // THROTTLED pg_basebackup, and blocks while it streams.
+    let exe = build_example("crash_during_basebackup");
+    let mut child = Command::new(&exe)
+        .arg(pg_bin())
+        .arg(&clone_root)
+        .arg(&ledger_dir)
+        .arg("127.0.0.1")
+        .arg(primary.port.to_string())
+        .arg(&primary.repl_user)
+        .arg(&primary.dbname)
+        .arg(clone_port.to_string())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn crash_during_basebackup");
+
+    let ready = read_ready_line(&mut child);
+    eprintln!("[sigkill-bb] child reported: {ready}");
+    let clone_id = ready
+        .split_whitespace()
+        .nth(1)
+        .expect("clone_id")
+        .to_string();
+    let datadir = clone_root.join(&clone_id);
+
+    // The ledger breadcrumb exists BEFORE the basebackup finished (the fix). The
+    // datadir is a PARTIAL prod-PII copy still being written.
+    let ledger = CloneLedger::open(&ledger_dir).unwrap();
+    assert_eq!(
+        ledger.entries().unwrap().len(),
+        1,
+        "ledger-first: the breadcrumb must exist before/while basebackup runs"
+    );
+    assert!(
+        datadir.exists(),
+        "a (partial) prod-PII datadir is on disk while basebackup streams"
+    );
+
+    // === SIGKILL the orchestrator WHILE basebackup is still streaming. ===
+    let child_pid = child.id();
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(child_pid.to_string())
+        .output();
+    let _ = child.wait();
+    eprintln!("[sigkill-bb] orchestrator pid {child_pid} SIGKILLed mid-basebackup (no teardown)");
+    assert!(
+        datadir.exists(),
+        "the half-written prod-PII datadir survives the killed orchestrator (pre-reap)"
+    );
+
+    // === REAP — ledger-first breadcrumb means the reaper finds it; the sweep is
+    //     the belt-and-suspenders backstop. ===
+    let outcome = reap_orphans_with_sweep(&ledger, &clone_root).expect("reaper pass");
+    eprintln!("[sigkill-bb] reaper outcome: {outcome:?}");
+    assert!(
+        outcome
+            .alarms
+            .iter()
+            .any(|a| a.clone_id == clone_id && a.reaped),
+        "the mid-basebackup orphan must be reaped: {outcome:?}"
+    );
+
+    // === THE ASSERTION: no clone dir / process survives the killed orchestrator. ===
+    assert!(
+        !datadir.exists(),
+        "BLOCKER FIX: the mid-basebackup prod-PII datadir must be GONE after the reaper"
+    );
+    assert!(
+        !cluster_alive_on_port(clone_port),
+        "no clone process/cluster may survive on port {clone_port}"
+    );
+    assert!(
+        ledger.entries().unwrap().is_empty(),
+        "the reaped clone must be removed from the ledger"
+    );
+
+    drop(primary);
+    cleanup(&root);
+}
+
+// ===========================================================================
+//  LEDGER-INDEPENDENT SWEEP — an UNRECORDED prod-PII datadir is reaped (§10.7)
+// ===========================================================================
+//
+//  Defence-in-depth: even with NO ledger entry at all (the ledger write failed or
+//  was lost), a clone datadir under clone_root whose owner is not live is found by
+//  the filesystem sweep and destroyed. We materialise a real prod-PII clone via
+//  pg_basebackup, then DELETE its ledger entry to model a lost ledger, then prove
+//  the sweep alone reaps it.
+
+#[test]
+fn ledger_independent_sweep_reaps_unrecorded_datadir() {
+    if skip("ledger_independent_sweep") {
+        return;
+    }
+    let root = scratch_root("sweep");
+    let primary = Primary::start(&root, 54364, "prod", GOV_SEED_SQL);
+
+    let clone_root = root.join("clones");
+    let ledger_dir = root.join("ledger");
+    let ledger = CloneLedger::open(&ledger_dir).unwrap();
+
+    // Make a real prod-PII clone datadir on disk via pg_basebackup (the same op
+    // provision uses), then stamp a DEAD owner marker and ensure there is NO
+    // ledger entry — the exact "datadir exists, ledger can't see it" condition.
+    let clone_id = "local-clone-UNRECORDED-1";
+    let datadir = clone_root.join(clone_id);
+    std::fs::create_dir_all(&clone_root).unwrap();
+    let status = Command::new(pg_bin().join("pg_basebackup"))
+        .arg("--pgdata")
+        .arg(&datadir)
+        .arg("--wal-method=stream")
+        .arg("--checkpoint=fast")
+        .arg("--no-sync")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(primary.port.to_string())
+        .arg("--username")
+        .arg(&primary.repl_user)
+        .arg("--no-password")
+        .status()
+        .expect("spawn pg_basebackup");
+    assert!(status.success(), "pg_basebackup for the unrecorded clone");
+    assert!(
+        datadir.join("PG_VERSION").exists(),
+        "real PG datadir on disk"
+    );
+
+    // Stamp a DEAD owner-identity marker (pid that cannot be alive). NO ledger
+    // entry is written — the reaper is blind to it via the ledger.
+    write_owner_marker(
+        &datadir,
+        &OwnerIdentity {
+            pid: 2_147_483_647, // effectively never a live pid
+            start: String::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        ledger.entries().unwrap().is_empty(),
+        "premise: there is NO ledger entry for this datadir"
+    );
+
+    // The ledger-only pass sees nothing (proves the original BLOCKER).
+    let ledger_only = reap_orphans(&ledger).expect("ledger-only pass");
+    assert!(
+        ledger_only.alarms.is_empty(),
+        "the ledger-only reaper cannot see an unrecorded datadir (the BLOCKER)"
+    );
+    assert!(datadir.exists(), "still on disk after the ledger-only pass");
+
+    // The full pass (ledger + filesystem sweep) reaps it.
+    let outcome = reap_orphans_with_sweep(&ledger, &clone_root).expect("full reaper pass");
+    eprintln!("[sweep] reaper outcome: {outcome:?}");
+    assert!(
+        outcome
+            .alarms
+            .iter()
+            .any(|a| a.clone_id == clone_id && a.reaped),
+        "the sweep must reap the unrecorded prod-PII datadir: {outcome:?}"
+    );
+    assert!(
+        !datadir.exists(),
+        "the unrecorded prod-PII datadir must be GONE after the sweep"
     );
 
     drop(primary);

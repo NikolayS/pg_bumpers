@@ -48,7 +48,10 @@ pub mod ledger;
 pub mod local;
 pub mod parity;
 
-pub use ledger::{reap_orphans, CloneLedger, LedgerEntry, OrphanAlarm, ReapOutcome};
+pub use ledger::{
+    reap_orphans, reap_orphans_with_sweep, write_owner_marker, CloneLedger, LedgerEntry,
+    OrphanAlarm, OwnerIdentity, ReapOutcome, OWNER_MARKER,
+};
 pub use local::{LocalCloneConfig, LocalCloneProvider, PrimaryRef};
 pub use parity::{check_parity, ColumnGrant, ParityReport, RlsPolicy};
 
@@ -111,6 +114,14 @@ pub struct CloneGovernance {
     /// Whether the clone's storage is encrypted at rest (SPEC §4). For the local
     /// `pg_basebackup` provider this reflects the documented on-disk posture of
     /// the git-ignored clone dir (see [`local::LocalCloneProvider`] docs).
+    ///
+    /// **MVP scope (documentary flag):** for the local pivot this is `chmod 0700`
+    /// on the clone dir **plus** the documented deployment posture (production
+    /// mounts the clone root on an encrypted volume); it is **not** full-disk
+    /// encryption enforced in-process, so `assert_compliant` cannot itself detect
+    /// an unencrypted volume. This is intentional and disclosed; real FDE is a
+    /// deploy-time control. The honest leaked-PII control here is the
+    /// reaper/sweep (SPEC §10.7), not this flag.
     pub encryption_at_rest: bool,
     /// Where the clone's access is logged (a path / sink id). Empty ⇒ not
     /// access-logged ⇒ non-compliant.

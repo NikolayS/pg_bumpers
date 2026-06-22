@@ -11,19 +11,26 @@
 //!
 //! # Lifecycle
 //!
-//! - [`LocalCloneProvider::provision`]:
-//!   1. allocate a clone datadir under the git-ignored clone root + a dedicated
-//!      port;
-//!   2. `pg_basebackup -D <datadir> -X stream` from the primary (a consistent
+//! - [`LocalCloneProvider::provision`] (**ledger-first, fail-closed ordering**):
+//!   1. allocate a clone id + datadir path under the git-ignored clone root + a
+//!      dedicated port;
+//!   2. **record the clone in the [`CloneLedger`] BEFORE any prod PII exists on
+//!      disk** — the breadcrumb (clone id, owner identity, datadir, port) precedes
+//!      `pg_basebackup`, so a SIGKILL anywhere from here on (including during the
+//!      whole, minutes-long base backup) leaves a *reapable* orphan record (SPEC
+//!      §10.7). This is the BLOCKER fix: the old ordering wrote the datadir first
+//!      and the ledger entry only afterward, leaving a window where a prod-PII
+//!      datadir existed with no ledger entry the reaper could see;
+//!   3. `pg_basebackup -D <datadir> -X stream` from the primary (a consistent
 //!      physical copy — it inherits prod's catalog, RLS policies, and column
 //!      grants **byte-for-byte**, which is what makes RLS/column-grant parity
 //!      *inherent*, SPEC §4);
-//!   3. pin the clone to its dedicated port + loopback-only + a private socket
+//!   4. stamp the owner-identity marker inside the datadir (for the
+//!      ledger-independent filesystem sweep) and `chmod 0700`;
+//!   5. pin the clone to its dedicated port + loopback-only + a private socket
 //!      dir (so it can never collide with the primary or 5432);
-//!   4. **record the clone in the [`CloneLedger`]** (so a crash leaves a reapable
-//!      orphan, SPEC §10.7);
-//!   5. `pg_ctl start` the clone and wait until it accepts connections;
-//!   6. return a governance-compliant [`CloneHandle`] pointing at the clone DSN.
+//!   6. `pg_ctl start` the clone and wait until it accepts connections;
+//!   7. return a governance-compliant [`CloneHandle`] pointing at the clone DSN.
 //! - [`LocalCloneProvider::destroy`]: `pg_ctl stop -m immediate`, delete the
 //!   datadir, and forget the ledger entry — idempotent (mandatory teardown,
 //!   SPEC §4).
@@ -47,7 +54,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::ledger::{CloneLedger, LedgerEntry};
+use super::ledger::{write_owner_marker, CloneLedger, LedgerEntry, OwnerIdentity};
 use super::{
     CloneError, CloneGovernance, CloneHandle, CloneProvider, DataClassification, ProviderKind,
 };
@@ -164,7 +171,25 @@ impl CloneProvider for LocalCloneProvider {
         }
         fs::create_dir_all(&sockdir).map_err(|e| CloneError::Tooling(format!("sock dir: {e}")))?;
 
-        // (1) pg_basebackup — a consistent physical copy of the primary. -X
+        // (1) RECORD IN THE LEDGER **before any prod PII exists on disk** — the
+        //     fail-closed ordering (SPEC §10.7, the BLOCKER fix). The breadcrumb
+        //     (clone id, owner identity, datadir, port) is written BEFORE
+        //     pg_basebackup runs, so a SIGKILL anywhere in the (minutes-long) base
+        //     backup leaves a reapable orphan record. `destroy_orphan` tolerates a
+        //     missing/partial datadir and absent postmaster.pid, so an early entry
+        //     reaps cleanly whether the crash hits during basebackup, conf, or
+        //     start. The owner identity (pid + start-time) defeats pid reuse.
+        let owner = OwnerIdentity::current();
+        let entry = LedgerEntry {
+            clone_id: clone_id.clone(),
+            datadir: datadir.clone(),
+            port: self.cfg.clone_port,
+            owner_pid: owner.pid,
+            owner_start: owner.start.clone(),
+        };
+        self.ledger.record(&entry)?;
+
+        // (2) pg_basebackup — a consistent physical copy of the primary. -X
         //     stream pulls the needed WAL so the clone is self-consistent; -R is
         //     omitted so the clone comes up as a normal (non-standby) cluster we
         //     can write a rolled-back rehearsal txn against.
@@ -187,7 +212,16 @@ impl CloneProvider for LocalCloneProvider {
         )?;
         set_mode_0700(&datadir)?;
 
-        // (2) Pin the clone to its dedicated port + loopback + private socket +
+        // (2b) Stamp the owner-identity marker INSIDE the datadir, now that it
+        //      exists (pg_basebackup requires an empty/absent target, so this must
+        //      follow it). This lets the ledger-independent filesystem sweep
+        //      attribute the datadir to its owner even if the ledger entry is ever
+        //      lost — a clone whose marker names a dead/recycled owner (or whose
+        //      marker is missing, e.g. a crash mid-basebackup) is reaped
+        //      fail-closed.
+        write_owner_marker(&datadir, &owner)?;
+
+        // (4) Pin the clone to its dedicated port + loopback + private socket +
         //     access logging (every read of the prod-PII copy is logged, §4).
         //     Written to postgresql.auto.conf so it overrides the inherited conf.
         let auto_conf = datadir.join("postgresql.auto.conf");
@@ -211,19 +245,7 @@ impl CloneProvider for LocalCloneProvider {
         let _ = fs::remove_file(datadir.join("standby.signal"));
         let _ = fs::remove_file(datadir.join("recovery.signal"));
 
-        // (3) RECORD IN THE LEDGER **before** starting — so a crash between here
-        //     and teardown leaves a reapable orphan (SPEC §10.7). owner_pid =
-        //     this orchestrator process; the reaper destroys the clone once this
-        //     pid is gone.
-        let entry = LedgerEntry {
-            clone_id: clone_id.clone(),
-            datadir: datadir.clone(),
-            port: self.cfg.clone_port,
-            owner_pid: std::process::id(),
-        };
-        self.ledger.record(&entry)?;
-
-        // (4) Start the clone postmaster and wait for it to accept connections.
+        // (5) Start the clone postmaster and wait for it to accept connections.
         self.run(
             Command::new(self.tool("pg_ctl"))
                 .arg("-D")
@@ -237,7 +259,7 @@ impl CloneProvider for LocalCloneProvider {
             "pg_ctl start",
         )?;
 
-        // (5) The clone DSN (over TCP on the dedicated port; loopback only).
+        // (6) The clone DSN (over TCP on the dedicated port; loopback only).
         let conn = format!(
             "host=127.0.0.1 port={} user={} dbname={}",
             self.cfg.clone_port, self.cfg.primary.repl_user, self.cfg.primary.dbname

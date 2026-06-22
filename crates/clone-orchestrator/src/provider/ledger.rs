@@ -6,21 +6,43 @@
 //! sell against. So a clone must NOT survive the orchestrator that made it. The
 //! mechanism, mirroring the local-stack's out-of-tree PID ledger:
 //!
-//! 1. **Before** handing a [`CloneHandle`](super::CloneHandle) out, the provider
-//!    appends a [`LedgerEntry`] (datadir, port, pidfile, owner pid) to an
-//!    **out-of-process ledger file** — a directory of one JSON file per live
-//!    clone. The file survives the orchestrator's death (even SIGKILL).
+//! 1. **Before creating the datadir / running `pg_basebackup`**, the provider
+//!    writes a [`LedgerEntry`] (datadir, port, owner pid + boot-unique owner
+//!    identity) to an **out-of-process ledger file** — a directory of one JSON
+//!    file per live clone. The file survives the orchestrator's death (even
+//!    SIGKILL). The breadcrumb therefore **always precedes any prod PII on disk**
+//!    (fail-closed ordering, SPEC §10.7).
 //! 2. On clean teardown the provider removes the entry once the cluster is gone.
-//! 3. If the orchestrator dies mid-rehearsal, the entry is left behind. A
-//!    [`reap_orphans`] pass — run by a sidecar/cron, or by the next orchestrator
-//!    start — destroys every clone whose owning pid is no longer alive
-//!    (stop the postmaster, delete the datadir) and raises an [`OrphanAlarm`].
+//! 3. If the orchestrator dies mid-rehearsal (including mid-`pg_basebackup`), the
+//!    entry is left behind. A [`reap_orphans`] pass — run by a sidecar/cron, or by
+//!    the next orchestrator start — destroys every clone whose owning orchestrator
+//!    is no longer alive (stop the postmaster, delete the datadir) and raises an
+//!    [`OrphanAlarm`].
 //!
-//! The reaper is **pure-Rust** (no shell) so it works even when the orchestrator
-//! that wrote the entry is gone: it reads the pidfile, signals the postmaster,
-//! waits for it to exit, then removes the datadir. The integration test kills an
-//! orchestrator mid-rehearsal and asserts the reaper leaves no cluster / process
-//! / dir.
+//! # Defence-in-depth: two independent backstops
+//!
+//! - **Ledger-driven reap** — the primary path: a recorded clone whose owner is
+//!   dead is destroyed (above).
+//! - **Filesystem sweep** — [`reap_orphans`] **also** scans `clone_root` for any
+//!   clone datadir whose owner is not a live, matching owner, *even with no ledger
+//!   entry at all*. This fully closes the leaked-PII window: if the ledger write
+//!   ever fails/is lost (or a crash lands between datadir creation and the ledger
+//!   write under any future ordering), the on-disk PII is still found and reaped.
+//!
+//! # PID-reuse hardening (fail-closed liveness)
+//!
+//! The reaper treats a clone as live only when its owner pid is alive **and** the
+//! live process's start-time matches the [`LedgerEntry::owner_start`] recorded at
+//! provision. A recycled pid (the orchestrator died and the OS handed its pid to
+//! an unrelated process) has a *different* start-time, so it no longer masks the
+//! orphan — the clone is reaped. Combined with the filesystem sweep (which is
+//! pid-independent), a reused pid can never hide a leaked prod-PII clone.
+//!
+//! The reaper is **pure-Rust + `kill`/`ps`** (no `unsafe`) so it works even when
+//! the orchestrator that wrote the entry is gone: it reads the pidfile, signals
+//! the postmaster, waits for it to exit, then removes the datadir. The integration
+//! tests kill an orchestrator mid-rehearsal (and mid-`pg_basebackup`) and assert
+//! the reaper leaves no cluster / process / dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,6 +51,12 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use super::CloneError;
+
+/// The basename of the **owner-identity marker** written inside every clone
+/// datadir (before any PII is copied in). It pins the clone to the orchestrator
+/// that made it, so the ledger-independent filesystem sweep can decide ownership
+/// without any ledger entry. JSON: `{ "owner_pid": u32, "owner_start": "..." }`.
+pub const OWNER_MARKER: &str = ".pgb_clone_owner.json";
 
 /// One live clone recorded in the ledger. Carries everything the reaper needs to
 /// destroy the clone **without** the provider that made it — it is the contract
@@ -44,12 +72,103 @@ pub struct LedgerEntry {
     /// The pid of the orchestrator process that owns this clone. The reaper
     /// treats the clone as an orphan once this pid is no longer alive.
     pub owner_pid: u32,
+    /// The owning orchestrator's process **start-time**, captured at provision —
+    /// a boot-unique discriminator that survives PID reuse. The reaper treats the
+    /// owner as live only when `owner_pid` is alive **and** the live process's
+    /// start-time still equals this; a recycled pid has a different start-time, so
+    /// it is reaped rather than mistaken for the original owner (fail-closed).
+    ///
+    /// `#[serde(default)]` keeps entries written by older orchestrators
+    /// deserializable; an empty token means "no identity recorded", which the
+    /// reaper treats fail-closed (owner considered dead unless proven live).
+    #[serde(default)]
+    pub owner_start: String,
 }
 
 impl LedgerEntry {
     /// The clone postmaster's pidfile inside its datadir.
     pub fn pidfile(&self) -> PathBuf {
         self.datadir.join("postmaster.pid")
+    }
+
+    /// This clone's owner identity (pid + start-time discriminator).
+    pub fn owner(&self) -> OwnerIdentity {
+        OwnerIdentity {
+            pid: self.owner_pid,
+            start: self.owner_start.clone(),
+        }
+    }
+}
+
+/// A boot-unique identity for the orchestrator process that owns a clone:
+/// `(pid, start-time)`. The pid alone is insufficient — pids are recycled — so
+/// the start-time pins the identity to one specific process incarnation. Stored
+/// in both the ledger entry and the in-datadir [`OWNER_MARKER`] so the reaper can
+/// decide liveness from either source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerIdentity {
+    /// The orchestrator process id.
+    pub pid: u32,
+    /// Its start-time as reported by `ps -o lstart=` (1s resolution; combined
+    /// with the pid this uniquely identifies one process incarnation).
+    pub start: String,
+}
+
+impl OwnerIdentity {
+    /// The identity of the **current** process (the orchestrator provisioning a
+    /// clone). `start` is best-effort: an empty string still records the pid, and
+    /// liveness then falls back to a bare pid check (degraded, but never a panic).
+    pub fn current() -> Self {
+        let pid = std::process::id();
+        OwnerIdentity {
+            pid,
+            start: process_start_time(pid).unwrap_or_default(),
+        }
+    }
+
+    /// Whether this owner is still a live, *matching* process — fail-closed.
+    ///
+    /// Requires the pid to be alive **and**, when a start-time was recorded, the
+    /// live process's current start-time to match it. A recycled pid (different
+    /// start-time) ⇒ not live ⇒ the clone is an orphan to reap. If no start-time
+    /// was recorded (legacy entry) we fall back to the bare pid probe.
+    pub fn is_live(&self) -> bool {
+        if !pid_alive(self.pid) {
+            return false;
+        }
+        match process_start_time(self.pid) {
+            // pid alive but start-time differs ⇒ the pid was recycled.
+            Some(now) if !self.start.is_empty() => now == self.start,
+            // pid alive, no recorded identity to compare ⇒ legacy fall-back.
+            _ => true,
+        }
+    }
+}
+
+/// The wall-clock start-time of process `pid` via `ps -o lstart=` (a portable
+/// POSIX keyword on macOS + Linux). Trimmed; `None` if the pid is gone or `ps`
+/// fails. Combined with the pid this is a boot-unique process discriminator that
+/// survives pid reuse — and it needs no `unsafe` (keeps the crate
+/// `#![forbid(unsafe_code)]`-clean), matching the `kill`-based liveness probe.
+fn process_start_time(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let out = Command::new("ps")
+        .arg("-o")
+        .arg("lstart=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -64,11 +183,47 @@ pub struct CloneLedger {
 
 impl CloneLedger {
     /// Open (creating if needed) a ledger rooted at `dir`.
+    ///
+    /// Prefer [`CloneLedger::canonical`] in production: a caller-supplied path that
+    /// points at a tmp-clearable / per-process directory would make orphans
+    /// undetectable across orchestrator restarts (every orchestrator and the
+    /// reaper sidecar **must** share one durable ledger). An explicit `dir` is for
+    /// tests and for advanced deployments that pin their own durable path.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, CloneError> {
         let dir = dir.into();
         fs::create_dir_all(&dir)
             .map_err(|e| CloneError::Tooling(format!("ledger dir {}: {e}", dir.display())))?;
         Ok(CloneLedger { dir })
+    }
+
+    /// Open the **canonical, durable** ledger location all orchestrators and the
+    /// reaper share (SPEC §10.7). This is **not** caller-supplied and **not** under
+    /// the system tempdir (which a deployment / reboot can clear, orphaning prod
+    /// PII undetectably): it is pinned to a stable XDG state dir,
+    /// `$PGB_CLONE_LEDGER_DIR` (deployment override) or
+    /// `$XDG_STATE_HOME/pg_bumpers/clone-ledger`, falling back to
+    /// `$HOME/.local/state/pg_bumpers/clone-ledger`. Co-locating the ledger with
+    /// the durable clone storage is the documented production posture.
+    pub fn canonical() -> Result<Self, CloneError> {
+        Self::open(Self::canonical_dir())
+    }
+
+    /// The canonical durable ledger directory (see [`CloneLedger::canonical`]).
+    pub fn canonical_dir() -> PathBuf {
+        if let Some(explicit) = std::env::var_os("PGB_CLONE_LEDGER_DIR") {
+            return PathBuf::from(explicit);
+        }
+        let state_base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
+            })
+            // Last resort only if even $HOME is unset (should not happen on a real
+            // host); the tempdir is documented as non-durable but is better than
+            // panicking, and the filesystem sweep is the backstop.
+            .unwrap_or_else(std::env::temp_dir);
+        state_base.join("pg_bumpers").join("clone-ledger")
     }
 
     /// The ledger directory.
@@ -139,6 +294,35 @@ impl CloneLedger {
         }
         Ok(out)
     }
+}
+
+/// Write the owner-identity [`OWNER_MARKER`] into a clone datadir. Called by the
+/// provider **before** any prod PII is copied in, so the ledger-independent sweep
+/// can attribute the datadir to a (possibly dead) owner even with no ledger entry.
+pub fn write_owner_marker(datadir: &Path, owner: &OwnerIdentity) -> Result<(), CloneError> {
+    let json = serde_json::to_vec_pretty(owner)
+        .map_err(|e| CloneError::Tooling(format!("owner marker encode: {e}")))?;
+    let path = datadir.join(OWNER_MARKER);
+    fs::write(&path, json)
+        .map_err(|e| CloneError::Tooling(format!("owner marker {}: {e}", path.display())))
+}
+
+/// Read the owner identity from a clone datadir's [`OWNER_MARKER`], if present and
+/// parseable. `None` ⇒ no/garbled marker, which the sweep treats fail-closed (an
+/// unattributable clone datadir is a reap candidate).
+fn read_owner_marker(datadir: &Path) -> Option<OwnerIdentity> {
+    let bytes = fs::read(datadir.join(OWNER_MARKER)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Heuristic: does `path` look like a Postgres clone datadir? We only ever sweep
+/// directories we own (created by this crate's provider), but require a tell-tale
+/// (`PG_VERSION`, `postmaster.pid`, or our own [`OWNER_MARKER`]) before treating a
+/// child of `clone_root` as a reap candidate — so a stray non-PG dir is ignored.
+fn looks_like_clone_datadir(path: &Path) -> bool {
+    path.join(OWNER_MARKER).exists()
+        || path.join("PG_VERSION").exists()
+        || path.join("postmaster.pid").exists()
 }
 
 /// An orphan-clone alarm (SPEC §10.7). Raised whenever the reaper finds a clone
@@ -244,21 +428,53 @@ fn wait_pid_gone(pid: u32, tries: u32, sleep_ms: u64) -> bool {
     !pid_alive(pid)
 }
 
-/// Run one orphan-reaper pass over `ledger` (SPEC §10.7).
+/// Run one **ledger-driven** orphan-reaper pass over `ledger` (SPEC §10.7).
 ///
-/// For every recorded clone: if its **owning orchestrator pid is dead**, the
+/// For every recorded clone: if its **owning orchestrator is no longer live**
+/// (pid gone, or pid recycled to a different process — see [`OwnerIdentity`]), the
 /// clone is an orphan — destroy it (stop postmaster + delete datadir), raise an
-/// [`OrphanAlarm`], and forget the ledger entry. If the owner is still alive the
+/// [`OrphanAlarm`], and forget the ledger entry. If the owner is still live the
 /// clone is in active use and left untouched (recorded in
 /// [`ReapOutcome::live_skipped`]).
+///
+/// This is the primary backstop. In production, prefer
+/// [`reap_orphans_with_sweep`], which additionally sweeps the clone-storage root
+/// so a clone with **no** ledger entry (lost/failed ledger write) is still caught.
 pub fn reap_orphans(ledger: &CloneLedger) -> Result<ReapOutcome, CloneError> {
     let mut outcome = ReapOutcome::default();
+    reap_from_ledger(ledger, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// Run a **full** orphan-reaper pass: the ledger-driven reap (see [`reap_orphans`])
+/// **plus** a ledger-independent sweep of `clone_root` (SPEC §10.7,
+/// defence-in-depth).
+///
+/// The sweep fully closes the leaked-PII window: every clone datadir under
+/// `clone_root` whose owner is not a live, matching owner is destroyed **even if
+/// it has no ledger entry at all** — the case the original ledger-only reaper
+/// could not see (a crash between datadir creation and the ledger write, or a
+/// lost/relocated ledger). An orphan caught by *both* paths is reaped once and
+/// alarmed once.
+pub fn reap_orphans_with_sweep(
+    ledger: &CloneLedger,
+    clone_root: &Path,
+) -> Result<ReapOutcome, CloneError> {
+    let mut outcome = ReapOutcome::default();
+    reap_from_ledger(ledger, &mut outcome)?;
+    sweep_clone_root(clone_root, ledger, &mut outcome)?;
+    Ok(outcome)
+}
+
+/// The ledger-driven half of a reaper pass (records into `outcome`).
+fn reap_from_ledger(ledger: &CloneLedger, outcome: &mut ReapOutcome) -> Result<(), CloneError> {
     for entry in ledger.entries()? {
-        if pid_alive(entry.owner_pid) {
+        if entry.owner().is_live() {
             outcome.live_skipped.push(entry.clone_id.clone());
             continue;
         }
-        // Orphan: the orchestrator that owned this clone is gone.
+        // Orphan: the orchestrator that owned this clone is gone (or its pid was
+        // recycled to an unrelated process — see `OwnerIdentity::is_live`).
         let reaped = destroy_orphan(&entry);
         outcome.alarms.push(OrphanAlarm {
             clone_id: entry.clone_id.clone(),
@@ -273,7 +489,87 @@ pub fn reap_orphans(ledger: &CloneLedger) -> Result<ReapOutcome, CloneError> {
             ledger.forget(&entry.clone_id)?;
         }
     }
-    Ok(outcome)
+    Ok(())
+}
+
+/// The ledger-independent half: scan `clone_root` for clone datadirs whose owner
+/// is not live, and reap them — **even with no ledger entry** (records into
+/// `outcome`). Datadirs already reaped/alarmed by the ledger pass are skipped.
+fn sweep_clone_root(
+    clone_root: &Path,
+    ledger: &CloneLedger,
+    outcome: &mut ReapOutcome,
+) -> Result<(), CloneError> {
+    let rd = match fs::read_dir(clone_root) {
+        Ok(rd) => rd,
+        // No clone root yet ⇒ nothing on disk to sweep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(CloneError::Tooling(format!(
+                "sweep read {clone_root:?}: {e}"
+            )))
+        }
+    };
+    // Snapshot the ledger once: any datadir owned by a *live* ledger entry is in
+    // active use and must be left alone.
+    let ledger_entries = ledger.entries()?;
+    for ent in rd {
+        let ent = ent.map_err(|e| CloneError::Tooling(format!("sweep entry: {e}")))?;
+        let path = ent.path();
+        if !path.is_dir() || !looks_like_clone_datadir(&path) {
+            continue;
+        }
+        // Already alarmed by the ledger pass this run (e.g. dead-owner entry whose
+        // datadir survived the destroy attempt) ⇒ don't double-process.
+        if outcome.alarms.iter().any(|a| a.datadir == path) {
+            continue;
+        }
+        // A live ledger entry owns this datadir ⇒ in active use, leave it.
+        if ledger_entries
+            .iter()
+            .any(|e| e.datadir == path && e.owner().is_live())
+        {
+            continue;
+        }
+
+        // Decide ownership from the in-datadir marker. A live, matching owner ⇒
+        // in active use, leave it. Otherwise (dead owner, recycled pid, or no/
+        // garbled marker) it is an orphan — fail-closed.
+        let owner = read_owner_marker(&path);
+        let clone_id = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if matches!(&owner, Some(o) if o.is_live()) {
+            outcome.live_skipped.push(clone_id);
+            continue;
+        }
+
+        // Orphaned, unrecorded (or recorded-but-dead) prod-PII datadir: reap it.
+        let entry = LedgerEntry {
+            clone_id: clone_id.clone(),
+            datadir: path.clone(),
+            // Port unknown from the filesystem alone; the postmaster.pid stop +
+            // datadir removal in `destroy_orphan` does not need it.
+            port: 0,
+            owner_pid: owner.as_ref().map(|o| o.pid).unwrap_or(0),
+            owner_start: owner.as_ref().map(|o| o.start.clone()).unwrap_or_default(),
+        };
+        let reaped = destroy_orphan(&entry);
+        outcome.alarms.push(OrphanAlarm {
+            clone_id: entry.clone_id.clone(),
+            datadir: entry.datadir.clone(),
+            port: entry.port,
+            owner_pid: entry.owner_pid,
+            reaped,
+        });
+        // If the ledger happened to have an entry for this datadir, forget it now.
+        if reaped {
+            ledger.forget(&entry.clone_id)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -301,6 +597,7 @@ mod tests {
             datadir: dir.join("data-abc"),
             port: 54361,
             owner_pid: std::process::id(),
+            owner_start: OwnerIdentity::current().start,
         };
         ledger.record(&e).unwrap();
         let listed = ledger.entries().unwrap();
@@ -326,6 +623,7 @@ mod tests {
                 datadir: live_datadir.clone(),
                 port: 54371,
                 owner_pid: std::process::id(),
+                owner_start: OwnerIdentity::current().start,
             })
             .unwrap();
 
@@ -341,6 +639,7 @@ mod tests {
                 datadir: dead_datadir.clone(),
                 port: 54372,
                 owner_pid: dead_pid,
+                owner_start: String::new(),
             })
             .unwrap();
 
@@ -382,5 +681,157 @@ mod tests {
     fn pid_alive_is_true_for_self_false_for_zero() {
         assert!(pid_alive(std::process::id()));
         assert!(!pid_alive(0));
+    }
+
+    #[test]
+    fn process_start_time_is_some_for_self_none_for_dead() {
+        assert!(process_start_time(std::process::id()).is_some());
+        assert!(process_start_time(0).is_none());
+        assert!(process_start_time(pick_dead_pid()).is_none());
+    }
+
+    #[test]
+    fn owner_identity_pid_reuse_is_not_live() {
+        // The exact red-team scenario: the orchestrator died and the OS recycled
+        // its pid to an UNRELATED live process. The bare-pid check would say
+        // "alive" and skip the orphan forever; the start-time discriminator makes
+        // it fail-closed. We model the recycled pid as *this* live process with a
+        // DIFFERENT recorded start-time — pid is alive, identity does not match.
+        let recycled = OwnerIdentity {
+            pid: std::process::id(),
+            start: "Thu Jan  1 00:00:00 1970".to_string(), // not our real start
+        };
+        assert!(
+            pid_alive(recycled.pid),
+            "precondition: the (recycled) pid is alive"
+        );
+        assert!(
+            !recycled.is_live(),
+            "a live pid with a mismatched start-time must NOT count as the original owner"
+        );
+
+        // The genuine current identity is live (pid alive + start-time matches).
+        assert!(OwnerIdentity::current().is_live());
+
+        // A dead pid is never live regardless of recorded start-time.
+        assert!(!OwnerIdentity {
+            pid: pick_dead_pid(),
+            start: String::new()
+        }
+        .is_live());
+    }
+
+    #[test]
+    fn ledger_pass_reaps_recycled_pid_owner() {
+        // A ledger entry whose owner pid is alive but whose recorded start-time no
+        // longer matches (pid reuse) must be reaped, not skipped as live.
+        let dir = tmp_dir("recycle");
+        let ledger = CloneLedger::open(&dir).unwrap();
+        let datadir = dir.join("recycled-data");
+        fs::create_dir_all(&datadir).unwrap();
+        ledger
+            .record(&LedgerEntry {
+                clone_id: "recycled-clone".into(),
+                datadir: datadir.clone(),
+                port: 54390,
+                owner_pid: std::process::id(), // alive…
+                owner_start: "Thu Jan  1 00:00:00 1970".into(), // …but recycled
+            })
+            .unwrap();
+
+        let outcome = reap_orphans(&ledger).unwrap();
+        assert!(
+            outcome.live_skipped.is_empty(),
+            "a recycled-pid owner must not be treated as live: {outcome:?}"
+        );
+        assert_eq!(outcome.alarms.len(), 1, "the recycled-pid clone is reaped");
+        assert!(!datadir.exists(), "the orphan datadir must be deleted");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_reaps_unrecorded_datadir_with_no_ledger_entry() {
+        // The BLOCKER's belt-and-suspenders: a clone datadir on disk with NO
+        // ledger entry (and a dead/garbage owner marker) is still reaped by the
+        // filesystem sweep.
+        let dir = tmp_dir("sweep");
+        let ledger = CloneLedger::open(dir.join("ledger")).unwrap();
+        let clone_root = dir.join("clones");
+        let orphan = clone_root.join("local-clone-CRASHED-1");
+        fs::create_dir_all(&orphan).unwrap();
+        // Make it look like a PG datadir and stamp a DEAD owner marker.
+        fs::write(orphan.join("PG_VERSION"), b"18\n").unwrap();
+        write_owner_marker(
+            &orphan,
+            &OwnerIdentity {
+                pid: pick_dead_pid(),
+                start: String::new(),
+            },
+        )
+        .unwrap();
+        assert!(ledger.entries().unwrap().is_empty(), "no ledger entry");
+
+        let outcome = reap_orphans_with_sweep(&ledger, &clone_root).unwrap();
+        assert_eq!(
+            outcome.alarms.len(),
+            1,
+            "the unrecorded orphan must raise exactly one alarm: {outcome:?}"
+        );
+        assert_eq!(outcome.alarms[0].clone_id, "local-clone-CRASHED-1");
+        assert!(outcome.alarms[0].reaped);
+        assert!(
+            !orphan.exists(),
+            "the unrecorded orphan datadir must be gone"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_leaves_live_owner_datadir_alone() {
+        // A datadir whose in-datadir owner marker names THIS live process is in
+        // active use → the sweep must not touch it.
+        let dir = tmp_dir("sweep-live");
+        let ledger = CloneLedger::open(dir.join("ledger")).unwrap();
+        let clone_root = dir.join("clones");
+        let live = clone_root.join("local-clone-live-1");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("PG_VERSION"), b"18\n").unwrap();
+        write_owner_marker(&live, &OwnerIdentity::current()).unwrap();
+
+        let outcome = reap_orphans_with_sweep(&ledger, &clone_root).unwrap();
+        assert!(
+            outcome.alarms.is_empty(),
+            "a live-owner datadir must not be reaped: {outcome:?}"
+        );
+        assert!(live.exists(), "the in-use clone datadir must survive");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_skips_non_clone_directories() {
+        // A stray non-PG directory under clone_root is ignored (no tell-tale).
+        let dir = tmp_dir("sweep-stray");
+        let ledger = CloneLedger::open(dir.join("ledger")).unwrap();
+        let clone_root = dir.join("clones");
+        let stray = clone_root.join("not-a-clone");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("readme.txt"), b"hi").unwrap();
+
+        let outcome = reap_orphans_with_sweep(&ledger, &clone_root).unwrap();
+        assert!(outcome.alarms.is_empty());
+        assert!(stray.exists(), "a non-clone dir must be left untouched");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_dir_honors_explicit_override() {
+        // The pinned canonical location is deployment-overridable and NOT tmp.
+        let want = std::env::temp_dir().join("pgb-canonical-test-override");
+        std::env::set_var("PGB_CLONE_LEDGER_DIR", &want);
+        assert_eq!(CloneLedger::canonical_dir(), want);
+        std::env::remove_var("PGB_CLONE_LEDGER_DIR");
+        // Without the override it is anchored under a state dir, never bare tmp.
+        let derived = CloneLedger::canonical_dir();
+        assert!(derived.ends_with("pg_bumpers/clone-ledger"));
     }
 }

@@ -55,10 +55,11 @@ pub use predicate::{
 };
 pub use proposal::{propose, propose_with_ttl, Proposal, DEFAULT_TTL_MILLIS};
 pub use provider::{
-    check_parity, reap_orphans, with_clone, CloneError, CloneGovernance, CloneHandle, CloneLedger,
-    CloneProvider, ColumnGrant, DataClassification, DblabProvider, LedgerEntry, LocalCloneConfig,
-    LocalCloneProvider, NoneProvider, OrphanAlarm, ParityReport, PrimaryRef, ProviderKind,
-    ReapOutcome, RlsPolicy,
+    check_parity, reap_orphans, reap_orphans_with_sweep, with_clone, write_owner_marker,
+    CloneError, CloneGovernance, CloneHandle, CloneLedger, CloneProvider, ColumnGrant,
+    DataClassification, DblabProvider, LedgerEntry, LocalCloneConfig, LocalCloneProvider,
+    NoneProvider, OrphanAlarm, OwnerIdentity, ParityReport, PrimaryRef, ProviderKind, ReapOutcome,
+    RlsPolicy, OWNER_MARKER,
 };
 
 /// The outcome of comparing the dry-run affected-PK set against the apply-time set.
