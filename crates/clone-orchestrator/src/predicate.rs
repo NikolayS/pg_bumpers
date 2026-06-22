@@ -273,7 +273,19 @@ pub fn predicate_volatile_reason(
         // SQL. They are deterministic (IMMUTABLE) by construction — accept them
         // here, *before* the catalog lookup, so we never reach the unresolvable
         // path for them.
-        if KNOWN_DETERMINISTIC_SPECIAL_FORMS.contains(&bare_name(name).as_str()) {
+        //
+        // IMPORTANT: this short-circuit applies **only to unqualified names**
+        // (no `.` in the rendered name). A schema-qualified call such as
+        // `public.coalesce(...)` names a **real user-defined function** in the
+        // `public` schema — a user may have defined a VOLATILE UDF with a name
+        // that shadows the built-in special form. Matching on the bare name alone
+        // would skip the `pg_proc.provolatile` lookup for that UDF and silently
+        // allow a volatile predicate (§4 volatile-bypass). For qualified names we
+        // fall through to the resolver: it will find the UDF's provolatile class
+        // (REFUSE if 'v') or, if the function is unresolvable, fail-closed REFUSE.
+        if !name.contains('.')
+            && KNOWN_DETERMINISTIC_SPECIAL_FORMS.contains(&bare_name(name).as_str())
+        {
             continue;
         }
         match resolver.volatility_of(name) {
@@ -560,14 +572,86 @@ mod tests {
             None,
             "least in a WHERE predicate must proceed"
         );
-        // Case-insensitive + schema-qualified bare-name handling.
+        // Case-insensitive: bare COALESCE (uppercase) still proceeds.
         assert_eq!(
             reason("DELETE FROM t WHERE COALESCE(owner, 'd') = 'x'"),
             None
         );
-        assert_eq!(
+        // Schema-qualified `pg_catalog.coalesce` is NOT covered by the allow-set
+        // (it is schema-qualified and must fall through to pg_proc.provolatile;
+        // pg_catalog.coalesce has no pg_proc row → Unknown → refused fail-closed).
+        // This is intentionally more conservative than the old behaviour; the §4
+        // qualified-bypass fix (see below) documents this edge.
+        assert!(matches!(
             reason("UPDATE t SET x=0 WHERE pg_catalog.coalesce(owner,'') = 'x'"),
-            None
+            Some(VolatileReason::UnresolvableFunction(_))
+        ));
+    }
+
+    // --- §4 qualified-bypass fix: schema-qualified special-form names are NOT
+    //     short-circuited; they fall through to pg_proc.provolatile (fail-closed)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn schema_qualified_coalesce_udf_is_refused_via_provolatile() {
+        // THE BYPASS: `public.coalesce(bigint)` is a real VOLATILE UDF. Before the
+        // fix the allow-set matched on the bare name `coalesce` regardless of
+        // schema, skipping the pg_proc lookup and allowing the volatile predicate.
+        // After the fix the schema-qualified name is NOT short-circuited; the
+        // MapResolver returns Volatile for "coalesce" (simulating a volatile UDF),
+        // and the engine correctly REFUSES.
+        let mut resolver = MapResolver::new(&[("coalesce", Volatility::Volatile)]);
+        let r = predicate_volatile_reason(
+            "UPDATE public.accounts SET balance=0 WHERE public.coalesce(id::bigint) IS NOT NULL",
+            &mut resolver,
+        );
+        assert!(
+            matches!(r, Some(VolatileReason::VolatileFunction(ref n)) if n == "public.coalesce"),
+            "schema-qualified volatile UDF named coalesce must be REFUSED via provolatile, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn schema_qualified_nonexistent_function_is_refused_fail_closed() {
+        // A schema-qualified call to a function that does not exist in pg_proc
+        // (resolver returns Unknown) must be REFUSED fail-closed, even if the bare
+        // name matches the allow-set.
+        let mut resolver = NoFunctionVolatility; // everything → Unknown
+        let r = predicate_volatile_reason(
+            "UPDATE t SET x=0 WHERE public.coalesce(id::bigint) IS NOT NULL",
+            &mut resolver,
+        );
+        assert!(
+            matches!(r, Some(VolatileReason::UnresolvableFunction(ref n)) if n == "public.coalesce"),
+            "schema-qualified unresolvable function must be REFUSED fail-closed, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn bare_special_forms_still_proceed_after_fix() {
+        // Regression guard: the fix must NOT break the legitimate use-case of bare
+        // (unqualified) special forms. coalesce/nullif/greatest/least without a
+        // schema prefix must still proceed (they are the genuine SQL special forms
+        // with no pg_proc row, and they are deterministic).
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE coalesce(owner,'') = 'x'"),
+            None,
+            "bare coalesce must still proceed after the qualified-bypass fix"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE nullif(a,b) IS NULL"),
+            None,
+            "bare nullif must still proceed"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE greatest(a,b) > 0"),
+            None,
+            "bare greatest must still proceed"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE least(a,b) < 10"),
+            None,
+            "bare least must still proceed"
         );
     }
 

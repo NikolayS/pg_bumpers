@@ -386,6 +386,95 @@ fn catalog_less_special_forms_proceed_against_real_pg() {
     drop_db(&admin, &dbname);
 }
 
+// ===========================================================================
+//  §4 qualified-bypass fix — public.coalesce(bigint) volatile UDF → REFUSED
+// ===========================================================================
+
+#[test]
+fn schema_qualified_volatile_coalesce_udf_is_refused() {
+    // RED→GREEN (re-review §4 qualified-bypass): before the fix the allow-set
+    // matched `public.coalesce` on its bare name `coalesce`, skipping the
+    // pg_proc.provolatile lookup and proceeding with a VOLATILE UDF. After the
+    // fix a schema-qualified name is NOT short-circuited; it falls through to the
+    // real pg_proc lookup which returns provolatile='v' → REFUSED.
+    //
+    // We create a VOLATILE `public.coalesce(bigint)` UDF and assert that
+    // `WHERE public.coalesce(id::bigint) IS NOT NULL` is REFUSED before any
+    // execution and the DB is untouched.
+    let Some((admin, dbname, mut client)) = setup("qualified_coalesce_volatile") else {
+        return;
+    };
+    client
+        .batch_execute(
+            "CREATE FUNCTION public.coalesce(bigint) RETURNS bigint \
+             LANGUAGE sql VOLATILE AS $$ SELECT clock_timestamp()::text::bigint $$;",
+        )
+        .expect("create volatile public.coalesce(bigint) UDF");
+
+    // Prove the UDF really is volatile in pg_proc (the premise).
+    let provolatile: String = client
+        .query_one(
+            "SELECT provolatile::text FROM pg_proc \
+             WHERE proname = 'coalesce' AND pronamespace = 'public'::regnamespace",
+            &[],
+        )
+        .expect("find public.coalesce in pg_proc")
+        .get(0);
+    assert_eq!(
+        provolatile, "v",
+        "premise: public.coalesce(bigint) is VOLATILE"
+    );
+
+    eprintln!(
+        "[qualified-coalesce] public.coalesce provolatile={provolatile} — now asserting REFUSED"
+    );
+
+    assert_refused_volatile_untouched(
+        &mut client,
+        "UPDATE public.accounts SET balance = 0 WHERE public.coalesce(id::bigint) IS NOT NULL",
+    );
+
+    // Also assert fail-closed: a qualified call to a non-existent schema-qualified
+    // function (schema exists but function does not) → REFUSED (Unknown).
+    assert_refused_volatile_untouched(
+        &mut client,
+        "UPDATE public.accounts SET balance = 0 WHERE public.no_such_fn_xyz(id) IS NOT NULL",
+    );
+
+    drop_db(&admin, &dbname);
+}
+
+#[test]
+fn bare_coalesce_still_proceeds_against_real_pg() {
+    // Regression guard: bare (unqualified) `coalesce` must still PROCEED after
+    // the qualified-bypass fix. The real pg_proc has no row for `coalesce` (it is
+    // a SQL special form handled by the planner), so only the allow-set keeps it
+    // from being fail-closed refused. This test proves the allow-set still fires
+    // for the unqualified name.
+    let Some((admin, dbname, mut client)) = setup("bare_coalesce_proceeds") else {
+        return;
+    };
+    let before = account_balances(&mut client);
+    let clock = SystemClock::new();
+    let statement = "UPDATE public.accounts SET balance = 0 WHERE coalesce(owner, '') = 'owner-3'";
+    let proposal = propose(statement, None, &clock);
+    let inner_clock = SystemClock::new();
+    let mut backend = PgRehearsal::new(&mut client, &inner_clock);
+    let br = dry_run(&proposal, &mut backend, &clock)
+        .unwrap_or_else(|e| panic!("bare coalesce must proceed after the fix, got {e:?}"));
+    eprintln!(
+        "[bare-coalesce] PROCEEDS (predicate_volatile={})",
+        br.predicate_volatile
+    );
+    assert!(
+        !br.predicate_volatile,
+        "bare coalesce must record predicate_volatile=false"
+    );
+    // Rolled back — no persistence.
+    assert_eq!(account_balances(&mut client), before);
+    drop_db(&admin, &dbname);
+}
+
 #[test]
 fn unknown_user_function_is_still_refused_fail_closed() {
     // A genuinely unknown / unresolvable user function in the predicate must
