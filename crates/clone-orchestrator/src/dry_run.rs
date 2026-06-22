@@ -30,10 +30,12 @@
 //!   catches volatile built-ins (`random`/`clock_timestamp`/`nextval`/…) and
 //!   volatile UDFs alike. The statement is [`DryRunError::Volatile`] and never
 //!   run.
-//! - **No usable PK / unique-not-null identity** (SPEC §10.2): affected rows
-//!   cannot be keyed across the dry-run/apply boundary, so the write is
-//!   [`DryRunError::PkLess`] — **no `ctid` fallback**. (A PK-bearing table with
-//!   `REPLICA IDENTITY NOTHING` still proceeds — see [`DryRunError::PkLess`].)
+//! - **No primary key** (SPEC §10.2): affected rows cannot be keyed across the
+//!   dry-run/apply boundary, so the write is [`DryRunError::PkLess`] — **no
+//!   `ctid` fallback**. The identity is keyed strictly on the PK today (a
+//!   unique-not-null fallback is a documented future change, not yet
+//!   implemented). (A PK-bearing table with `REPLICA IDENTITY NOTHING` still
+//!   proceeds — see [`DryRunError::PkLess`].)
 //!
 //! The orchestration (parse → refuse → measure → assemble → rollback) is
 //! DB-free and unit-tested against a mock [`Rehearsal`]; the real PG18 backend
@@ -85,27 +87,28 @@ pub enum DryRunError {
     #[error("REFUSED: statement is not a rehearsable certified write ({0})")]
     NotRehearsable(String),
 
-    /// The target relation has **no usable identity** — no primary key and no
-    /// unique-not-null index — so the affected-row set cannot be keyed across the
-    /// dry-run/apply boundary. **REFUSED, no `ctid` fallback** (SPEC §10.2).
+    /// The target relation has **no primary key**, so the affected-row set cannot
+    /// be keyed across the dry-run/apply boundary. **REFUSED, no `ctid` fallback**
+    /// (SPEC §10.2).
     ///
     /// ## §10.2 mapping: PK-set capture vs. REPLICA IDENTITY
     ///
-    /// The affected-row set is keyed on the **primary key** (or, absent a PK, a
-    /// unique-not-null index) — this is what `RETURNING`/pre-image captures and
-    /// what the checksum hashes. That on-disk identity is **orthogonal** to a
-    /// table's `REPLICA IDENTITY` setting, which governs what a *logical-
-    /// replication* `UPDATE`/`DELETE` WAL record carries for downstream
-    /// subscribers. SPEC §10.2's "PK-less / no-replica-identity" is naming the
-    /// **genuinely identity-less** case (no key at all); it is not asking us to
-    /// refuse a PK-bearing table merely because its `REPLICA IDENTITY` is
-    /// `NOTHING`/`DEFAULT`. Consequence: a PK-bearing table with
-    /// `REPLICA IDENTITY NOTHING` **proceeds** (we capture the PK exactly), and
-    /// we refuse only when there is no usable PK / unique-not-null identity — the
-    /// real PK-less case this error names.
-    #[error(
-        "REFUSED: target relation `{0}` has no usable PK / unique-not-null identity (no ctid fallback)"
-    )]
+    /// Today the affected-row set is keyed strictly on the **primary key** — the
+    /// `pk_columns` lookup filters `pg_index.indisprimary`, so a table with no PK
+    /// is refused even if it carries a unique-not-null index. (Extending the
+    /// certified set to fall back to a unique-not-null index is a future change;
+    /// it is **not** implemented here, so the message names only the PK.) The PK
+    /// is what `RETURNING`/pre-image captures and what the checksum hashes.
+    ///
+    /// That on-disk identity is **orthogonal** to a table's `REPLICA IDENTITY`
+    /// setting, which governs what a *logical-replication* `UPDATE`/`DELETE` WAL
+    /// record carries for downstream subscribers. SPEC §10.2's "PK-less /
+    /// no-replica-identity" is naming the **genuinely identity-less** case (no PK
+    /// at all); it is not asking us to refuse a PK-bearing table merely because
+    /// its `REPLICA IDENTITY` is `NOTHING`/`DEFAULT`. Consequence: a PK-bearing
+    /// table with `REPLICA IDENTITY NOTHING` **proceeds** (we capture the PK
+    /// exactly), and we refuse only the real PK-less case this error names.
+    #[error("REFUSED: target relation `{0}` has no primary key (no ctid fallback)")]
     PkLess(String),
 
     /// The proposal has outlived its TTL; re-propose before rehearsing.
@@ -304,8 +307,8 @@ fn stmt_label(stmt: &sqlparser::ast::Statement) -> &'static str {
 /// 4. **Rehearse** — the backend runs the statement in a rolled-back txn and
 ///    measures the blast radius (PK set + cascades + triggers + locks + WAL +
 ///    duration + LSN/staleness).
-/// 5. **PK-less guard** — refuse if the target (or any cascade) has no usable PK
-///    (no `ctid` fallback).
+/// 5. **PK-less guard** — refuse if the target (or any cascade) has no primary
+///    key (no `ctid` fallback).
 /// 6. **Assemble** — fold the measurement into the §10.1 [`BlastRadius`] record.
 ///
 /// On success the returned record reflects a write that was rehearsed and then
@@ -344,7 +347,7 @@ pub fn dry_run(
         .rehearse(&proposal.statement, kind, &target_relation)
         .map_err(DryRunError::Backend)?;
 
-    // (5) PK-less guard: refuse if the target or any cascade has no usable PK
+    // (5) PK-less guard: refuse if the target or any cascade has no primary key
     //     (no ctid fallback — §10.2).
     assemble(proposal, kind, measurement)
 }

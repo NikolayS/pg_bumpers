@@ -33,6 +33,12 @@
 //!      `statement_timestamp`, `transaction_timestamp`, `txid_current`, … —
 //!      which Postgres marks `STABLE`, not `volatile`, yet still differ across
 //!      the dry-run/apply boundary) are **always refused**, by name;
+//!    - the **known-deterministic SQL special forms**
+//!      ([`KNOWN_DETERMINISTIC_SPECIAL_FORMS`] — `coalesce`/`nullif`/`greatest`/
+//!      `least`) are accepted *before* the catalog lookup: sqlparser models them
+//!      as `Expr::Function` but they have **no `pg_proc` row**, so resolving them
+//!      would yield `Unknown` and wrongly fail-closed REFUSE this everyday SQL.
+//!      They are immutable by construction;
 //!    - every **other** function name is resolved against the live connection's
 //!      `pg_proc.provolatile` ([`FunctionVolatility`]): `'v'` (volatile) →
 //!      refused; immutable/stable (`'i'`/`'s'`) → allowed; **unknown /
@@ -79,6 +85,36 @@ pub const NONDETERMINISTIC_KEYWORDS: &[&str] = &[
     "txid_current",
     "pg_current_xact_id",
     "pg_current_xact_id_if_assigned",
+];
+
+/// SQL **special-form primitives** that sqlparser models as `Expr::Function` but
+/// that have **no `pg_proc` row**, and are deterministic (`IMMUTABLE`)
+/// by construction.
+///
+/// These are syntactic constructs the grammar spells like a function call
+/// (`coalesce(a, b)`, `nullif(a, b)`, `greatest(...)`, `least(...)`), so
+/// sqlparser surfaces them as `Expr::Function` and they flow into
+/// [`function_names_in`] — but the planner handles them directly, so
+/// `SELECT count(*) FROM pg_proc WHERE proname = 'coalesce'` is `0`. Without
+/// this allow-set the `pg_proc.provolatile` resolver would find no row,
+/// return [`Volatility::Unknown`], and the engine would fail-closed REFUSE —
+/// over-refusing everyday SQL (`WHERE coalesce(owner,'') = 'x'`). They are
+/// known-deterministic, so we treat them as immutable **before** the catalog
+/// lookup, never reaching the unresolvable path.
+///
+/// Scope note: the other catalog-less SQL special forms that sqlparser parses
+/// (`CAST`/`TRIM`/`SUBSTRING`/`POSITION`/`OVERLAY`/`EXTRACT`/…) get their own
+/// dedicated `Expr` variants (`Expr::Cast`, `Expr::Trim`, …), so they are *not*
+/// `Expr::Function` and never reach the catalog lookup in the first place —
+/// they already proceed and need no entry here. This set covers only the
+/// special forms that *do* route through [`function_names_in`] as functions.
+///
+/// Compared case-insensitively, on the bare (schema-stripped) name.
+pub const KNOWN_DETERMINISTIC_SPECIAL_FORMS: &[&str] = &[
+    "coalesce", // COALESCE(...) — first non-NULL argument
+    "nullif",   // NULLIF(a, b) — NULL when equal, else a
+    "greatest", // GREATEST(...) — largest non-NULL argument
+    "least",    // LEAST(...) — smallest non-NULL argument
 ];
 
 /// The volatility class of a Postgres function, as recorded by
@@ -231,6 +267,15 @@ pub fn predicate_volatile_reason(
     // (b) Resolve every remaining function against pg_proc.provolatile.
     //     Volatile → refuse; Unknown → refuse (fail-closed); Immutable/Stable → ok.
     for name in &names {
+        // Catalog-less SQL special forms (`coalesce`/`nullif`/`greatest`/`least`)
+        // parse as `Expr::Function` but have **no `pg_proc` row**, so the resolver
+        // would return `Unknown` and we would wrongly fail-closed REFUSE everyday
+        // SQL. They are deterministic (IMMUTABLE) by construction — accept them
+        // here, *before* the catalog lookup, so we never reach the unresolvable
+        // path for them.
+        if KNOWN_DETERMINISTIC_SPECIAL_FORMS.contains(&bare_name(name).as_str()) {
+            continue;
+        }
         match resolver.volatility_of(name) {
             Volatility::Volatile => return Some(VolatileReason::VolatileFunction(name.clone())),
             Volatility::Unknown => return Some(VolatileReason::UnresolvableFunction(name.clone())),
@@ -484,6 +529,62 @@ mod tests {
         // lower()/abs() are IMMUTABLE → no false refusal.
         assert_eq!(reason("UPDATE t SET x=0 WHERE lower(name) = 'x'"), None);
         assert_eq!(reason("DELETE FROM t WHERE abs(amount) > 100"), None);
+    }
+
+    #[test]
+    fn catalog_less_special_forms_proceed() {
+        // RED→GREEN: `coalesce`/`nullif`/`greatest`/`least` parse as
+        // `Expr::Function` but have NO `pg_proc` row, so the resolver returns
+        // `Unknown` for them. Before the allow-set this fail-closed REFUSED these
+        // everyday-SQL predicates (`UnresolvableFunction`); they must proceed.
+        // Note: `immutable_world()` does NOT map these names, so they reach the
+        // resolver as `Unknown` — exactly like the real `pg_proc` lookup (n=0) —
+        // proving the allow-set, not a test fixture, lets them through.
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE coalesce(owner,'') = 'x'"),
+            None,
+            "coalesce in a WHERE predicate must proceed"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE nullif(a,b) IS NULL"),
+            None,
+            "nullif in a WHERE predicate must proceed"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE greatest(a,b) > 0"),
+            None,
+            "greatest in a WHERE predicate must proceed"
+        );
+        assert_eq!(
+            reason("UPDATE public.accounts SET balance=0 WHERE least(a,b) < 10"),
+            None,
+            "least in a WHERE predicate must proceed"
+        );
+        // Case-insensitive + schema-qualified bare-name handling.
+        assert_eq!(
+            reason("DELETE FROM t WHERE COALESCE(owner, 'd') = 'x'"),
+            None
+        );
+        assert_eq!(
+            reason("UPDATE t SET x=0 WHERE pg_catalog.coalesce(owner,'') = 'x'"),
+            None
+        );
+    }
+
+    #[test]
+    fn special_form_does_not_widen_to_real_volatile_or_unknown() {
+        // The allow-set must NOT mask a genuinely volatile function or an unknown
+        // UDF that happens to share an argument-position with a special form.
+        // A volatile function still refuses even when nested as an arg to coalesce.
+        assert!(matches!(
+            reason("UPDATE t SET x=0 WHERE coalesce(random(), 0) > 0.5"),
+            Some(VolatileReason::VolatileFunction(ref n)) if n == "random"
+        ));
+        // An unknown UDF still fail-closed refuses when wrapped by a special form.
+        assert!(matches!(
+            reason("UPDATE t SET x=0 WHERE coalesce(mystery_fn(1), 0) = 0"),
+            Some(VolatileReason::UnresolvableFunction(ref n)) if n == "mystery_fn"
+        ));
     }
 
     #[test]

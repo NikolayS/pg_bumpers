@@ -334,6 +334,90 @@ fn immutable_predicate_is_not_over_refused() {
 }
 
 #[test]
+fn catalog_less_special_forms_proceed_against_real_pg() {
+    // RED→GREEN (re-review): `coalesce`/`nullif`/`greatest`/`least` parse as
+    // `Expr::Function` but have NO `pg_proc` row, so the live `provolatile`
+    // resolver returns `Unknown` for them. Before the allow-set the engine
+    // fail-closed REFUSED this everyday SQL — a false positive. They are
+    // deterministic by construction and must now PROCEED with
+    // predicate_volatile=false. We assert against the real pg_proc lookup (the
+    // resolver genuinely finds n=0 for these names) to prove it's the allow-set,
+    // not a fixture, letting them through.
+    let Some((admin, dbname, mut client)) = setup("special_forms_ok") else {
+        return;
+    };
+    // Sanity-check the premise on this very cluster: these names have no pg_proc
+    // row, so the catalog lookup alone would (and did) over-refuse them.
+    let n: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_proc \
+             WHERE proname IN ('coalesce','nullif','greatest','least')",
+            &[],
+        )
+        .expect("count special-form pg_proc rows")
+        .get(0);
+    assert_eq!(n, 0, "premise: special forms have no pg_proc row");
+
+    let before = account_balances(&mut client);
+    let clock = SystemClock::new();
+    for statement in [
+        "UPDATE public.accounts SET balance = 0 WHERE coalesce(owner, '') = 'owner-3'",
+        "UPDATE public.accounts SET balance = 0 WHERE nullif(owner, '') IS NULL",
+        "UPDATE public.accounts SET balance = 0 WHERE greatest(balance, 0) > 0",
+        "UPDATE public.accounts SET balance = 0 WHERE least(balance, 0) < 10",
+    ] {
+        let proposal = propose(statement, None, &clock);
+        let inner_clock = SystemClock::new();
+        let mut backend = PgRehearsal::new(&mut client, &inner_clock);
+        let br = dry_run(&proposal, &mut backend, &clock).unwrap_or_else(|e| {
+            panic!("catalog-less special form `{statement}` must proceed, got {e:?}")
+        });
+        eprintln!(
+            "[special-forms] {statement}\n  => PROCEEDS (predicate_volatile={})",
+            br.predicate_volatile
+        );
+        assert!(
+            !br.predicate_volatile,
+            "a deterministic special form must record predicate_volatile=false"
+        );
+    }
+    // No persistence — every dry-run rolled back.
+    assert_eq!(account_balances(&mut client), before);
+    drop_db(&admin, &dbname);
+}
+
+#[test]
+fn unknown_user_function_is_still_refused_fail_closed() {
+    // A genuinely unknown / unresolvable user function in the predicate must
+    // STILL be refused (fail-closed) — the allow-set must not weaken this. The
+    // function does not exist in pg_proc, so the resolver returns Unknown and the
+    // engine refuses before any execution.
+    let Some((admin, dbname, mut client)) = setup("unknown_fn") else {
+        return;
+    };
+    let before = account_balances(&mut client);
+    let clock = SystemClock::new();
+    let statement = "UPDATE public.accounts SET balance = 0 WHERE no_such_udf_xyz(owner) = 'x'";
+    let proposal = propose(statement, None, &clock);
+    let err = {
+        let inner_clock = SystemClock::new();
+        let mut backend = PgRehearsal::new(&mut client, &inner_clock);
+        dry_run(&proposal, &mut backend, &clock).unwrap_err()
+    };
+    eprintln!("[unknown-fn] {statement}\n  => {err}");
+    assert!(
+        matches!(err, DryRunError::Volatile(_)),
+        "an unknown user function must be REFUSED (fail-closed), got {err:?}"
+    );
+    assert_eq!(
+        account_balances(&mut client),
+        before,
+        "DB must be untouched — the unknown-function predicate never ran"
+    );
+    drop_db(&admin, &dbname);
+}
+
+#[test]
 fn pk_less_table_is_refused_no_ctid_fallback() {
     let Some((admin, dbname, mut client)) = setup("pkless") else {
         return;

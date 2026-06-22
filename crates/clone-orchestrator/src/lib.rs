@@ -25,8 +25,9 @@
 //!   /…) are refused by name and every other function is resolved against
 //!   `pg_proc.provolatile` (volatile/unknown ⇒ refuse, fail-closed). See
 //!   [`predicate`].
-//! - No usable PK / unique-not-null identity → REFUSED, **no `ctid` fallback**
-//!   (SPEC §10.2; `REPLICA IDENTITY` is orthogonal — see [`dry_run::DryRunError::PkLess`]).
+//! - No primary key → REFUSED, **no `ctid` fallback** (SPEC §10.2; identity is
+//!   keyed on the PK only today — `REPLICA IDENTITY` is orthogonal — see
+//!   [`dry_run::DryRunError::PkLess`]).
 //! - Non-certified shape (DDL/`TRUNCATE`/`INSERT`/…) → REFUSED (default-deny,
 //!   §10.3).
 //!
