@@ -50,6 +50,24 @@ import sys
 #                                     99.0%; only pg.rs, the `_meta` sink, is 0%
 #                                     DB-free because it runs under the env-gated
 #                                     PG18 integration test, like pgb-proxy)
+#   pgb-applyd              57.11%   (S5 #67: the write-path daemon. The GATING
+#                                     LOGIC — the service state machine (propose/
+#                                     dry_run/request_elevation/approve/apply, the
+#                                     stored-proposal re-derivation invariant, the
+#                                     recoverable-error mapping) + the JSON-RPC
+#                                     protocol types — is fully DB-free unit-tested
+#                                     (service.rs 84.4%, protocol.rs 89.5%). The
+#                                     drop to 57% is NOT logic rot: it is main.rs
+#                                     (0% DB-free), the binary's Unix-socket accept
+#                                     loop + per-connection thread + env/audit-boot
+#                                     wiring + the resident PG18 apply Client — an
+#                                     inherently DB-and-IO-only seam proven ONLY
+#                                     under the env-gated PG18 IT (tests/applyd_it.rs)
+#                                     + the TS IT (mcp/server), exactly like
+#                                     pgb-audit's pg.rs and pgb-proxy's session
+#                                     loop/main.rs. Floor 54% bounds that IT-only
+#                                     surface while keeping the service/protocol
+#                                     gating logic high; RATCHET UP as it grows.)
 #
 # Floors sit a couple of points under current so normal churn stays green while
 # a genuine drop trips CI. RATCHET UP, never down.
@@ -61,6 +79,7 @@ FLOORS = {
     "crates/proxy/": ("pgb-proxy", 54.0),
     "crates/warden/": ("pgb-warden", 85.0),
     "crates/audit/": ("pgb-audit", 80.0),
+    "crates/applyd/": ("pgb-applyd", 54.0),
 }
 
 

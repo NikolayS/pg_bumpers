@@ -612,6 +612,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pgb-applyd"
+version = "0.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "pgb-audit",
+ "pgb-cli",
+ "pgb-clone-orchestrator",
+ "pgb-core",
+ "pgb-policy",
+ "postgres",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "pgb-audit"
 version = "0.0.0"
 dependencies = [
@@ -647,6 +666,7 @@ name = "pgb-clone-orchestrator"
 version = "0.0.0"
 dependencies = [
  "ed25519-dalek",
+ "pgb-clone-orchestrator",
  "pgb-core",
  "pgb-policy",
  "postgres",

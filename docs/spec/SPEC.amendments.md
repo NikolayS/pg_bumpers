@@ -695,3 +695,107 @@ swap — the file is not itself true WORM). The preserved-and-passed reviewer it
 unchanged: concurrent-appender fork-safety (`SharedSink` mutex + `PgSink` re-reads the
 persisted tail as `prev_hash`), the 42501 audited-can't-write invariant, env-secret handling
 (the key never logged), and the single shared `_meta` chain.
+
+---
+
+## S5 — MCP production wire + live Core (#67)
+
+**SPEC sections touched:** §3 (layer 3 MCP is cooperative, NOT a security boundary; the
+deterministic floor stays in Rust), §4 (the MCP toolset; propose→dry_run→apply; the
+`_meta` audit chain), §11 (the toolset), §14.3 (the signed grant consumed at apply),
+§10.1/§10.2/§10.3 (blast radius + PK-set guard + typed-inverse), §12 (clone.provider).
+
+**Issue:** #67 (S5: MCP production wire + live Core). Builds on #66 (the production
+grant-gated apply path `guarded_apply_with_grant`) and #64 (the shared anchored `_meta`
+chain).
+
+### What is wired (now real, end-to-end)
+
+The MCP server is now a **deployable, real-Core** server. A new Rust write-path daemon
+owns the apply floor; a TS `ApplydCore` + a stdio MCP shell wire the MCP server to it;
+reads go through the live proxy. Concretely:
+
+- **`pgb-applyd` (new crate `crates/applyd`, binary `pgb-applyd`)** — a long-lived process
+  that binds a **Unix-domain socket** (`PGB_APPLYD_SOCKET`; dir `0700`, socket `0600` —
+  NOT a TCP port, NOT agent-reachable) and speaks **line-delimited JSON-RPC 2.0**. It holds
+  the write-safety STATE in-process, TTL'd via an injected `Clock` (the production analog
+  of the TS `FakeCore`): proposal records, the cached `BlastRadius` per proposal, elevation
+  requests + the signed grants (held in-process; the grant NEVER crosses to the agent), the
+  `NonceStore`, the approver `VerifyingKey`, the `PolicyConfig`, and the shared `_meta`
+  audit chain. Methods: `propose` / `dry_run` / `request_elevation` / `approve` / `apply` /
+  `get_audit`. Reuses the merged primitives verbatim — `clone_orchestrator::{propose,
+  dry_run, guarded_apply_with_grant}`, the `pgb_cli` approval flow (request/approve/audit +
+  the self-approval gate), `pgb_audit::AuditBoot::connect_with_anchor` (the proxy's
+  env/audit-boot wiring) — and **reimplements no crypto, no §4 guards, no audit chain**.
+
+- **The SECURITY-CRITICAL apply invariant** — at `apply`, the daemon re-derives the
+  `LiveRequest{statement_text, normalized_params, role, session_id, proposal_id}` from the
+  **STORED proposal record**, NEVER from apply-time params. The `apply` RPC takes only
+  `{proposal_id, confirm_rows, confirm_token}`, so the agent/MCP cannot present a different
+  statement/role/session at apply than what was proposed + dry-run + approved. (Proven by
+  `apply_rederives_from_stored_record_*` in `tests/service_unit.rs`: a grant minted for
+  proposal-A's session can never be redirected onto proposal-B, because there are no
+  apply-time fields to redirect.) The §14.3 binding hash + `verify_for_apply` enforce this.
+
+- **`ApplydCore` (TS, `mcp/server/src/applydCore.ts`)** — a thin Unix-socket JSON-RPC client
+  implementing the `Core` interface; the production peer of `FakeCore`. It maps
+  `propose/dryRun/apply/requestElevation/getAudit` onto `pgb-applyd` and translates a
+  JSON-RPC error into the existing `ApplyResult{outcome:"blocked", block}` / `{notFound}`
+  shape so every denial stays a recoverable contract. Node `net` + `readline` only — NO new
+  dependencies (`license-check` stays green).
+
+- **The stdio MCP shell (TS, `mcp/server/src/bin/mcpStdio.ts`, bin `pgb-mcp`)** — the single
+  new deployable entrypoint. It speaks MCP `initialize`/`tools/list`/`tools/call` over
+  stdin/stdout (line-delimited JSON-RPC 2.0) and constructs `createServer({ transport:
+  PgProxyTransport.connect({...proxy...}), core: new ApplydCore({socketPath}), role })`,
+  dispatching `tools/call → server.call`. `package.json` gains the `bin` + a real emitting
+  build (`tsconfig.build.json`, `outDir:dist`).
+
+- **Reads go through the live proxy** (`PgProxyTransport` → the proxy endpoint) — unchanged.
+
+- **The full lifecycle is AUDITED** to the shared, anchored `_meta` chain: `request_elevation`
+  (BLOCK), `grant_signed` (ALLOW, at approve), and `apply_committed`/the apply-block code
+  (at apply) all hash-chain into one `_meta` chain (single genesis), the same chain the
+  proxy and CLI write to.
+
+### DEFERRED (honest scope — disclosed, not silently dropped)
+
+- **Generic-schema `ApplyConn` beyond single-int-PK** — `pgb-applyd`'s apply is constrained
+  to the **single-integer-PK `UPDATE`/`DELETE`** shape on a `(id, owner, balance)` table the
+  existing IT impl already proves (the lifted `PgApplyConn`/`PgRevertConn`). This is the #1
+  risk honored deliberately: a hand-rolled generic-schema apply could mis-read the PK or
+  skip a pre-image column and silently break reversibility while looking green. Anything
+  wider is gated out by the dry-run's existing PK-less / volatile / irreversible REFUSALS
+  (fail-closed). Generic-schema apply is DEFERRED.
+
+- **Cross-process session attestation (T4)** — the proxy read session and the applyd
+  proposal are tied by the `session_id` the shell PASSES, not by a cryptographic binding
+  between the two processes. The applyd binds the apply to whatever `session_id` it stored
+  at propose (defeating cross-session GRANT replay), but the link from the *proxy read
+  session* to the *applyd proposal session* is not yet cryptographically attested. DEFERRED.
+
+- **KMS approver-key resolution** — the approver `VerifyingKey` is loaded from
+  `PGB_APPROVER_PUBKEY` (hex); production resolves it from a KMS key version (§10.9). The
+  signing key is presented out-of-band by the operator at `approve` (it never enters the
+  daemon's config or the agent path). DEFERRED.
+
+- **dblab clone provider** — the dry-run runs the baseline `clone.provider: none` in-txn
+  rehearsal (`PgRehearsal`); the dblab clone provider is the existing separate deferral.
+
+### Not a security boundary (the honesty contract)
+
+The MCP server, the stdio shell, and `ApplydCore` are **cooperative, NOT a security
+boundary** (SPEC §3). They add no privilege: every read passes the proxy/WALL and every
+write passes `pgb-applyd`'s deterministic floor (`guarded_apply_with_grant` — bounded,
+reversible, grant-verified, fail-closed). A compromised MCP server cannot invent privilege,
+because the daemon re-derives the apply from its own stored proposal record. We do **not**
+claim generic-schema apply works.
+
+### One-impl conn lift (refactor, no behavior change)
+
+`PgApplyConn` (from `crates/clone-orchestrator/tests/apply_grant_it.rs`) and `PgRehearsal`
+(from `tests/common/mod.rs`) were **lifted into reusable library code** at
+`pgb_clone_orchestrator::conn` (behind the new `pg` feature), with `PgRevertConn` added
+alongside, so the integration tests AND `pgb-applyd` share exactly ONE implementation of
+each conn — no second, unproven copy. The existing clone-orchestrator IT tests now reuse the
+lifted impls (re-verified green: 16 IT tests).

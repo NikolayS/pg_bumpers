@@ -11,6 +11,13 @@ members = [
     "crates/pgwire",
     "crates/audit",
     "crates/cli",
+    # The write-path daemon (issue #67, S5): a long-lived process owning the
+    # propose→dry_run→approve→apply lifecycle over a Unix-domain socket
+    # (line-delimited JSON-RPC 2.0), driving the merged grant-gated apply floor
+    # (guarded_apply_with_grant). The production analog of the TS FakeCore; the
+    # MCP server's ApplydCore wires to it. NOT TCP, NOT agent-reachable.
+    # publish = false.
+    "crates/applyd",
     # Throwaway S0 fidelity-spike harness (issue #8). publish = false; not
     # production. Kept in the workspace only so it compiles under the fast CI job;
     # its DB tests are env-gated (PG_BUMPERS_IT=1) and skipped by `cargo test`.

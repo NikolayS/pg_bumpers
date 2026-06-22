@@ -5,8 +5,12 @@
   "description": "pg_bumpers MCP server — the §4/§11 toolset, executing through the proxy (cooperative, NOT a security boundary; SPEC.md §3).",
   "license": "Apache-2.0",
   "type": "module",
+  "bin": {
+    "pgb-mcp": "dist/bin/mcpStdio.js"
+  },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "license-check": "node scripts/license-check.mjs"
   },

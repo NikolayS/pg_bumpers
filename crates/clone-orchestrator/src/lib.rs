@@ -58,6 +58,11 @@
 
 pub mod apply;
 pub mod apply_grant;
+/// Real-PG18 connection seams (`PgRehearsal` / `PgApplyConn` / `PgRevertConn`),
+/// the single shared impl of the engine traits against PostgreSQL 18. Behind the
+/// `pg` feature so the DB-free build never links a Postgres client.
+#[cfg(feature = "pg")]
+pub mod conn;
 pub mod dry_run;
 pub mod predicate;
 pub mod proposal;
@@ -72,6 +77,8 @@ pub use apply::{
 pub use apply_grant::{
     guarded_apply_with_grant, BridgedApplyConfig, GrantedApplyError, LiveRequest,
 };
+#[cfg(feature = "pg")]
+pub use conn::{PgApplyConn, PgRehearsal, PgRevertConn};
 pub use dry_run::{
     classify, dry_run, AffectedTable, DryRunError, Measurement, Rehearsal, RelationEffect,
     WriteKind,

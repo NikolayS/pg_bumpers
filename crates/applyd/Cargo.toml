@@ -1,0 +1,58 @@
+[package]
+name = "pgb-applyd"
+description = "pg_bumpers write-path daemon: Unix-socket JSON-RPC service owning the propose→dry_run→approve→apply lifecycle over the merged grant-gated apply floor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pgb_applyd"
+
+[[bin]]
+name = "pgb-applyd"
+path = "src/main.rs"
+
+[dependencies]
+# Deterministic time at the seam (the TTL Clock), BlastRadius, PkChecksum, the
+# typed-inverse + the apply barrier — the DB-free core seams the service folds.
+pgb-core = { path = "../core" }
+# The single policy model + the §14.3 grant crypto (GrantToken / NonceStore /
+# InMemoryNonceStore) the apply path consumes — REUSED, never reimplemented.
+pgb-policy = { path = "../policy" }
+# The merged write-safety floor: propose / dry_run / guarded_apply_with_grant +
+# the typed errors. The `pg` feature pulls in the ONE lifted real-PG18 conn impl
+# (PgRehearsal / PgApplyConn / PgRevertConn) the binary drives — the service core
+# itself is generic over the conn traits and stays DB-free.
+pgb-clone-orchestrator = { path = "../clone-orchestrator", features = ["pg"] }
+# The operator approval flow (request_elevation / approve / verify_at_apply) +
+# the principal self-approval gate — REUSED for the elevation lifecycle. The
+# `pg` feature wires the shared `_meta` audit chain (AuditBoot) the proxy uses.
+pgb-cli = { path = "../cli" }
+# The shared, hash-chained `_meta` audit sink + the AuditBoot wiring (mirrors the
+# proxy: connect_with_anchor, the durable WORM, verify_then_anchor).
+pgb-audit = { path = "../audit", features = ["pg"] }
+# The §14.3 grant takes the approver's Ed25519 VerifyingKey; the parsing of the
+# pubkey/seed material into a key happens here. Same v2 (BSD-3-Clause) the rest
+# of the workspace pins.
+ed25519-dalek = { version = "2", default-features = false }
+# Line-delimited JSON-RPC 2.0 request/response (de)serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Advisory SQL parse to re-derive the WHERE predicate from the STORED proposal
+# statement for the apply conn (same crate/version the orchestrator pins).
+sqlparser = { version = "0.62", features = ["visitor"] }
+# The resident apply Client + the binary's primary connection (real PG18).
+postgres = "0.19"
+# Hex decode for the approver pubkey material (PGB_APPROVER_PUBKEY).
+hex = "0.4"
+
+[dev-dependencies]
+# DB setup/teardown for the env-gated (PG_BUMPERS_IT=1) IT, plus the in-memory
+# nonce store + signing key the IT mints to drive the operator-approve path.
+rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }

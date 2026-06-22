@@ -12,6 +12,15 @@ publish = false
 [lib]
 name = "pgb_clone_orchestrator"
 
+[features]
+# The real-PG18 connection seams (`conn` module): PgRehearsal — the §12 in-txn
+# baseline rehearsal — and PgApplyConn/PgRevertConn — the focused single-int-PK
+# UPDATE/DELETE apply + revert conns. Behind a feature so the DB-free build/test
+# path needs no Postgres client. The integration tests and `pgb-applyd` enable
+# it. These impls were LIFTED from the former `tests/*_it.rs` so there is exactly
+# ONE implementation shared by the tests and applyd (no second, unproven copy).
+pg = ["dep:postgres"]
+
 [dependencies]
 # The merged core seams: BlastRadius (§10.1), PkChecksum/PkSetBuilder (§10.2),
 # typed-inverse InverseKind (§10.3), Clock (§10.4). DB-free; the orchestrator
@@ -36,11 +45,23 @@ thiserror = "2"
 # crypto impl. Default features off (we only touch the key type), so this adds no
 # RNG/serde surface.
 ed25519-dalek = { version = "2", default-features = false }
+# Synchronous Postgres client for the real-PG18 `conn` seams (the lifted
+# PgRehearsal / PgApplyConn / PgRevertConn). OPTIONAL — only pulled in under the
+# `pg` feature, so the default DB-free build never links it. MIT/Apache (keeps
+# cargo-deny green); the sync client keeps these conns linear and readable,
+# matching the S0 fidelity spike.
+postgres = { version = "0.19", optional = true }
 
 [dev-dependencies]
+# The integration tests drive the lifted `conn` module (PgRehearsal /
+# PgApplyConn / PgRevertConn) — so they self-enable the crate's own `pg` feature
+# (a dev-dep on the crate itself). This is what makes the tests reuse the ONE
+# library impl rather than a second copy.
+pgb-clone-orchestrator = { path = ".", features = ["pg"] }
 # Synchronous Postgres client for the env-gated (PG_BUMPERS_IT=1) real-PG18
-# integration tests. MIT/Apache (keeps cargo-deny green); the sync client keeps
-# the rehearsal harness linear and readable, matching the S0 fidelity spike.
+# integration tests (DB setup/teardown helpers in tests/common). MIT/Apache
+# (keeps cargo-deny green); the sync client keeps the harness linear, matching
+# the S0 fidelity spike.
 postgres = "0.19"
 # Unit/IT tests mint a signing key to sign the §14.3 grant they then verify at the
 # real apply path. `rand_core` provides the OsRng `SigningKey::generate` needs;
