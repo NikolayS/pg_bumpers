@@ -61,6 +61,7 @@ pub mod dry_run;
 pub mod predicate;
 pub mod proposal;
 pub mod provider;
+pub mod revert;
 
 pub use apply::{
     guarded_apply, statement_timeout_ms, AppliedWrite, ApplyConn, ApplyError, CapturedRow,
@@ -83,6 +84,7 @@ pub use provider::{
     NoneProvider, OrphanAlarm, OwnerIdentity, ParityReport, PrimaryRef, ProviderKind, ReapOutcome,
     RlsPolicy, OWNER_MARKER,
 };
+pub use revert::{revert, RevertConn, RevertError, RevertReport, RevertRow};
 
 /// The outcome of comparing the dry-run affected-PK set against the apply-time set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

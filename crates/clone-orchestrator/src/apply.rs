@@ -829,9 +829,11 @@ fn build_inverse(
             for row in rows {
                 let mut image = row.before_image.clone();
                 // Stamp the owning relation so a multi-relation inverse is routable
-                // by the revert (#37), which consumes per-relation pre-images.
+                // by the revert (#37), which consumes per-relation pre-images. The
+                // stamp column name is shared with the revert engine so writer and
+                // reader agree on the one routing key.
                 image.push((
-                    "__relation".to_string(),
+                    crate::revert::RELATION_STAMP.to_string(),
                     pgb_core::inverse::ImageValue::Text(cascade_rel.clone()),
                 ));
                 b = b.push_row(InverseRow::new(row.pk.clone(), image));
