@@ -42,7 +42,9 @@ use pgb_applyd::protocol::{
     INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, METHOD_NOT_FOUND_CODE,
 };
 use pgb_applyd::Service;
-use pgb_audit::{AuditBoot, LocalSecretStore, SecretStore, SharedSink, AUDIT_SIGNING_KEY_ID};
+use pgb_audit::{
+    AnchorRole, AuditBoot, LocalSecretStore, SecretStore, SharedSink, AUDIT_SIGNING_KEY_ID,
+};
 use pgb_cli::{ApprovalFlow, InMemoryNonceStore, RecordingWebhookSender};
 use pgb_clone_orchestrator::{PgApplyConn, PgRehearsal};
 use pgb_core::{Clock, NoopBarrier, SystemClock};
@@ -91,14 +93,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let anchor_interval_ms: u64 = env_or("PGB_ANCHOR_INTERVAL_MS", "60000").parse()?;
     let anchor_path = env_secret("PGB_ANCHOR_PATH")?;
 
+    // S5 #76 item 3: applyd defaults to the VERIFY-ONLY anchor role over the ONE
+    // shared chain — the proxy OWNS the anchor file + signing key and is the sole
+    // anchorer. applyd verifies the persisted chain against the owner's durable
+    // anchored head on boot (fail-closed on a mismatch) but never anchors, so there
+    // is exactly one anchorer over the shared chain (no two-anchorer race).
+    let anchor_role = AnchorRole::parse(
+        std::env::var("PGB_ANCHOR_ROLE").ok().as_deref(),
+        AnchorRole::Verify,
+    )
+    .map_err(|e| format!("{e} (fail-closed)"))?;
+
     let mut store = LocalSecretStore::new();
     store.put(AUDIT_SIGNING_KEY_ID, signing_key.as_bytes())?;
     let mut boot =
         AuditBoot::connect_with_anchor(&meta_dsn, &store, anchor_interval_ms, &anchor_path)
             .map_err(|e| format!("audit _meta boot failed (fail-closed): {e}"))?;
     let clock = SystemClock::new();
-    boot.verify_then_anchor(clock.monotonic_millis())
+    boot.boot(anchor_role, clock.monotonic_millis())
         .map_err(|e| format!("audit startup verification failed — refusing to start: {e}"))?;
+    eprintln!(
+        "pgb-applyd: audit `_meta` chain verified on startup (anchor role: {anchor_role:?}, \
+         anchor {anchor_path})"
+    );
     let sink = SharedSink::from_arc(boot.sink_arc());
 
     // The resident PG18 apply Client (the primary as the WALL role; never 5432).

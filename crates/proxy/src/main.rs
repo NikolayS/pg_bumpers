@@ -49,7 +49,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pgb_audit::{AuditBoot, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID};
+use pgb_audit::{AnchorRole, AuditBoot, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID};
 use pgb_core::{Clock, SystemClock};
 use pgb_policy::PolicyConfig;
 use pgb_proxy::config::{BackendTarget, TlsConfig};
@@ -162,25 +162,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handle over a DURABLE, file-backed WORM anchor: the shared sink + the
     // interval anchorer over the canonical chain, with the anchored head persisted
     // across restarts.
+    // S5 #76 item 3: the proxy is the DEFAULT anchor OWNER over the ONE shared
+    // chain — it owns the durable anchor file + signing key and is the sole
+    // anchorer. applyd (and any other consumer) boots VERIFY-ONLY against this
+    // owner's anchored head. Exactly one anchorer over the shared chain means no
+    // two-anchorer race; `PGB_ANCHOR_ROLE` can override (e.g. to make a different
+    // binary the owner).
+    let anchor_role = AnchorRole::parse(
+        std::env::var("PGB_ANCHOR_ROLE").ok().as_deref(),
+        AnchorRole::Owner,
+    )
+    .map_err(|e| format!("{e} (fail-closed)"))?;
+
     let mut boot =
         AuditBoot::connect_with_anchor(&meta_dsn, &store, anchor_interval_ms, &anchor_path)
             .map_err(|e| format!("audit _meta boot failed (fail-closed): {e}"))?;
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
-    // FAIL-CLOSED boot sequence — VERIFY BEFORE ANCHOR (SPEC §3/§10.9): verify the
-    // persisted `_meta` chain against the PRIOR durable anchored head FIRST, and
-    // only on a clean verify anchor the current head forward. Re-anchoring first
-    // would re-pin whatever head is now in `_meta` (incl. an offline-forged head)
-    // and make the verify trivially pass — the hole this ordering closes. A
-    // full-chain rewrite across a restart changes the head ⇒ mismatch ⇒ refuse to
-    // start. (Genesis/first boot: empty durable WORM, nothing to verify against
-    // yet; anchored as the baseline.) Any error here is a hard exit.
-    boot.verify_then_anchor(clock.monotonic_millis())
+    // FAIL-CLOSED boot sequence — for the OWNER, VERIFY BEFORE ANCHOR (SPEC
+    // §3/§10.9): verify the persisted `_meta` chain against the PRIOR durable
+    // anchored head FIRST, and only on a clean verify anchor the current head
+    // forward. Re-anchoring first would re-pin whatever head is now in `_meta`
+    // (incl. an offline-forged head) and make the verify trivially pass — the hole
+    // this ordering closes. A full-chain rewrite across a restart changes the head
+    // ⇒ mismatch ⇒ refuse to start. (Genesis/first boot: empty durable WORM,
+    // nothing to verify against yet; anchored as the baseline.) A VERIFY-only role
+    // checks but never anchors. Any error here is a hard exit.
+    boot.boot(anchor_role, clock.monotonic_millis())
         .map_err(|e| format!("audit startup verification failed — refusing to start: {e}"))?;
     eprintln!(
         "pgb-proxy: audit `_meta` chain verified against its durable anchored head on startup \
-         (anchor {anchor_path}, interval {anchor_interval_ms}ms)"
+         (anchor role: {anchor_role:?}, anchor {anchor_path}, interval {anchor_interval_ms}ms)"
     );
 
     // Inject the SAME shared sink into the proxy `Recorder` (the exact
@@ -189,12 +202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink: Arc<Mutex<dyn Sink + Send>> = boot.sink_arc();
     let recorder = Recorder::new(sink, clock.clone(), cfg.backend.role.clone());
 
-    // Run the interval anchorer in the background, ticking on the same injected
-    // clock cadence. `AuditBoot` (sync Postgres client) is driven under a Mutex
-    // from a spawned task; the tokio interval provides the cadence and the
-    // monotonic clock the due-check.
+    // Run the interval anchorer in the background ONLY when this binary OWNS the
+    // anchor (item 3) — a verify-only role must never anchor. The anchorer ticks
+    // on the same injected clock cadence; `AuditBoot` (sync Postgres client) is
+    // driven under a Mutex from a spawned task.
     let boot = Arc::new(Mutex::new(boot));
-    {
+    if anchor_role.is_owner() {
         let boot = boot.clone();
         let clock = clock.clone();
         let tick = Duration::from_millis(anchor_interval_ms.max(1));

@@ -963,3 +963,96 @@ success. Atomic co-commit (the audit row inside the apply txn) is a documented f
   proves the green scenario depends on the #75 guard. The catastrophic-FN ledger stays empty.
 - **Marquee:** CLASS 2 now applies the wide-column `SET notes = 'audited'` shape end-to-end
   through the assembled stack (bounded, approval-gated, reversibly committed).
+
+---
+
+## S5 #76 — audit-completeness + honesty fast-follow (refusals audited · cross-process appends serialized · single anchor owner · write-path intent populated · README truthful)
+
+**SPEC sections touched:** §3/§4 (deterministic floor, "records every statement
+incl. rejects"), §10 ("rejects recorded"), §10.9 (one anchored chain, root-of-trust),
+§15.1 (intent capture T0–T2, **captured/logged only** — RiskEngine stays a stub=Allow).
+
+**Issue:** #76 (S5 sprint-review fast-follow — five undisclosed audit-completeness +
+honesty gaps; none loosens the floor — every change is tighten-only / fail-closed).
+
+### Item 1 — propose/dry_run REFUSALS are now audited (was: ZERO trace)
+
+`Service::{propose,dry_run}` (`crates/applyd/src/service.rs`) returned a structural
+refusal (the "delete a DB"/DROP/TRUNCATE headline, a volatile/PK-less dry_run) with
+**no** `_meta` record — violating §3/§10 "rejects recorded". Now each refusal appends a
+`Decision::Block` record (carrying the refusal's stable `reason_code` + the verbatim
+statement + principal) to the SAME shared `_meta` chain BEFORE returning, via the same
+fail-closed append the apply path uses (`audit_refusal_then` → `audit_decision`). If the
+append itself fails, the caller gets `AUDIT_FAILED` (the refusal is reported as unrecorded
+rather than silently lost). Tests: `service_unit::{refused_propose_leaves_a_verifiable_meta_block_record,
+refused_dry_run_leaves_a_verifiable_meta_block_record}`.
+
+### Item 2 — cross-process audit appends serialized (was: a `UNIQUE(seq)` race)
+
+warden + applyd + proxy are **separate processes**, each with its own `PgSink`/`Client`.
+The in-process `SharedSink` mutex orders one process' appends, but two processes could both
+read head `N` and both INSERT seq `N+1`, colliding on `UNIQUE(seq)` → fatal to the live
+warden (`run.rs` treats an append failure as fatal) or a dropped record. `PgSink::append`
+(`crates/audit/src/pg.rs`) now wraps the head-read + insert in **one transaction** holding a
+fixed `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)`, serializing the read-then-insert across
+every appender. The lock auto-releases at commit/abort, so a crashing appender never wedges
+the chain; `UNIQUE(seq)`/`UNIQUE(record_hash)` remain as a loud last-resort backstop. IT:
+`concurrent_append_it::concurrent_appenders_from_two_connections_produce_a_contiguous_verifying_chain`
+(80 concurrent cross-connection appends → contiguous chain seq 0..79, verifies, no crash, no
+lost record; RED without the lock = backend error / lost record).
+
+### Item 3 — single anchor OWNER over the one shared chain (was: N uncoordinated anchorers)
+
+Proxy and applyd each ran their OWN anchorer with SEPARATE anchor files + SEPARATE signing
+keys over the ONE shared chain — so "one anchored chain" was really N uncoordinated
+anchorers, and a restart could fail-closed-deadlock against the other's head or re-baseline a
+tampered chain by anchoring first. **Decision:** designate exactly ONE anchor OWNER via a
+`PGB_ANCHOR_ROLE=owner|verify` flag (`AnchorRole` in `crates/audit/src/boot.rs`). The
+**proxy** is the default `owner` (the sole anchorer; it runs the interval anchorer + the
+verify-before-anchor boot). **applyd** (and any other consumer) is `verify` — it runs
+`AuditBoot::verify_only`: verify the persisted chain against the owner's durable anchored head
+(fail-closed on a mismatch) but **never anchor**, so a verify-only binary over a tampered
+chain REFUSES and crucially cannot re-baseline it. The `deploy/{proxy,applyd}.env.example`
+defaults are now COHERENT: the SAME signing key (`pgb-audit-signing-key-dev-000001`) + the
+SAME anchor file + an explicit `PGB_ANCHOR_ROLE` (proxy=`owner`, applyd=`verify`). Why the
+proxy is owner: it is the long-lived, always-on inline endpoint; applyd is the write-path
+daemon that may restart more often, so making it verify-only avoids anchor churn. The
+cross-restart fail-closed property from #64/#71 is preserved (the owner still
+verify-before-anchors; the verifier still refuses a forged head). Tests:
+`boot::tests::{anchor_role_parse_defaults_and_values, verify_only_does_not_anchor_when_no_owner_baseline_exists,
+verify_only_refuses_a_tampered_chain_and_never_rebaselines}` + the real-PG18 IT
+`single_anchor_owner_it::single_owner_anchors_verifier_verifies_concurrent_restart_clean_tamper_refused`
+(owner anchors one head; verify-only verifies WITHOUT anchoring across a concurrent restart;
+a tampered chain is REFUSED with no re-baseline).
+
+### Item 4 — write-path intent tiers POPULATED (was: `IntentTiers::default()` — empty)
+
+`Service::audit_apply` logged `IntentTiers::default()` (EMPTY) on every write, while the read
+path (`crates/proxy/src/recorder.rs`) populated it. The write path now populates the tiers
+from the data in hand via `IntentTiers::from_statement(role, statement, Some("applyd"))` (T0
+role + T1 SQL class + any `/* intent: … ticket: … actor: … */` annotation), matching the read
+path. This is **capture/log only** per §15.1 — the RiskEngine stays a stub=Allow and is NOT
+given teeth. The optional explicit-intent passthrough (MCP client → `intent` field) was left
+out: the statement-derived default is sufficient and works without it (disclosed as a
+non-requirement, not silently dropped). Test:
+`service_unit::apply_committed_meta_record_carries_populated_intent_tiers` (the apply-committed
+`_meta` record carries non-empty T0–T2, NOT the empty default).
+
+### Item 5 — README accuracy (honesty — the inverse of the S4 "doc != reality" lesson)
+
+`README.md` described S3/S4/S5 as in-progress/skeleton/upcoming, contradicting merged
+reality (underclaiming). Marked S0–S5 **merged · green on PG18**; present-tensed the wired
+layers (proxy is the audit anchor owner; reads through the proxy, writes through `pgb-applyd`;
+the warden is the runnable audited watchdog; one shared, persistent, anchored `_meta` chain);
+added `crates/applyd` (`pgb-applyd`), the `pgb-mcp` stdio shell, and `pgb-cli verify` to the
+component layout. The honest split-by-damage-class guarantee language (writes = 0 catastrophic
+FN by construction; reads = bounded ≤ B not zero; audit = tamper-evident) and the disclosed
+carve-outs are unchanged — no overclaim.
+
+### Honest scope (what this did NOT change)
+
+The deterministic floor is untouched — these are audit-completeness + serialization +
+topology + honesty fixes, every one tighten-only. The `_meta` audit append is still NOT
+atomically co-committed with the apply txn (the documented #75 ordering caveat stands). The
+RiskEngine is still a stub=Allow (§15.1). The optional MCP-passed explicit intent remains a
+disclosed non-requirement.
