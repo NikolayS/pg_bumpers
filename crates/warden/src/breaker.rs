@@ -18,10 +18,11 @@
 //! wire from an agent/operator carries no way to forge one. `trip`/`force_close`
 //! reject any other [`Principal`]. This is the **documented MVP interface** for
 //! the mTLS channel: the *state correctness + non-forgeability* are real and
-//! tested here, but the proxy-side wiring that consumes this state to actually
-//! shed traffic is **deferred** (#52 authorized the deferral; see
-//! `docs/spec/SPEC.amendments.md` §S4). In S4 this is a warden-side state
-//! machine only — no running proxy reads it yet.
+//! tested here. As of S5 (#65) the running warden **trips and audits** this
+//! breaker (a `BREAKER_TRIP` record on the `_meta` chain), but the **proxy-side
+//! wiring that consumes this state to actually shed traffic is still deferred**
+//! (#52 authorized the deferral; see `docs/spec/SPEC.amendments.md` §S5) — no
+//! running proxy reads it yet.
 
 use pgb_core::Clock;
 

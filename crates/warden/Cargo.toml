@@ -17,15 +17,28 @@ path = "src/lib.rs"
 name = "pgb-warden"
 path = "src/main.rs"
 
+[features]
+# The live PG18 seams (`PgActivitySource` / `PgKiller`) + the Postgres `_meta`
+# audit sink are behind a default-on `pg` feature, so the pure gating logic +
+# audit-record construction build/test without a `postgres` client when desired
+# (`--no-default-features`). The shipped binary + the env-gated integration test
+# (`PG_BUMPERS_IT=1`) both need this feature; it is on by default.
+default = ["pg"]
+pg = ["dep:postgres", "pgb-audit/pg"]
+
 [dependencies]
 pgb-core = { path = "../core" }
 pgb-policy = { path = "../policy" }
+# The warden now appends its enforcement actions (WARDEN_TERMINATE / BREAKER_TRIP
+# / SLOT_ALARM) to the SAME `_meta` hash-chained audit log the rest of the system
+# writes (SPEC §3/§4/§10.9). Default-features off here; the `pg` feature above
+# turns on the audit crate's Postgres `_meta` sink in lock-step with ours.
+pgb-audit = { path = "../audit", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
 thiserror = "2"
-
-[dev-dependencies]
-# A synchronous Postgres client for the env-gated real-PG18 integration test
-# (spawns agent-tagged backends, creates a replication slot, asserts the warden
-# detects + kills only agent-tagged sessions). Same client the proxy IT uses.
-postgres = "0.19"
+# A synchronous Postgres client for the live `ActivitySource` (`pg_stat_activity`
+# / `pg_replication_slots`) and `Killer` (`pg_terminate_backend`). Same MIT/Apache
+# client the proxy + audit `_meta` sink use, so it adds no new license surface and
+# keeps `cargo deny check` green. Feature-gated so the pure logic builds without it.
+postgres = { version = "0.19", optional = true }

@@ -329,6 +329,17 @@ seams that connect agent → MCP → proxy → `guarded_apply` → audit, and wa
    `PgActivitySource` / `PgKiller` on a `SystemClock` cadence) is **deferred to S5**
    (#65). Tracking: #18 (carry-forwards) and #65 (the filed S5 warden-wiring issue).
 
+   > **RESOLVED in S5 (#65) — the warden is now a RUNNING, AUDITED watchdog.** The
+   > §S5 "Runnable + audited warden" section below supersedes this item: `postgres`
+   > is now a real (feature-gated) `[dependencies]` entry, `PgActivitySource` /
+   > `PgKiller` live in the `pgb_warden` library, and `main()` loads its policy
+   > **fail-closed** (`PGB_POLICY_PATH`), builds the live seams + a `PgSink`-backed
+   > `_meta` audit chain, and drives the proven `WardenLoop` on a `SystemClock`
+   > cadence. Every enforcement action (`WARDEN_TERMINATE` / `BREAKER_TRIP` /
+   > `SLOT_ALARM`) is appended to the same `_meta` chain the rest of the system uses
+   > and verified read-back by the env-gated PG18 IT. The deterministic kill /
+   > breaker / slot logic proven in #52 is **unchanged**.
+
 2. **Circuit breaker — a warden-side state machine only; NOT consumed by the proxy.**
    `pgb_warden::CircuitBreaker` is a real, clock-driven, non-forgeable state machine
    (Closed → Open → HalfOpen), with the §10.9 authentication modelled at the type level
@@ -482,3 +493,76 @@ integration tests, not yet by a served transport. That end-to-end assembly (and 
 the audit chain that records the grant decision) stays under the S5 assembly EPIC (#63),
 with the audit unification under #64. So: the grant is now a real gate **at the apply
 seam**; making the whole running system route through that seam is the remaining S5 wiring.
+
+## S5 — Runnable + audited warden (the live, audited watchdog) — #65
+
+**SPEC sections touched:** §3 (layer-2 warden), §4 (poll 1–5s; cancel/terminate only
+agent-tagged; `_meta` audit), §10.9 (authenticated breaker; "the audited cannot write
+audit"). Build target: §7 S5. **Issues:** #65 (closes), building on #52 (the proven
+deterministic kill/breaker/slot logic) and coordinating with #64 (one unified `_meta`
+chain across proxy/CLI/warden).
+
+### What changed (behavior — the S4 stub is gone)
+
+S4 disclosed (item 1 above) that the warden **binary** was a print-only stub: `main()`
+only validated config and printed; `postgres` was a **dev-dependency**, so the binary
+could not open a connection; and no warden action was audited. **#65 makes the binary a
+real, running, audited watchdog**, without touching the deterministic enforcement
+semantics #52 proved:
+
+- **Runnable binary.** `postgres` moved from a dev-dependency to a real, **feature-gated**
+  (`pg`, default-on) `[dependencies]` entry. The live `PgActivitySource` (`pg_stat_activity`
+  / `pg_replication_slots`) and `PgKiller` (`pg_terminate_backend`) now live in the
+  `pgb_warden` **library** (`crates/warden/src/run.rs`, `pg` module). `main()` reads
+  `PGB_POLICY_PATH` → `WardenThresholds::from_policy_yaml` **fail-closed** (a
+  present-but-invalid `warden:` section, a missing/unreadable file, or a missing required
+  secret → refuse to start, **non-zero exit**), builds the live seams over real admin
+  connections, and drives the **existing** `WardenLoop` on a `SystemClock` cadence
+  (poll 1–5s, §4). The proven `WardenLoop` / `ActivitySource` / `Killer` seams are reused
+  verbatim — the gating logic was **not** forked.
+
+- **Audited actions.** `pgb-audit` is now a warden dependency. Every enforcement action is
+  appended to a `PgSink`-backed `_meta` hash-chained audit chain via the `crates/audit`
+  public API (`PgSink` / `Sink::append`): `WARDEN_TERMINATE` (one per terminated
+  agent-tagged pid), `SLOT_ALARM` (one per slot over the WAL ceiling), `BREAKER_TRIP` (when
+  the authenticated breaker opens). The records are `BLOCK` decisions subject-tagged to the
+  audited `pgb_agent` role and **written as the `pgb_audit_writer` role** (never the agent)
+  to the **same** `pgb_audit.audit_log` table the proxy/CLI use — so #64's external anchor
+  covers them. A **spared** shared session is a non-event: it produces **no** audit action
+  (the "spare-shared" invariant of #52 is preserved exactly).
+
+- **Moat unchanged.** Kill-only-agent-tagged, spare-shared, the deterministic breaker, and
+  the non-forgeable `WardenCredential` are **byte-for-byte** the #52 logic. #65 added only
+  the live wiring + the audit append.
+
+### Evidence (red→green; real PG18, env-gated, NEVER 5432)
+
+- **Unit (DB-free, red→green):** the pure `audit_entries_for` / `tick_and_audit` mapping is
+  TDD'd — a stub returning no records fails 5 tests (RED); the real mapping passes (GREEN).
+  Fail-closed config + the env-derived `WardenSettings` (defaults + the two required
+  secrets, no credential literals) are unit-tested.
+- **Integration (`PG_BUMPERS_IT=1`, dedicated port 54362):** the running watchdog over the
+  live `PgActivitySource` / `PgKiller` **terminates** a real agent-tagged runaway,
+  **spares** a shared session, **alarms** on a replication slot, **trips** the breaker —
+  and **each action lands on the `_meta` chain** (`["WARDEN_TERMINATE","SLOT_ALARM",
+  "BREAKER_TRIP"]`), which **`verify_chain`s** on read-back. A RED run with the audit append
+  neutered proves the assertion bites (the `_meta` chain is empty `[]`). The throwaway
+  cluster is torn down; **:5432 was verified untouched** before and after.
+
+### Coverage-floor note (honest)
+
+`pgb-warden`'s DB-free line coverage moved from 95.18% (S4) to ~86.6%. This is **not logic
+rot** — every gating module + the pure audit-record construction + the binary's config/DSN
+assembly remain >95% covered. The drop is the **new, inherently-DB-only** live seams
+(`run.rs`'s `pg` module, `run_loop`'s real sleep driver, the thin `main.rs`), which are 0%
+DB-free and proven **only** under the env-gated PG18 IT — exactly like `pgb-audit`'s `pg.rs`
+and `pgb-proxy`'s session loop. The floor (`.github/scripts/coverage_floor.py`) was
+adjusted 90% → 85% with that documented rationale; ratchet up as logic coverage grows.
+
+### Still deferred (not in #65's scope)
+
+The **proxy-side** consumption of the breaker (shedding agent traffic when `Open`) remains
+deferred (authorized in #52); #65 makes the warden *trip and audit* the breaker, but no
+running proxy reads that state yet. Unifying the warden/proxy/CLI onto one persisted +
+anchored `_meta` chain is #64 (the warden already appends via the shared `crates/audit`
+API to the same table, so it rebases cleanly onto #64).
