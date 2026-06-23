@@ -89,7 +89,7 @@ async function main(): Promise<void> {
   // already-lazy ApplydCore socket) so the MCP `initialize` / `tools/list`
   // handshake ALWAYS completes — even when the proxy/backend is down. A down
   // backend then surfaces as a RECOVERABLE per-read block (PROXY_UNAVAILABLE),
-  // never a process death that shows Claude Code a silent `✘ Failed to connect`.
+  // never a process death that shows Claude Code a silent "Failed to connect".
   // The session carries the proxy `application_name` tag so the out-of-band warden
   // (SPEC §3 layer 2) recognizes + can terminate an agent-tagged runaway read. NOT
   // a security control — the un-strippable anchor is the hardened agent role.

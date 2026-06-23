@@ -22,9 +22,10 @@ The dev/test substrate for pg_bumpers (SPEC §3, §7, §12). There are **three p
    [`docs/spec/SPEC.amendments.md`](../docs/spec/SPEC.amendments.md) → *"S0 integration
    substrate"* for the deviation, rationale, and how to re-validate compose live.
 
-Both paths model the same shape: a streaming-replication **primary**, an OPTIONAL
+Paths A and B model the same shape: a streaming-replication **primary**, an OPTIONAL
 streaming **replica** (off by default → proves the bare-primary baseline, SPEC §12),
-and a separate append-only **`_meta`** audit DB (SPEC §4).
+and a separate append-only **`_meta`** audit DB (SPEC §4). (Path C — the one-command
+`up.sh` demo — co-locates the `_meta` chain on the **primary** instead; see below.)
 
 ---
 
@@ -154,7 +155,10 @@ Claude Code**. It:
    meta `54323`, replica `54322`; **never** 5432), seeds a demo DB (`pgb_demo`) on the
    primary with the canonical `_meta` audit chain
    (`crates/audit/sql/10_audit_meta.sql`) and a single-int-PK `accounts` table, and
-   `GRANT`s the read surface to the WALL role `pgb_agent`;
+   `GRANT`s the read surface to the WALL role `pgb_agent`. NOTE: unlike Path A/B
+   (which host `_meta` in the **separate** meta cluster on `54323`), this demo
+   **co-locates** the `_meta` audit chain on the **primary** (`54321`/`pgb_demo`) so
+   the whole stack is one cluster — the chain integrity guarantees are unchanged;
 3. generates a **throwaway Ed25519 approver keypair** (the apply-time trust root; the
    seed stays out-of-band in the state dir, never enters the agent path);
 4. launches the **real binaries**, health-checking each:

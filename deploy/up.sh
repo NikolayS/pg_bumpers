@@ -311,6 +311,11 @@ PGB_APPROVER_SEED_HEX=$APPROVER_SEED
 DEMO_DB=$DEMO_DB
 PRIMARY_PORT=$PRIMARY_PORT
 ENV
+# connect.env aggregates the Ed25519 approver seed, the audit signing key, and the
+# meta DSN password — the same class of secret as approver.seed.hex (which IS
+# 0600). Lock it down to the owner for a consistent posture (defense-in-depth; the
+# real boundary is the proxy/applyd, not file perms).
+chmod 0600 "$STATE_DIR/connect.env"
 
 # Post-flight: :5432 must be untouched.
 POST_5432="$(port_listeners 5432)"

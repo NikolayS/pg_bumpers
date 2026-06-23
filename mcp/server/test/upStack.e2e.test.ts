@@ -262,6 +262,49 @@ suite("deploy/up.sh runnable stack — MCP reads THROUGH pgb-proxy, write floor 
     log(`PROXY PROOF #2: query(secret_data) → ${denied.code} — the WALL role the proxy connects as denied the non-granted table (raw superuser would not).`);
   });
 
+  it("a warden pg_terminate_backend on the agent-tagged session does NOT crash the MCP shell, and the next read RECOVERS (re-dials)", { timeout: 30_000 }, async () => {
+    // Establish a live proxy-brokered backend (the lazy dial opens on this read).
+    const before = await toolCall("query", { sql: "SELECT count(*) AS n FROM public.accounts" });
+    expect(before.status, JSON.stringify(before)).toBe("ok");
+
+    // Simulate the warden's SPEC §3 layer-2 action: terminate the agent-tagged
+    // backend session (application_name='pgb_proxy', role pgb_agent) the proxy
+    // originated. This makes node-postgres in the MCP shell emit an async
+    // EventEmitter 'error'. WITHOUT an 'error' listener that re-throws as an
+    // uncaught exception and kills the whole pgb-mcp stdio process; WITH the
+    // listener (this PR's fix) it is absorbed into a recoverable per-read block.
+    const killed = psql(
+      `SELECT count(*)::int FROM (
+         SELECT pg_terminate_backend(pid)
+           FROM pg_stat_activity
+          WHERE application_name = 'pgb_proxy' AND usename = 'pgb_agent' AND pid <> pg_backend_pid()
+       ) t`,
+      demoDb,
+    );
+    log(`warden kill: pg_terminate_backend on the agent-tagged session(s) → ${killed} terminated.`);
+
+    // Give the loss a moment to propagate to the MCP shell's Client emitter.
+    await new Promise((r) => setTimeout(r, 300));
+
+    // (a) the shell is STILL ALIVE — it did not silently die on the async error.
+    expect(mcp!.exitCode, `mcp shell must survive the warden kill; stderr:\n${mcpStderr}`).toBeNull();
+
+    // (b)+(c) the NEXT read recovers: the lazy wrapper dropped its dead connection
+    // and re-dials a fresh proxy-brokered backend, returning rows again. (A read on
+    // the just-killed connection may surface a one-shot recoverable PROXY block
+    // first; the retry contract is that a subsequent read succeeds — assert that.)
+    let recovered: any;
+    for (let i = 0; i < 5; i++) {
+      recovered = await toolCall("query", { sql: "SELECT count(*) AS n FROM public.accounts" });
+      if (recovered.status === "ok") break;
+      // A recoverable block on the first post-kill read is acceptable (retryable).
+      expect(recovered.retryable, JSON.stringify(recovered)).toBe(true);
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(recovered.status, `read must recover after the warden kill: ${JSON.stringify(recovered)}`).toBe("ok");
+    log(`RECOVERED: the next read after the warden kill re-dialled pgb-proxy and returned rows — no process death.`);
+  });
+
   it("DROP TABLE and TRUNCATE through propose_write are REFUSED (NOT_REHEARSABLE)", async () => {
     for (const sql of ["DROP TABLE public.accounts", "TRUNCATE public.accounts"]) {
       const proposed = await toolCall("propose_write", { sql, expected_rows: 0 });

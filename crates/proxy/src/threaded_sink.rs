@@ -149,3 +149,43 @@ impl Drop for ThreadedSink {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fail-closed start: connecting the audit relay to an endpoint with nothing
+    /// listening must return `SinkError::Backend` — NOT panic, NOT hang. The
+    /// dedicated thread connects the sync `PgSink`, its connect fails, the thread
+    /// reports the error over the readiness channel and exits, and `connect`
+    /// surfaces it. This is the audit-floor posture: no sink ⇒ refuse to start.
+    ///
+    /// `127.0.0.1:1` is the reserved TCP port (tcpmux) — effectively never bound,
+    /// so the connect is refused promptly without any live DB.
+    #[test]
+    fn connect_to_a_dead_endpoint_fails_closed_without_panic_or_hang() {
+        let dsn = "host=127.0.0.1 port=1 user=pgb_audit_writer dbname=_meta connect_timeout=2";
+        let result = ThreadedSink::connect(dsn);
+        match result {
+            Err(SinkError::Backend(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "the fail-closed error must carry the connect failure detail"
+                );
+            }
+            Err(other) => panic!("expected SinkError::Backend, got {other:?}"),
+            Ok(_) => panic!("connecting to a dead endpoint must NOT succeed"),
+        }
+    }
+
+    /// The readiness handshake never leaves a zombie thread: a failed `connect`
+    /// returns `Err` (proven above) and the spawned thread exits on its own (its
+    /// `run` returns after sending the error). A second failed connect behaves
+    /// identically — no shared state leaks between attempts.
+    #[test]
+    fn a_failed_connect_is_repeatable_and_leaves_no_state() {
+        let dsn = "host=127.0.0.1 port=1 user=pgb_audit_writer dbname=_meta connect_timeout=2";
+        assert!(ThreadedSink::connect(dsn).is_err());
+        assert!(ThreadedSink::connect(dsn).is_err());
+    }
+}

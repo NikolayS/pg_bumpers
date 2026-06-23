@@ -43,13 +43,20 @@ export interface PgQueryConfig {
   values?: unknown[];
 }
 
-/** The minimal `pg` Client surface this module uses (avoids @types/pg). */
+/**
+ * The minimal `pg` Client surface this module uses (avoids @types/pg). A real
+ * node-postgres `Client` is an `EventEmitter`; we include the `on` surface so the
+ * transport can attach an `'error'`/`'end'` listener — without one, a lost backend
+ * connection re-throws as an uncaught exception and kills the stdio process.
+ */
 export interface PgLikeClient {
   query(
     config: string | PgQueryConfig,
     values?: unknown[],
   ): Promise<{ rows: Row[]; rowCount: number | null }>;
   end(): Promise<void>;
+  on(event: "error", listener: (err: Error) => void): unknown;
+  on(event: "end", listener: () => void): unknown;
 }
 
 /** Connection details for the proxy endpoint (a Postgres wire endpoint). */
@@ -78,8 +85,72 @@ export interface PgProxyConfig {
 export class PgProxyTransport implements ProxyTransport {
   /** Monotonic counter for unique prepared-statement names (one per query). */
   private stmtSeq = 0;
+  /**
+   * Set once the underlying connection is lost (the `Client` emitted `'error'`
+   * or `'end'` — backend restart, idle TCP reset, or the warden calling
+   * `pg_terminate_backend` on the agent-tagged session; SPEC §3 layer 2). A dead
+   * transport never touches the wire again: every read short-circuits to a
+   * recoverable block, and `LazyProxyTransport` re-dials on the next read.
+   */
+  private dead = false;
+  /** The async error that killed the connection (surfaced in the block detail). */
+  private lostError: unknown;
+  /** Listeners notified once, when the connection is first lost (the lazy wrapper). */
+  private readonly lossListeners: Array<(err: unknown) => void> = [];
 
-  constructor(private readonly client: PgLikeClient) {}
+  constructor(private readonly client: PgLikeClient) {
+    // The node-postgres `Client` is an `EventEmitter`. It emits an ASYNC `'error'`
+    // whenever the backend connection is lost (restart / idle TCP reset / the
+    // warden's `pg_terminate_backend` on the agent-tagged session). An emitter
+    // with NO `'error'` listener re-throws that as an UNCAUGHT exception, which
+    // `main().catch()` cannot catch — it kills the entire `pgb-mcp` stdio
+    // process (the silent death this whole path exists to prevent). Attaching a
+    // listener converts the loss into a recorded, recoverable signal. We also
+    // listen for `'end'` (a clean server-side close) for the same reason.
+    this.client.on("error", (err) => this.markLost(err));
+    this.client.on("end", () => this.markLost(new Error("the proxy connection ended")));
+  }
+
+  /** Mark the connection lost (idempotent) and notify the loss listeners once. */
+  private markLost(err: unknown): void {
+    if (this.dead) return;
+    this.dead = true;
+    this.lostError = err;
+    for (const listener of this.lossListeners) {
+      try {
+        listener(err);
+      } catch {
+        // A listener must never re-introduce the crash this method prevents.
+      }
+    }
+  }
+
+  /** True once the underlying connection has been lost. */
+  isDead(): boolean {
+    return this.dead;
+  }
+
+  /**
+   * Register a callback invoked once when the connection is lost. If the
+   * connection is ALREADY lost, the callback fires synchronously (so a caller
+   * registering late still learns of the loss and can re-dial).
+   */
+  onLost(listener: (err: unknown) => void): void {
+    if (this.dead) {
+      listener(this.lostError);
+      return;
+    }
+    this.lossListeners.push(listener);
+  }
+
+  /**
+   * Wrap an already-constructed client (e.g. a test double) in the transport,
+   * attaching the same `'error'`/`'end'` listeners `connect()` does. Production
+   * code uses `connect()`; this is the seam tests use to drive the loss path.
+   */
+  static fromClient(client: PgLikeClient): PgProxyTransport {
+    return new PgProxyTransport(client);
+  }
 
   /**
    * Run `sql` over the EXTENDED protocol (Parse/Bind/Execute) by giving it a
@@ -119,6 +190,11 @@ export class PgProxyTransport implements ProxyTransport {
   }
 
   async query(sql: string, _intent: IntentTiers): Promise<QueryResult> {
+    // If the connection was already lost, never touch the wire — surface the
+    // recoverable block so the lazy wrapper re-dials on the next read.
+    if (this.dead) {
+      return { outcome: "blocked", block: lostBlock(this.lostError) };
+    }
     // Defence-in-depth: the live transport refuses anything not provably a read.
     // The real read-only guarantee is the proxy/WALL; this just makes the live
     // client honest about its lane.
@@ -137,15 +213,30 @@ export class PgProxyTransport implements ProxyTransport {
       const res = await this.extendedQuery(sql);
       return { outcome: "rows", rows: res.rows, rowCount: res.rowCount ?? res.rows.length };
     } catch (err) {
-      // The proxy/WALL denied the read at the deterministic floor (e.g. the WALL
-      // role lacks SELECT → permission denied; a budget cutoff; a read-only
-      // rejection). Surface it as the RECOVERABLE block contract the server
-      // relays verbatim, NOT an opaque thrown error.
+      // A query that fails because the CONNECTION itself was lost (the warden's
+      // `pg_terminate_backend`, a backend restart, an idle TCP reset) can arrive as
+      // a synchronous query rejection BEFORE the async `'error'` event fires. Treat
+      // it as a recoverable loss: mark dead so the lazy wrapper re-dials, and
+      // surface the retryable `PROXY_UNAVAILABLE` (never a non-retryable brick).
+      if (isConnectionLost(err)) {
+        this.markLost(err);
+        return { outcome: "blocked", block: lostBlock(err) };
+      }
+      // Otherwise the proxy/WALL denied the read at the deterministic floor (e.g.
+      // the WALL role lacks SELECT → permission denied; a budget cutoff; a
+      // read-only rejection). Surface it as the RECOVERABLE block contract the
+      // server relays verbatim, NOT an opaque thrown error.
       return { outcome: "blocked", block: backendBlock(err) };
     }
   }
 
   async discoverSchema(): Promise<SchemaColumn[]> {
+    // discoverSchema has no block channel; throwing is caught by the server's
+    // tool dispatch and relayed as a structured error (the lazy wrapper re-dials
+    // on the next read). Never touch a dead wire.
+    if (this.dead) {
+      throw new Error(lostBlock(this.lostError).reason);
+    }
     const res = await this.extendedQuery(
       `SELECT table_schema AS schema, table_name AS table,
               column_name AS column, data_type AS type
@@ -162,6 +253,11 @@ export class PgProxyTransport implements ProxyTransport {
   }
 
   async explain(sql: string): Promise<PlanResult | { blocked: import("./blockContract.js").BlockBody }> {
+    // If the connection was already lost, surface the recoverable block (the lazy
+    // wrapper re-dials on the next read) rather than touching a dead wire.
+    if (this.dead) {
+      return { blocked: lostBlock(this.lostError) };
+    }
     // Defence-in-depth (mirrors `query` above): the raw caller SQL is about to be
     // interpolated into `EXPLAIN (FORMAT JSON) ${sql}`. Postgres runs that as a
     // simple-query string, so a stacked second statement (`SELECT 1; DROP TABLE
@@ -182,7 +278,13 @@ export class PgProxyTransport implements ProxyTransport {
     try {
       res = await this.extendedQuery(`EXPLAIN (FORMAT JSON) ${sql}`);
     } catch (err) {
-      // A WALL/floor denial during planning is a recoverable block, not a throw.
+      // A lost connection (warden terminate / restart / reset) is a recoverable
+      // loss: mark dead so the lazy wrapper re-dials, and surface the retryable
+      // PROXY_UNAVAILABLE. Anything else is a WALL/floor denial during planning.
+      if (isConnectionLost(err)) {
+        this.markLost(err);
+        return { blocked: lostBlock(err) };
+      }
       return { blocked: backendBlock(err) };
     }
     const planRow = res.rows[0] as Record<string, unknown> | undefined;
@@ -193,8 +295,10 @@ export class PgProxyTransport implements ProxyTransport {
     return { plan: JSON.stringify(planJson), cost };
   }
 
-  /** Close the underlying connection. */
+  /** Close the underlying connection. Idempotent after a loss. */
   async close(): Promise<void> {
+    // Mark dead first so the `'end'`/`'error'` our own `end()` may emit is a no-op.
+    this.dead = true;
     await this.client.end();
   }
 }
@@ -232,4 +336,52 @@ function backendBlock(err: unknown): import("./blockContract.js").BlockBody {
     remedy: "adjust the statement to a permitted read, or use the write lifecycle for changes",
     retryable: false,
   };
+}
+
+/**
+ * The recoverable block returned when a read hits a connection that was already
+ * LOST (the warden's `pg_terminate_backend`, a backend restart, an idle TCP
+ * reset). It is `retryable` because the stack typically recovers and the lazy
+ * wrapper re-dials on the next read — this is what turns the async EventEmitter
+ * `'error'` (which would otherwise crash the process) into a recoverable signal.
+ */
+function lostBlock(err: unknown): import("./blockContract.js").BlockBody {
+  const detail = err instanceof Error ? err.message : err == null ? "connection lost" : String(err);
+  return {
+    code: "PROXY_UNAVAILABLE",
+    reason: `the proxy connection was lost: ${detail}`,
+    remedy:
+      "the backend session ended (e.g. a warden terminate, restart, or idle reset); retry — the read will re-dial the proxy",
+    retryable: true,
+  };
+}
+
+/**
+ * Was this read error caused by the CONNECTION being lost (rather than a
+ * proxy/WALL/floor denial of the statement)? A lost connection can surface as a
+ * synchronous query rejection BEFORE the async EventEmitter `'error'` fires — the
+ * warden's `pg_terminate_backend` on the agent-tagged session, a backend restart,
+ * or an idle TCP reset. node-postgres reports these as a connection-terminated
+ * message (no SQLSTATE) or one of the connection-class SQLSTATEs / socket errnos.
+ * Such an error is RECOVERABLE (re-dial), NOT a permanent `PROXY_BLOCKED` brick.
+ */
+function isConnectionLost(err: unknown): boolean {
+  const e = (err ?? {}) as PgError & { errno?: string };
+  // Connection-class SQLSTATEs: 08xxx (connection exception family), and the
+  // admin-shutdown / crash-shutdown codes the backend sends on termination.
+  const code = e.code ?? "";
+  if (code.startsWith("08") || code === "57P01" || code === "57P02" || code === "57P03") {
+    return true;
+  }
+  // node-postgres connection-loss messages / socket errnos (no SQLSTATE).
+  const message = (e.message ?? "").toLowerCase();
+  return (
+    message.includes("connection terminated") ||
+    message.includes("connection ended") ||
+    message.includes("server closed the connection") ||
+    message.includes("econnreset") ||
+    message.includes("epipe") ||
+    code === "ECONNRESET" ||
+    code === "EPIPE"
+  );
 }

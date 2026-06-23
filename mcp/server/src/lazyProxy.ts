@@ -7,7 +7,7 @@
  * connect — even when the proxy/backend is down. The previous shell connected
  * the proxy eagerly (a real libpq round-trip) BEFORE the JSON-RPC read loop, so a
  * down backend killed the process with zero MCP bytes and Claude Code only saw a
- * silent `✘ Failed to connect`.
+ * silent "Failed to connect".
  *
  * `ApplydCore` is already lazy (its socket connects on the first RPC). This
  * mirrors that for the read path: the underlying `PgProxyTransport.connect(...)`
@@ -40,6 +40,13 @@ function connectBlock(err: unknown): BlockBody {
 }
 
 /**
+ * How `LazyProxyTransport` opens a live transport. Defaults to the real
+ * `PgProxyTransport.connect`; tests inject a fake to drive the connection-loss
+ * path (the warden `pg_terminate_backend` / TCP reset / restart) deterministically.
+ */
+export type ProxyDial = (config: PgProxyConfig) => Promise<PgProxyTransport>;
+
+/**
  * A `ProxyTransport` that defers `PgProxyTransport.connect(...)` to the first
  * read. A failed connect is returned as a recoverable block (per method) instead
  * of throwing, so the MCP handshake is never blocked on backend availability.
@@ -51,20 +58,43 @@ export class LazyProxyTransport implements ProxyTransport {
   /** The most recent dial error (for the block detail). */
   private lastError: unknown;
 
-  constructor(private readonly config: PgProxyConfig) {}
+  constructor(
+    private readonly config: PgProxyConfig,
+    private readonly dial: ProxyDial = PgProxyTransport.connect,
+  ) {}
 
   /**
    * Resolve the live transport, dialing once on first use. Returns `undefined`
    * (NOT a throw) if the connection cannot be established, so each caller can
    * surface its own recoverable block. A failed dial is not cached — a later
    * read retries (the stack may have come up in the meantime).
+   *
+   * When a dial succeeds we register an `onLost` callback on the live transport.
+   * node-postgres emits an async `'error'` whenever the backend connection drops
+   * (a backend restart, an idle TCP reset, or the warden calling
+   * `pg_terminate_backend` on the agent-tagged session; SPEC §3 layer 2). The
+   * transport turns that into a `onLost` signal here; we DROP the cached
+   * connection so the NEXT read RE-DIALS (reconnect) instead of reusing a dead
+   * client — and the lost client never crashes the process.
    */
   private async ensure(): Promise<PgProxyTransport | undefined> {
+    // A cached-but-dead transport (its connection was lost) must be re-dialled.
+    if (this.connected && this.connected.isDead()) {
+      this.connected = undefined;
+    }
     if (this.connected) return this.connected;
     if (this.dialing) return this.dialing;
-    this.dialing = PgProxyTransport.connect(this.config)
+    this.dialing = this.dial(this.config)
       .then((t) => {
-        this.connected = t;
+        // Drop the cache the moment THIS connection is lost so the next read
+        // re-dials. `onLost` fires synchronously if it is already dead.
+        t.onLost((err) => {
+          this.lastError = err;
+          if (this.connected === t) this.connected = undefined;
+        });
+        // Guard against a loss that landed between connect and listener attach
+        // (`onLost` already covers the already-dead case, but be explicit).
+        if (!t.isDead()) this.connected = t;
         return t;
       })
       .catch((err) => {

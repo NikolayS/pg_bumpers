@@ -1,7 +1,7 @@
 /**
  * Lazy-connect contract for the deployable stdio MCP shell (`pgb-mcp`).
  *
- * Regression guard for the silent `✘ Failed to connect` Claude Code showed when
+ * Regression guard for the silent "Failed to connect" Claude Code showed when
  * the proxy/backend was down: the shell USED to connect the proxy eagerly BEFORE
  * the JSON-RPC read loop, so a down backend killed the process with zero MCP
  * bytes and the `initialize` handshake never completed.
