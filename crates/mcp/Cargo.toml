@@ -35,6 +35,12 @@ serde_json = "1"
 # cooperative fast-path — we do NOT re-implement a classifier. The proxy enforces
 # independently (the MCP classifier is a fast-path, not the boundary).
 pgb-pgwire = { path = "../pgwire" }
+# The §11.2 T0–T2 intent-capture schema (`IntentTiers::from_statement`) + the §11.5
+# RiskEngine stub (`AllowStub` returns Allow; captured/logged only, NEVER given
+# teeth). The write tools capture intent from the statement (like the proxy/applyd
+# path) and surface the stub verdict in dry_run — the deterministic floor (applyd)
+# is the guarantee, not this seam. REUSED, never re-implemented.
+pgb-policy = { path = "../policy" }
 # The async wire to the proxy's agent endpoint. The read path goes THROUGH the
 # live `pgb-proxy` (the real boundary), exactly as the TS `PgProxyTransport`
 # does — `tokio-postgres` (extended-protocol-only, which the proxy requires) over
@@ -62,8 +68,19 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "ne
 # of live PG18 and drives the read tools THROUGH it. Reuses the proxy's own
 # integration harness deps (all cargo-deny-approved permissive licenses).
 pgb-proxy = { path = "../proxy" }
-pgb-policy = { path = "../policy" }
+# `pgb-policy` is a main dependency (intent capture + the RiskEngine stub); the
+# e2e tests reuse it for the budget/policy fixtures too.
 pgb-core = { path = "../core" }
+# The env-gated write-path e2e spawns the REAL pgb-applyd binary (Unix socket) in
+# front of live PG18 and drives the write tools THROUGH it. The dep makes cargo
+# build the binary + set CARGO_BIN_EXE_pgb-applyd for the test to exec.
+pgb-applyd = { path = "../applyd" }
 postgres = "0.19"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# The write-path e2e mints the Ed25519 approver keypair (the apply-time trust root)
+# + does the operator `approve` hop OUT-of-band over the applyd socket. Same crates
+# / versions the applyd IT pins (all BSD/MIT — cargo-deny-approved).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"

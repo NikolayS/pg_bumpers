@@ -9,19 +9,23 @@
 //! ```
 //!
 //! connects a real Claude Code to it. The handshake (`initialize`) +
-//! `tools/list` + `tools/call` work end-to-end. PR2 wires the **read path**:
+//! `tools/list` + `tools/call` work end-to-end. PR2 wired the **read path**:
 //! `query` / `explain_plan` / `discover_schema` execute THROUGH the live
 //! `pgb-proxy` (the real boundary, NOT raw PG), and `get_audit` reads the `_meta`
-//! audit tail. The four write tools return the recoverable `UNIMPLEMENTED` block
-//! (writes land in #83 PR3).
+//! audit tail. PR3 wires the **write path**: `propose_write` / `dry_run` /
+//! `request_elevation` / `apply_write` execute THROUGH the `pgb-applyd` Unix-socket
+//! daemon (the grant-gated §4 floor). applyd stays a SEPARATE daemon — the write
+//! credential never enters this agent-facing process.
 //!
 //! Honesty (SPEC §3): this server is COOPERATIVE, not a security boundary. The
 //! deterministic floor (proxy + WALL + applyd + warden) is the real boundary.
 //!
-//! Lazy-connect: the binary starts even if the proxy is down — the first read
-//! dials, and a down proxy is a recoverable `PROXY_UNAVAILABLE` block, never a
-//! crash. A dropped / warden-killed connection is absorbed and re-dialed on the
-//! next read (no uncaught failure kills the process).
+//! Lazy-connect: the binary starts even if the proxy/applyd are down — the first
+//! read dials the proxy, the first write dials the applyd socket, and a down
+//! proxy/applyd is a recoverable `PROXY_UNAVAILABLE` / `APPLYD_UNAVAILABLE` block,
+//! never a crash. A dropped / warden-killed proxy connection or a reset applyd
+//! socket is absorbed and re-dialed on the next call (no uncaught failure kills the
+//! process).
 //!
 //! Environment (mirrors the deploy stack's `connect.env` / `PgProxyTransport`):
 //!   - `PGB_ROLE`            — the authenticated role (T0). Default `pgb_agent`.
@@ -37,12 +41,19 @@
 //!     Default: TLS-on iff a CA is configured.
 //!   - `PGB_PROXY_TLS_CA`    — PEM path of trust anchors to verify the proxy cert.
 //!   - `PGB_STATEMENT_TIMEOUT_MS` — client-side statement_timeout (default 30000).
+//!   - `PGB_APPLYD_SOCKET`   — the `pgb-applyd` Unix-socket path the write tools
+//!     dial (optional; without it the write tools return a recoverable
+//!     `APPLYD_UNAVAILABLE` block). NEVER a TCP port.
+//!   - `PGB_APPLYD_TIMEOUT_MS` — per-call applyd round-trip timeout (default 30000).
 //!   - `PGB_META_DSN`        — the `_meta` reader DSN for `get_audit` (optional;
 //!     without it `get_audit` returns a recoverable `AUDIT_UNAVAILABLE` block).
 
 use std::process::ExitCode;
 
-use pgb_mcp::{AuditConfig, AuditReader, PgBumpersMcp, ProxyConfig, ProxyTransport, TlsMode};
+use pgb_mcp::{
+    ApplydClient, ApplydConfig, AuditConfig, AuditReader, PgBumpersMcp, ProxyConfig,
+    ProxyTransport, TlsMode,
+};
 use rmcp::{ServiceExt, transport::stdio};
 
 /// Read an env var, falling back to `default` when unset or empty.
@@ -123,7 +134,31 @@ fn build_server() -> Result<PgBumpersMcp, String> {
             .parse()
             .map_err(|e| format!("PGB_STATEMENT_TIMEOUT_MS is not a number: {e}"))?,
     };
+    let role_for_writes = env_or("PGB_ROLE", "pgb_agent");
+    let session_for_writes = env_or("PGB_SESSION_ID", format!("mcp-{}", std::process::id()));
     let mut server = PgBumpersMcp::new(role, session_id).with_proxy(ProxyTransport::new(proxy_cfg));
+
+    // The write tools dial the `pgb-applyd` Unix socket. Optional: if unset, the
+    // write tools return a recoverable APPLYD_UNAVAILABLE block. The role/session
+    // are pinned into applyd's stored proposal record at propose (the apply
+    // re-derives from them — the agent can never swap them at apply time). The
+    // write credential lives in the SEPARATE applyd daemon, never here.
+    if let Ok(socket_path) = std::env::var("PGB_APPLYD_SOCKET")
+        && !socket_path.is_empty()
+    {
+        let timeout_ms = env_or(
+            "PGB_APPLYD_TIMEOUT_MS",
+            pgb_mcp::DEFAULT_TIMEOUT_MS.to_string(),
+        )
+        .parse()
+        .map_err(|e| format!("PGB_APPLYD_TIMEOUT_MS is not a number: {e}"))?;
+        server = server.with_applyd(ApplydClient::new(ApplydConfig {
+            socket_path,
+            role: role_for_writes,
+            session_id: session_for_writes,
+            timeout_ms,
+        }));
+    }
 
     // `get_audit` reads the `_meta` audit tail through a reader DSN. Optional: if
     // unset, `get_audit` returns a recoverable AUDIT_UNAVAILABLE block.

@@ -857,12 +857,16 @@ dependencies = [
 name = "pgb-mcp"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "pgb-applyd",
  "pgb-audit",
  "pgb-core",
  "pgb-pgwire",
  "pgb-policy",
  "pgb-proxy",
  "postgres",
+ "rand_core 0.6.4",
  "rcgen",
  "rmcp",
  "rustls",
