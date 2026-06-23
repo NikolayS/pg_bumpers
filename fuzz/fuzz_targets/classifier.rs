@@ -11,25 +11,59 @@
 //!    classified as a safe single `Read`. We assert this two ways:
 //!      a. If the classifier ever says `Read`, the reason is `None` and a
 //!         re-classification is stable (`Read` is deterministic).
-//!      b. We synthesize inputs we KNOW are unsafe — by appending a stacked
-//!         write statement (`; DROP TABLE …` / `; UPDATE …` etc.) to the fuzzer
-//!         text — and assert the classifier NEVER returns `Read` for them.
-//!         This is the property a deliberately-broken classifier (one that
-//!         classifies a `DROP` as a read) would fail, proving the target's
-//!         teeth.
+//!      b. We synthesize inputs we KNOW are genuinely two statements — by
+//!         appending a stacked write statement (`; DROP TABLE …` / `; CREATE …`
+//!         etc.) onto a base that is *itself* a clean single `Read` — and assert
+//!         the classifier NEVER returns `Read` for the result. This is the
+//!         property a deliberately-broken classifier (one that classifies a
+//!         `DROP` as a read) would fail, proving the target's teeth.
 //!
 //! The fuzzer drives both: it controls the base SQL text AND which unsafe
 //! suffix to append.
+//!
+//! ## Oracle correctness — why the stack uses a newline and a base guard
+//!
+//! Naively building the stacked input as `format!("{base} ; {tail}")` and
+//! asserting it is never `Read` is **unsound**: SQL text that ends *mid-token*
+//! swallows whatever we append, so the "stacked write" never actually becomes a
+//! second statement. Concretely:
+//!
+//!   * a base ending in an **unterminated `--` line comment** (e.g. the fuzz
+//!     base `VALUES (1)--\x05`) comments out a ` ; CREATE TABLE …` tail entirely
+//!     — the whole thing is one legitimate read, so `classify` correctly returns
+//!     `Read` and the naive oracle false-fails;
+//!   * the same swallowing happens for a base ending in an **open `/* … */`
+//!     block comment**, an **open string literal** (`SELECT 'oops`), or an
+//!     **open dollar-quote** (`SELECT $$oops`) — all of which consume the tail.
+//!
+//! The classifier is byte-for-byte faithful to PostgreSQL here (only `\n`/`\r`
+//! terminate a `--` comment; an open block-comment/string/dollar-quote runs to
+//! its closer), so the bug is in the *oracle*, not the classifier. We fix the
+//! oracle two ways, belt-and-braces:
+//!
+//!   1. **Separate the tail with a real newline** (`"{base}\n; {tail}"`). A `\n`
+//!      ends a `--` comment, so an unterminated-line-comment base can no longer
+//!      swallow the appended write.
+//!   2. **Only assert the stacked invariant when `base` is itself a clean single
+//!      `Read`.** If `classify(base) == Read`, the base parsed to exactly one
+//!      read statement with no dangling open comment/string/dollar-quote (those
+//!      all classify `NotRead`/`ParseError`), so appending `\n; <write>` is
+//!      *genuinely* a second statement. This ties the oracle to the actual
+//!      statement structure rather than to the syntactic presence of `;`+tail.
+//!
+//! Together these make 2b assert the real invariant — "a genuinely-stacked write
+//! must never classify as a safe read" — with no false positives. The bare-tail
+//! assertion (a lone write must be `NotRead`) is unconditional and unaffected.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pgb_pgwire::{classify, classify_with_reason, Classification};
+use pgb_pgwire::{Classification, classify, classify_with_reason};
 
 /// Statements that are unambiguously NOT a safe single read. Appending any of
-/// these (statement-stacked) to ANY base text yields input that the classifier
-/// must reject — either as a write, a multi-statement, or a parse error. Never
-/// as `Read`.
+/// these (statement-stacked, newline-separated) onto a base that is itself a
+/// clean single read yields input the classifier must reject — as a write, a
+/// multi-statement, or a parse error. Never as `Read`.
 const UNSAFE_TAILS: &[&str] = &[
     "DROP TABLE users",
     "DELETE FROM accounts",
@@ -42,6 +76,13 @@ const UNSAFE_TAILS: &[&str] = &[
     "COPY t FROM PROGRAM 'sh'",
 ];
 
+// A non-fuzz, CI-run regression harness for this exact oracle (the known
+// false-positive bytes + real-stacked-write teeth) lives in the workspace test
+// `crates/pgwire/tests/classifier.rs`, which `cargo test --workspace` runs on
+// the pinned stable toolchain. We deliberately do NOT add `#[cfg(test)]` units
+// here: this `[[bin]]` is `test = false` (libFuzzer convention — its `main` is
+// the libFuzzer entrypoint, so `cargo test` would *run the fuzzer*, not Rust
+// unit tests), so any in-file tests would be dead code that never executes.
 fuzz_target!(|data: &[u8]| {
     // Need valid UTF-8 to feed &str; non-UTF-8 inputs are simply skipped (the
     // classifier only ever sees decoded protocol strings, which are UTF-8).
@@ -65,20 +106,25 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // --- Invariant 2b: fail-closed teeth. Stacking a known write onto ANY base
-    // must NEVER classify as a safe single read. The fuzzer picks the tail. ---
+    // --- Invariant 2b: fail-closed teeth. A *genuinely* two-statement input
+    // (base + stacked write) must NEVER classify as a safe single read. ---
     let tail = UNSAFE_TAILS[(data.first().copied().unwrap_or(0) as usize) % UNSAFE_TAILS.len()];
 
-    // `base ; <write>` — statement-stacked, the classic `SELECT 1; DROP …`
-    // bypass. Must be NotRead (MultipleStatements / ParseError / NotARead).
-    let stacked = format!("{base} ; {tail}");
-    assert_ne!(
-        classify(&stacked),
-        Classification::Read,
-        "SAFETY VIOLATION: stacked write classified as a safe read: {stacked:?}"
-    );
+    // Only assert when the base is itself a clean single read: that guarantees
+    // it has no dangling open `--`/`/* */`/string/dollar-quote that would
+    // swallow the appended tail (those all classify NotRead/ParseError). The
+    // newline before `;` additionally terminates any trailing `--` line comment
+    // so the write becomes a real second statement, not commented-out text.
+    if cls == Classification::Read {
+        let stacked = format!("{base}\n; {tail}");
+        assert_ne!(
+            classify(&stacked),
+            Classification::Read,
+            "SAFETY VIOLATION: genuinely-stacked write classified as a safe read: {stacked:?}"
+        );
+    }
 
-    // The bare write alone must also never be a read.
+    // The bare write alone must also never be a read — unconditional.
     assert_ne!(
         classify(tail),
         Classification::Read,

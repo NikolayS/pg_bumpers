@@ -121,3 +121,61 @@ fn empty_input_is_not_read() {
     assert_eq!(cls, Classification::NotRead);
     assert_eq!(reason, Some(NotReadReason::Empty));
 }
+
+/// Comment-boundary fidelity with PostgreSQL — the root-cause evidence for the
+/// classifier-fuzz-oracle false positive.
+///
+/// The classifier is byte-for-byte faithful to PostgreSQL's lexer on where a
+/// `--` line comment ends: ONLY a newline (`\n`) or carriage return (`\r`)
+/// terminates it. A control byte such as `\x05` does NOT end the comment, so
+/// everything after `--` (up to the next newline / end of input) is commented
+/// out — including a `;`-separated statement appended after it. This is
+/// *correct*, fail-closed behavior; the fuzz oracle's old `format!("{base} ; …")`
+/// construction wrongly assumed the appended write always became a second
+/// statement. These tests pin the classifier behavior so the (unchanged,
+/// PG-faithful) classifier cannot silently drift.
+#[test]
+fn unterminated_line_comment_swallows_appended_text_like_postgres() {
+    // The exact bytes that tripped the old fuzz oracle: a complete read whose
+    // trailing `-- …\x05` comment runs to end-of-input. This is a single read.
+    assert_read("VALUES (1)--\u{05}");
+
+    // Appending `; CREATE TABLE …` after the unterminated comment changes
+    // nothing: the whole tail is inside the `--` comment, so it stays a single
+    // read — exactly as PostgreSQL would parse it. (This is why the old oracle
+    // false-fired; the classifier is right.)
+    assert_read("VALUES (1)--\u{05} ; CREATE TABLE t (id int)");
+
+    // A control byte mid-comment does not terminate it either.
+    assert_read("SELECT 1 -- note\u{05} still a comment");
+}
+
+#[test]
+fn newline_terminates_line_comment_restoring_the_stack() {
+    // The moment a real newline ends the `--` comment, the appended statement
+    // becomes a genuine SECOND statement — caught as statement-stacking. This is
+    // the newline the fixed fuzz oracle inserts before `;`.
+    let (cls, reason) = classify_with_reason("VALUES (1)--\u{05}\n; CREATE TABLE t (id int)");
+    assert_eq!(cls, Classification::NotRead);
+    assert_eq!(reason, Some(NotReadReason::MultipleStatements));
+
+    // A carriage return ends a `--` comment too.
+    assert_not_read("SELECT 1 -- c\r; DROP TABLE x");
+}
+
+#[test]
+fn open_block_comment_string_and_dollar_quote_are_not_a_clean_read() {
+    // An unterminated `/* … */` block comment, an open string literal, and an
+    // open dollar-quote all fail to parse (run past end-of-input) and are
+    // fail-closed NOT-READ — so they are never a clean single read that a
+    // stacked-write oracle could build on.
+    assert_not_read("SELECT 1 /* open block comment");
+    assert_not_read("SELECT 'open string literal");
+    assert_not_read("SELECT $$open dollar quote");
+
+    // Appending a `;`-stacked write to any of them stays NOT-READ (the open
+    // token swallows it / it still fails to parse) — never a Read.
+    assert_not_read("SELECT 1 /* open\n; CREATE TABLE t (id int)");
+    assert_not_read("SELECT 'open\n; DROP TABLE x");
+    assert_not_read("SELECT $$open\n; DELETE FROM accounts");
+}
