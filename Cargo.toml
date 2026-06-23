@@ -18,6 +18,15 @@ members = [
     # MCP server's ApplydCore wires to it. NOT TCP, NOT agent-reachable.
     # publish = false.
     "crates/applyd",
+    # The agent-facing MCP server (EPIC #83): the §4 nine-tool catalog speaking
+    # the REAL Model Context Protocol over stdio via the official `rmcp` SDK, so
+    # `claude mcp add pg-bumpers -- pgb-mcp` connects to a real Claude Code. This
+    # is the Rust replacement for the TS `mcp/server` (consolidation EPIC #83). It
+    # is COOPERATIVE, NOT a security boundary (SPEC §3): the deterministic floor
+    # (proxy + WALL + applyd + warden) is the real boundary. PR1 = skeleton
+    # (handshake + catalog + whoami); read paths land in PR2, writes in PR3.
+    # publish = false.
+    "crates/mcp",
     # Throwaway S0 fidelity-spike harness (issue #8). publish = false; not
     # production. Kept in the workspace only so it compiles under the fast CI job;
     # its DB tests are env-gated (PG_BUMPERS_IT=1) and skipped by `cargo test`.

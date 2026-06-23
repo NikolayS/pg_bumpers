@@ -172,7 +172,8 @@ crates/
   applyd/             # write-path daemon owning propose→dry_run→approve→apply over the floor; binary `pgb-applyd` (owner-only Unix socket)
   warden/             # runnable, audited out-of-band watchdog + circuit breaker
   cli/                # operator approval flow + `pgb-cli verify` (load + verify the shared `_meta` chain + anchored head); binary `pgb-cli`
-mcp/server/           # MCP server (TypeScript) — agent-facing layer; `pgb-mcp` stdio shell over the Rust floor
+  mcp/                # agent-facing MCP server (Rust, via the `rmcp` SDK); §4 nine-tool catalog over stdio; binary `pgb-mcp` (EPIC #83; replaces mcp/server)
+mcp/server/           # MCP server (TypeScript) — agent-facing layer; being replaced by the Rust `crates/mcp` (EPIC #83; removed in PR4)
 spikes/fidelity/      # S0 throwaway fidelity-spike harness (gate; publish=false)
 deploy/               # local-stack.sh (live substrate) + docker-compose (shipped artifact) + WALL SQL/hba
 proto/                # protocol/IDL definitions (added as protocols solidify)
