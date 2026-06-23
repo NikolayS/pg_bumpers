@@ -61,20 +61,33 @@ minimal MCP toolset and executes everything **through the proxy**.
   at this layer; unit tests use in-memory `FakeProxyTransport` / `FakeCore`
   (`src/testing/fakes.ts`).
 
-## Not yet wired (S4 — deferred to S5)
+## Deployable end-to-end (S5) — and being replaced by the Rust `pgb-mcp`
 
-This crate ships the §11 toolset, the block contract, and the RiskEngine seam,
-all individually tested, but it is **not a deployable, end-to-end server yet**:
+This server is now a **runnable, end-to-end MCP process**, not just a tested
+surface:
 
-- **No JSON-RPC/stdio entrypoint.** There is no runnable MCP wire process; the
-  `McpServer` surface is exercised by tests, not served over a transport.
-- **No production `Core`.** The write path (`propose_write → dry_run →
-  apply_write`) terminates in the **test `FakeCore`** (`src/testing/fakes.ts`).
-  No live `Core` drives the real Rust `propose → dry_run → guarded_apply` path,
-  so a write through this server does **not** reach a real database apply.
-- The full **MCP → proxy → `guarded_apply`** wiring (a real JSON-RPC/stdio shell
-  + a production `Core`) is tracked for **S5** (#63). See
-  `docs/spec/SPEC.amendments.md` §S4 for the full disclosure.
+- **JSON-RPC/stdio entrypoint shipped.** `dist/bin/mcpStdio.js` is a real MCP
+  wire process. `deploy/up.sh` launches the full stack and prints a
+  `claude mcp add … -- node …/dist/bin/mcpStdio.js` line; a real Claude Code (or
+  any MCP client) drives the nine tools over stdio.
+- **Live `Core` over the Rust floor.** Reads go through a real `pg` client to
+  `pgb-proxy`; writes go through a real client to the `pgb-applyd` socket
+  (`propose_write → dry_run → apply_write` → the Rust `guarded_apply` floor), so a
+  write through this server **does** reach a real, bounded, reversible database
+  apply under an operator grant.
+- **Proven end-to-end** in `test/upStack.e2e.test.ts` (`PG_BUMPERS_IT=1`): a real
+  MCP client drives `mcpStdio.js` against the live `up.sh` stack — read through
+  the proxy (WALL-enforced), `DROP TABLE` refused, a bounded `UPDATE` approved and
+  committed, and `pgb-cli verify` confirms the audit chain. Captured run:
+  `deploy/up.transcript.txt`.
+
+> **This TypeScript server is being retired.** Per
+> [EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83) ("one language —
+> Rust for all"), the MCP server is being ported to a native Rust `pgb-mcp`
+> (`rmcp` SDK). `pgb-applyd` stays a separate privileged daemon (the write
+> credential stays isolated from the agent-facing process); the Rust server is a
+> thin adapter — read path → `pgb-proxy`, write path → `applyd` over its socket.
+> The MCP layer remains explicitly **not** a security boundary either way.
 
 ## Develop
 

@@ -24,10 +24,10 @@ So you document and test against what actually exists:
 | **S0** | skeleton · the Wall (hardened role) · `core` · contracts/seams · CI gate | **merged, green on PG18** |
 | **S1** | pgwire termination · audit hash-chain · enforcing proxy | **merged, green on PG18** |
 | **S2** | clone dry-run (blast radius) · clone governance | **merged, green on PG18** |
-| **S3** | guarded apply · typed-inverse capture | **in progress** |
-| **S4** | warden loop · MCP tools · policy wiring · audit anchoring · read-gates · CLI approval | upcoming / fast-follow |
-| **S5** | FP/FN benchmark · marquee MCP-bypass repro | upcoming / fast-follow |
-| — | LLM gating risk-engine (write + read) | fast-follow |
+| **S3** | guarded apply · typed-inverse capture | **merged, green on PG18** |
+| **S4** | warden loop · MCP tools · policy wiring · audit anchoring · read-gates · CLI approval | **merged, green on PG18** |
+| **S5** | `pgb-applyd` write daemon · runnable MCP stdio shell · `deploy/up.sh` end-to-end · marquee MCP-bypass repro | **merged, green on PG18** |
+| — | LLM gating risk-engine (write + read) · Rust `pgb-mcp` port ([#83](https://github.com/NikolayS/pg_bumpers/issues/83)) | fast-follow |
 
 What this means in the tree today:
 
@@ -129,10 +129,13 @@ Runs in `mcp/server` with **pnpm 11.8.0** and **Node 22**:
 | test | `pnpm test` (`vitest run`) | TS contract tests |
 | license-check | `pnpm run license-check` | Apache/MIT/BSD/ISC only; bans GPL/AGPL |
 
-The MCP server is a **TS skeleton** today (`@pg-bumpers/mcp-server`, `0.0.0`,
-`private`); the real tools land in S4. The block-contract test
-(`mcp/server/test/blockContract.test.ts`) already pins the fail-closed shape:
-blocks default `retryable: false`.
+The MCP server is a **runnable stdio shell** (`@pg-bumpers/mcp-server`, `private`)
+with the nine §11 tools, a live `pg`-client read path through `pgb-proxy`, and a
+write path through the `pgb-applyd` socket; `test/upStack.e2e.test.ts` drives it
+end-to-end against the `deploy/up.sh` stack (env-gated `PG_BUMPERS_IT=1`). The
+block-contract test (`mcp/server/test/blockContract.test.ts`) pins the
+fail-closed shape: blocks default `retryable: false`. The TS server is being
+ported to a native Rust `pgb-mcp` ([EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83)).
 
 ### Run all gates locally before pushing
 

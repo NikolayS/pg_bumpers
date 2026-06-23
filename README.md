@@ -2,234 +2,295 @@
 
 [![CI](https://github.com/NikolayS/pg_bumpers/actions/workflows/ci.yml/badge.svg)](https://github.com/NikolayS/pg_bumpers/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-3ddc97)
-![spec](https://img.shields.io/badge/SPEC-v0.8%20·%20build--frozen-5b8cff)
-![status](https://img.shields.io/badge/build-S0–S5%20merged%20·%20green%20on%20PG18-3ddc97)
-![substrate](https://img.shields.io/badge/substrate-local%20Postgres%2018-336791)
+![status](https://img.shields.io/badge/status-MVP%20·%20runnable%20on%20PG18-3ddc97)
 
-> **Working title** (brand TBD; nine-lives / *Felis* leads).
+**A self-hostable control plane that lets AI agents read and write your
+_production_ Postgres — safely.** Your agent connects through a proxy and gets a
+least-privilege role; every write is **bounded, reversible, and human-approved**;
+runaway reads and sessions are **killed**; and every action lands on a
+**tamper-evident audit chain** you can verify.
 
-**Let AI agents read & write _production Postgres_ — safely.** Run them with
-`--dangerously-skip-permissions` and they can't cause disaster. **Your database
-has nine lives.**
+Point a coding agent (or a text-to-SQL bot, or an internal copilot) at a real
+database — even in `--dangerously-skip-permissions` mode — and the floor below it
+holds. A `DROP TABLE` gets **refused**. A `DELETE` with no `WHERE` gets
+**bounded** and held for approval. Nobody hands the agent superuser.
 
 ---
 
-## The problem · why now
+## Why this exists
 
-AI agents now touch production databases — coding agents, text-to-SQL, internal
-copilots — often in YOLO / `--dangerously-skip-permissions` modes. Nobody has a
-safe way to let them.
+AI agents now touch production databases directly, often in YOLO modes. The
+public failures are not hypothetical:
 
-> The Replit agent **deleted SaaStr's production database**. The official
-> Anthropic Postgres MCP read-only mode was **bypassed by statement-stacking**
-> (`COMMIT; DROP SCHEMA …`). Datadog's lesson: **app-layer protection isn't
-> enough — you need native Postgres RBAC.**
+- The Replit agent **deleted a production database**.
+- The official Anthropic Postgres MCP read-only mode was **bypassed by
+  statement-stacking** (`COMMIT; DROP SCHEMA …` smuggled through a "read-only"
+  path).
 
-Everyone else decides *whether* an action runs (allow/deny, masking, JIT).
-**Nobody predicts _what a write will do_** before it hits prod.
+App-layer "please be careful" prompts don't stop this. pg_bumpers puts a
+**deterministic safety floor** — native Postgres roles, byte/time budgets, and a
+bounded-and-reversible write path — between the agent and your data. No language
+model sits in that floor; it holds even if the agent is fully compromised.
 
-## What it is
+## The honest guarantee (split by damage class)
 
-A self-hostable control plane between an AI agent and production Postgres. Reads
-are cost-gated, bounded & audited. Writes are **rehearsed first** (on an instant
-clone of prod if available, else measured in a rolled-back transaction), blast
-radius **measured**, then applied reversibly under guards.
+We do **not** claim "impossible to break" or "tamper-proof." We claim three
+precise, testable things:
 
-## The honest guarantee — split by damage class
+- **Writes — 0 catastrophic data-loss false-negatives by construction.** Every
+  applied write is **bounded + reversible**: rehearsed first, guarded on the
+  affected **primary-key set** (catches row-identity drift, not just row count),
+  fenced by a restore point, and undoable via a captured typed-inverse.
+  Structural / irreversible operations (`DROP`, `TRUNCATE`, DDL) are **refused
+  outright** — they are not rehearsable, so they never run.
+- **Reads — bounded disclosure, not zero.** Disclosure can't be un-happened, so
+  the promise is a **per-role byte/row budget, then a hard cutoff/kill** — plus
+  best-effort detection. Data you never granted the agent stays unreadable
+  (default-deny); data you did grant is capped.
+- **Audit — tamper-evident, not tamper-proof.** Every decision (including refused
+  writes and denied reads) lands on a hash-chained `_meta` log whose head is
+  externally anchored. A rewritten chain is **detected** by the anchored head.
 
-We do **not** claim "impossible to break." We claim two precise, testable things:
+The safety guarantee is the **deterministic floor**. An LLM risk-gate is planned
+to *tighten* it further (block/hold/escalate, never loosen), but in this MVP that
+gate is a stub that returns `Allow` — the floor is doing all the work.
 
-- **Writes (reversible damage):** data-loss is **prevented or undoable** — every
-  applied write is **bounded + reversible by construction**. The deterministic
-  floor (PK-set checksum guard + typed-inverse + restore-point fence) aims for
-  **zero catastrophic data-loss false-negatives by construction**, not by a model
-  getting it right.
-- **Reads (irreversible damage):** disclosure can't be un-happened, so we promise
-  **bounded disclosure** — at most a per-role byte/row budget, then a hard
-  **cutoff/kill** — **plus best-effort detection** of exfiltration. This is
-  **tamper-evident, bounded, and detected — never "zero," "impossible," or
-  "tamper-proof."**
+## Try it in ~5 minutes
 
-## How it decides: a deterministic floor + an LLM risk-gate
+This walkthrough is the real flow, captured from an actual run on a throwaway
+PostgreSQL 18. It launches the full stack, prints a `claude mcp add` line you
+paste into Claude Code, and lets you watch a `DROP TABLE` get refused and a
+bounded write get approved.
 
-- **Floor (deterministic, non-bypassable):** native-role WALL + cost/byte budgets
-  + `statement_timeout` + bounded-&-reversible writes. **This is the guarantee —
-  no model is in this path.**
-- **LLM risk-gate (tighten-only):** scores how dangerous an action looks and can
-  **block / hold / escalate** — but can **never loosen** below the floor. Its
-  worst mistake is a false-positive (a blocked legit action), **never a breach**.
+> **Dev-quickstart honesty.** This local stack runs with **TLS off**
+> (`PGB_PROXY_REQUIRE_TLS=false`) — SCRAM-SHA-256 auth is still enforced. It uses
+> throwaway Postgres clusters on **dedicated high ports** (it never touches
+> `5432`) and tears them down cleanly. The agent-facing MCP server is currently
+> the Node stdio shell shipped in `mcp/server/`; a native Rust `pgb-mcp` is
+> landing (see [EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83)).
 
-> **MVP posture:** the `RiskEngine` is currently a **stub returning `Allow`**
-> (`crates/policy`), and intent tiers **T0–T2 are captured/logged only**
-> (SPEC §15.1). The safety today comes entirely from the **deterministic floor**.
-> LLM posture is **staged**: floor-only → advisory → gating.
+### 1. Prerequisites
 
-## Status
+- **Rust 1.90** (pinned by `rust-toolchain.toml`)
+- **PostgreSQL 18** — on macOS, the Homebrew keg `postgresql@18` (the launcher
+  uses `initdb` / `pg_ctl` from `/opt/homebrew/opt/postgresql@18/bin`):
+  ```sh
+  brew install postgresql@18
+  export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
+  ```
+- **Node 22 + pnpm** (for the current MCP stdio shell)
+- **[Claude Code](https://claude.com/claude-code)** (the agent you'll connect)
 
-The product spec is **build-frozen at v0.8**. The build runs in sprints; this is
-the live, fully-tested implementation.
+### 2. Clone and build
 
-| Sprint | Scope | State |
-|--------|-------|-------|
-| **S0** | Skeleton · WALL (hardened role + network boundary) · core seams · contracts · fidelity gate | **merged · green on PG18** |
-| **S1** | pgwire termination · read enforcement (read-only / byte-row cutoff / `statement_timeout`) · audit · proxy | **merged · green on PG18** |
-| **S2** | Clone-orchestrator dry-run (blast-radius preview) · clone governance | **merged · green on PG18** |
-| **S3** | Guarded apply + typed-inverse (PITR fence · apply-time PK-set re-check · `RETURNING` written-set) | **merged · green on PG18** |
-| **S4** | Warden · MCP server · `policy.yaml` wiring · external audit anchor · deferred read gates · CLI approval | **merged · green on PG18** |
-| **S5** | `pgb-applyd` write-path daemon + live MCP `Core` over the grant-gated floor · ONE shared, persistent, anchored `_meta` chain (single owner) · runnable audited warden · benchmark breadth + the marquee "delete a DB through the official MCP" end-to-end repro + `KNOWN_BYPASSES.md` | **merged · green on PG18** — run `deploy/marquee.sh`; evidence in `deploy/marquee.transcript.txt` |
-| — | **LLM gating engine** (the risk model that tightens) | **fast-follow** |
+```sh
+git clone https://github.com/NikolayS/pg_bumpers.git
+cd pg_bumpers
+```
 
-**Substrate:** live integration tests run against **local Postgres 18** (Homebrew
-`postgresql@18`: `initdb` / `pg_basebackup` / `pg_ctl`), not Docker — a
-founder-approved pivot because `docker pull` is non-functional in the build
-environment. `deploy/docker-compose.yml` is retained as the **shipped artifact**
-(image bumped to `postgres:18`) and statically validated. Full rationale:
+`deploy/up.sh` builds the binaries for you on first run; you can also build them
+up front:
+
+```sh
+cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli
+( cd mcp/server && pnpm install --frozen-lockfile && pnpm run build )
+```
+
+### 3. Launch the stack
+
+```sh
+bash deploy/up.sh          # add --no-build if you built in step 2
+```
+
+It brings up a hardened throwaway PG18, launches the proxy + write-path daemon +
+warden, and prints a ready-to-paste connect line. Real output:
+
+```text
+================================================================================
+ pg_bumpers stack is UP. Reads route through pgb-proxy (NOT raw PG18). :5432 untouched.
+================================================================================
+
+  pgb-proxy  : 127.0.0.1:6432   (agent SCRAM endpoint, TLS OFF dev-mode, WALL role pgb_agent)
+  pgb-applyd : /tmp/pg_bumpers-up/applyd.sock        (write-path Unix socket)
+  pgb-warden : live
+  PG18       : primary 54321, meta 54323  (throwaway; NEVER 5432)
+  demo DB    : pgb_demo  (accounts read surface + the _meta audit chain)
+
+  Connect a REAL Claude Code to this stack — paste this single line:
+
+  claude mcp add pg-bumpers \
+    --env PGB_APPLYD_SOCKET=/tmp/pg_bumpers-up/applyd.sock \
+    --env PGB_PROXY_HOST=127.0.0.1 \
+    --env PGB_PROXY_PORT=6432 \
+    --env PGB_PROXY_DB=pgb_demo \
+    --env PGB_PROXY_USER=pgb_agent \
+    --env PGB_PROXY_PASSWORD=pgb_agent_dev_pw \
+    --env PGB_PROXY_APP_NAME=pgb_proxy \
+    --env PGB_ROLE=pgb_agent \
+    --env PGB_SESSION_ID=pgb-demo-session \
+    -- node <repo>/mcp/server/dist/bin/mcpStdio.js
+```
+
+**Paste the exact `claude mcp add` line `up.sh` printed** into your shell (the
+paths are filled in for your machine). Claude Code now has nine pg_bumpers tools.
+
+### 4. Drive it from Claude Code
+
+Each step below is "ask your agent X → you'll see Y." The `Y` outputs are
+verbatim from a real run against the stack above.
+
+**Ask it to read a table → it works, bounded, through the proxy.**
+
+> "Query `SELECT id, owner, balance FROM public.accounts ORDER BY id`."
+
+```text
+status=ok rowCount=8
+[{"id":1,"owner":"owner-1","balance":"1000"}, … {"id":8,"owner":"owner-8","balance":"8000"}]
+```
+
+The read genuinely traverses `pgb-proxy` as the least-privilege WALL role
+`pgb_agent` — not a raw superuser connection.
+
+**Ask it to read something it wasn't granted → default-deny.**
+
+> "Query `SELECT secret FROM public.secret_data`."
+
+```text
+status=blocked code=WALL_DENIED
+reason=the proxy/WALL denied this read (least-privilege default-deny):
+       permission denied for table secret_data (42501)
+```
+
+`secret_data` was never granted to the agent's role, so the WALL refuses it. A
+raw superuser would have leaked the row; the agent's role can't.
+
+**Ask it to `DROP TABLE` → REFUSED (never executed).**
+
+> "Propose a write: `DROP TABLE public.accounts`."
+
+```text
+status=blocked code=NOT_REHEARSABLE
+reason=statement kind `DROP` is not a certified rehearsable write
+retryable=false
+```
+
+`TRUNCATE` is refused the same way. Structural/irreversible ops aren't on the
+certified, rehearsable allow-list, so they are neutralized by refusal — the table
+keeps all 8 rows.
+
+**Ask it for a bounded write → measured, then held for approval.**
+
+> "Propose `UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0`, then dry-run
+> it, then apply it."
+
+```text
+propose_write  → status=ok proposal_id=p-9eb291bce874a5af
+dry_run        → status=ok total_rows=4 reversible=true     (rehearsed; nothing committed)
+apply_write    → status=blocked code=APPROVAL_REQUIRED retryable=true
+```
+
+The dry-run rehearses the write, reports the **blast radius** (4 rows, reversible)
+without committing anything, and the apply is **held** for a human — the agent
+can't self-approve.
+
+**Approve it (operator, out-of-band) → committed + reversible.**
+
+The signing key never enters the agent's path. As the operator, mint a grant on
+the write-path socket, then the agent's retry commits:
+
+```text
+operator approve → ok           (grant signed out-of-band)
+apply_write      → status=ok applied=true reversible=true
+```
+
+Only the 4 even-id rows were zeroed; the 4 odd-id rows are untouched — the write
+was bounded exactly to its measured radius. (The applyd socket `approve` RPC is
+shown in `deploy/README.md`; a `pgb-cli`/operator UI hop is fast-follow.)
+
+**Verify the audit chain → it checks out.**
+
+```sh
+PGB_META_DSN='host=127.0.0.1 port=54321 dbname=pgb_demo user=pgb_audit_writer password=pgb_audit_writer_dev_pw' \
+PGB_AUDIT_SIGNING_KEY=pgb-audit-signing-key-dev-000001 \
+PGB_ANCHOR_PATH=/tmp/pg_bumpers-up/verify.anchor.worm \
+  target/debug/pgb-cli verify
+```
+
+```text
+pgb-cli verify: the shared `_meta` chain VERIFIES and the durable
+anchored head MATCHES the chain head.
+  decisions by reason_code:
+    NOT_REHEARSABLE   x2   (the DROP + TRUNCATE refusals)
+    apply_committed   x1   (the approved bounded write)
+    approval_required x1
+    grant_signed      x1
+    ...
+```
+
+Every refusal and every approval is on the chain, and the head matches its
+external anchor.
+
+### 5. Tear it down
+
+```sh
+bash deploy/down.sh
+```
+
+Stops the three daemons, drops the throwaway clusters, frees the high ports, and
+verifies `:5432` was never touched.
+
+> The exact same flow runs end-to-end as an automated test:
+> `PG_BUMPERS_IT=1 pnpm test` in `mcp/server`
+> (`test/upStack.e2e.test.ts`) launches `up.sh`, drives the shipped MCP shell
+> through every step above, and runs `down.sh` — see
+> [`deploy/up.transcript.txt`](deploy/up.transcript.txt) for the captured run.
+
+## How it works
+
+pg_bumpers is four layers plus a mandatory network boundary. The first two are
+**native Postgres** and hold even against a hostile raw client; the proxy and
+write path add enforcement and the agent-facing API.
+
+| Layer | What it does |
+|---|---|
+| **Network boundary** | `pg_hba` permits the agent role **only from the proxy host**; every other origin is rejected. |
+| **WALL — native role** | `pgb_agent` is NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant anywhere · SELECT-whitelist only. A raw client *physically can't* write or read denied data. |
+| **Proxy + warden** | `pgb-proxy` is the agent's only endpoint: extended-protocol-only (kills statement-stacking), read-only gate, byte/row mid-stream cutoff, `statement_timeout`, hash-chained audit. `pgb-warden` is an out-of-band watchdog that kills runaway agent sessions. |
+| **Write-safety + MCP** | `pgb-applyd` owns the `propose → dry_run → approve → apply` lifecycle behind an owner-only socket; the MCP server is the agent-facing tool surface (cooperative, *not* a security boundary). |
+
+Full write-up: [`docs/architecture.md`](docs/architecture.md). Product spec:
+[`docs/spec/SPEC.md`](docs/spec/SPEC.md) (v0.8).
+
+## Status & scope
+
+This is an **MVP**, runnable today on PostgreSQL 18.
+
+- **Works now:** the native-role WALL + proxy-only network path; the enforcing
+  proxy (read-only, byte/row cutoff, `statement_timeout`, anti-statement-stacking,
+  audit); clone/transaction dry-run blast-radius preview; guarded apply with
+  typed-inverse and operator approval; the live warden; the tamper-evident,
+  externally-anchored audit chain; and the MCP tool surface — all exercised by the
+  end-to-end flow above.
+- **Deferred / fast-follow:** the LLM risk-gate (the `RiskEngine` is a stub
+  returning `Allow`); the native Rust `pgb-mcp` ([EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83));
+  DDL / multi-statement transactions / multi-DB; an operator approval UI; and a
+  managed clone provider for zero-impact rehearsal.
+
+Known limitations and intentional deviations are documented honestly:
+[`KNOWN_BYPASSES.md`](KNOWN_BYPASSES.md) and
 [`docs/spec/SPEC.amendments.md`](docs/spec/SPEC.amendments.md).
 
-## Architecture · four layers + a boundary
+## Contributing
 
-| # | Layer | What it does | Where it lives |
-|---|-------|--------------|----------------|
-| **0** | **Network boundary** *(mandatory)* | Agent reaches Postgres **only via the proxy** — `pg_hba` permits the agent role **only from the proxy host**; every other origin is rejected. | `deploy/hba/`, `deploy/init/` |
-| **1** | **The WALL — native Postgres roles** *(unbypassable)* | Hardened least-priv role `pgb_agent` (NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant anywhere · SELECT-whitelist only); a hostile *raw* client physically can't write or read denied data. | `deploy/sql/10_hardened_role.sql`, `deploy/test/wall_matrix.sh` |
-| **2** | **Enforcement — Rust proxy + warden** | Extended-protocol-only, read-only gate, byte/row **mid-stream cutoff**, `statement_timeout`, hash-chained audit. The warden is the runnable, audited out-of-band watchdog. Every gate verdict — incl. rejects and refused writes — lands on **one shared, persistent, anchored `_meta` chain** (a single anchor owner). | `crates/proxy`, `crates/pgwire`, `crates/audit`, `crates/warden` |
-| **3** | **Intent / UX — MCP server** *(agent-facing)* | What the agent talks to; reads execute *through* the proxy, writes through `pgb-applyd`; recoverable blocks. The `pgb-mcp` stdio shell speaks MCP and maps tool calls onto the Rust floor. | `mcp/server` (`pgb-mcp`) |
-| **4** | **Write-safety — guarded apply (+ optional clone rehearsal)** *(the moat)* | Bounded + reversible writes via the grant-gated apply floor; with a clone (DBLab), a zero-impact pre-flight preview. The `pgb-applyd` daemon owns the propose→dry_run→approve→apply lifecycle behind an owner-only Unix socket; refused proposals are audited. | `crates/applyd`, `crates/clone-orchestrator`, `crates/core` |
-
-A full architecture write-up is in [`docs/architecture.md`](docs/architecture.md).
-The authoritative references for *intent* remain
-[`docs/spec/SPEC.md`](docs/spec/SPEC.md) (§3–§4) and
-[`deploy/README.md`](deploy/README.md).
-
-## How a write works
-
-1. **propose** — SQL + expected rows → a stable `Proposal` (id + TTL). Nothing
-   touches prod (`crates/clone-orchestrator/src/proposal.rs`).
-2. **dry-run** — rehearse on a clone if present, **else measure in a
-   `BEGIN … ROLLBACK` txn**; refuse volatile predicates and PK-less targets
-   *before* executing; fold rows / cascades / triggers / locks / WAL / the
-   affected-PK set into a `BlastRadius` record, then roll back so **nothing is
-   persisted** (`crates/clone-orchestrator/src/dry_run.rs`). **Shipped (S2).**
-3. **apply** — under a signed, single-use, proposal-bound grant: restore-point
-   fence → apply-time PK-set re-check (abort on drift) → commit → typed-inverse
-   captured. The grant-gated apply floor (`guarded_apply_with_grant`) runs in
-   `crates/clone-orchestrator`, driven in production by the `pgb-applyd` daemon.
-
-> **Killer demo (the marquee):** `UPDATE accounts SET balance=0` (no `WHERE`) is
-> **rehearsed**, the affected-PK set is **measured**, and the operator sees the
-> blast radius *before* it touches prod — the test fixture is 8 rows, and at
-> production scale the same preview reports the full row count. And
-> `COMMIT; DROP SCHEMA public CASCADE` sent as a simple-query is **blocked** by
-> the extended-protocol-only proxy gate (the statement-stacking bypass that
-> defeated the off-the-shelf MCP) — proven against live PG18 in
-> `crates/proxy/tests/proxy_it.rs`. Full walkthrough: [`docs/demo.md`](docs/demo.md).
-
-## Quickstart
-
-Full guide: [`docs/quickstart.md`](docs/quickstart.md). The working path
-(macOS / Homebrew, local PG18 — no Docker required):
-
-```sh
-brew install postgresql@18                       # the substrate (PG18)
-deploy/local-stack.sh up                          # primary 54321 · replica 54322 · meta 54323
-PG_BUMPERS_IT=1 deploy/test/wall_matrix.sh        # WALL: every deny proven against real PG18
-PG_BUMPERS_IT=1 bash deploy/smoke.sh              # replication + _meta smoke
-deploy/local-stack.sh down                        # clean teardown (verifies ports freed)
-```
-
-The full stack contract, ports, the `PG_BUMPERS_IT` integration-gate convention,
-and the docker-compose shipped artifact are documented in
-[`deploy/README.md`](deploy/README.md).
-
-## Scope · MVP vs fast-follow
-
-| ✅ MVP (~12–15 wks) | ◻︎ Fast-follow |
-|---|---|
-| Native-role WALL + proxy-only network path | LLM **gating** risk-engine (write + read) |
-| Proxy: read-only, budgets, byte/row cutoff, `statement_timeout`, audit | The 100k-run FP/FN benchmark + calibration |
-| Clone dry-run preview + guarded apply + typed-inverse | T4 origin-context + attestation |
-| Warden + MCP + `policy.yaml` + tamper-evident audit | Approval UI, dual-control, connectors |
-| Autonomy L0–L2 · **intent capture T0–T2 (logged)** | DDL, multi-stmt txns, multi-DB, cloud |
-| **CLI approval** + signed proposal-bound grant | Specialized (fine-tuned) risk model |
-| Focused deterministic benchmark + bypass repro | |
-
-> In the MVP the `RiskEngine` is a **stub returning `Allow`** and intent tiers
-> T0–T2 are **captured/logged only** (SPEC §15.1) — populated on both the read
-> and the write path, never consulted by a gate. The live operator-approval flow
-> (signed, single-use, proposal-bound grant) and the MCP-tool flow are **wired**;
-> the LLM gating engine is the disclosed fast-follow.
-
-## Repository layout
-
-```
-crates/
-  proxy/              # inline read-only enforcement (agent-only endpoint); binary `pgb-proxy` (audit anchor OWNER)
-  pgwire/             # PostgreSQL wire-protocol helpers (extended-protocol-only)
-  audit/              # tamper-evident hash-chained audit (one shared, persistent, anchored `_meta` chain; single owner)
-  core/               # domain types + one-way-door seams (BlastRadius, PK-checksum, inverse, clock, barrier)
-  policy/             # policy.yaml model + RiskEngine seam (MVP stub: Allow) + grant/intent/verdict
-  clone-orchestrator/ # propose/dry-run, blast-radius, grant-gated guarded apply + typed-inverse
-  applyd/             # write-path daemon owning propose→dry_run→approve→apply over the floor; binary `pgb-applyd` (owner-only Unix socket)
-  warden/             # runnable, audited out-of-band watchdog + circuit breaker
-  cli/                # operator approval flow + `pgb-cli verify` (load + verify the shared `_meta` chain + anchored head); binary `pgb-cli`
-  mcp/                # agent-facing MCP server (Rust, via the `rmcp` SDK); §4 nine-tool catalog over stdio; binary `pgb-mcp` (EPIC #83; replaces mcp/server)
-mcp/server/           # MCP server (TypeScript) — agent-facing layer; being replaced by the Rust `crates/mcp` (EPIC #83; removed in PR4)
-spikes/fidelity/      # S0 throwaway fidelity-spike harness (gate; publish=false)
-deploy/               # local-stack.sh (live substrate) + docker-compose (shipped artifact) + WALL SQL/hba
-proto/                # protocol/IDL definitions (added as protocols solidify)
-docs/spec/            # SPEC.md (source of truth) + decisions.md + SPEC.amendments.md
-```
-
-## Build & test
-
-Toolchain is pinned: **Rust 1.90.0** (edition 2024, `rust-toolchain.toml`),
-**Node 22 + pnpm 11.8**. CI (`.github/workflows/ci.yml`) mirrors these on every
-push + PR.
-
-```sh
-# Rust workspace
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --locked
-cargo test  --workspace --locked
-cargo deny  check                     # licenses + bans + advisories (RUSTSEC) + sources
-
-# MCP server (TypeScript)
-cd mcp/server
-pnpm install --frozen-lockfile
-pnpm run build                        # tsc --noEmit
-pnpm test                             # vitest
-pnpm run license-check                # Apache/MIT/BSD/ISC only; bans GPL/AGPL
-```
-
-Integration tests are **env-gated**: they **skip** (exit 0) unless
-`PG_BUMPERS_IT=1`, and run for real against the local PG18 stack when it is set.
-See [`docs/development.md`](docs/development.md) for the full process.
-
-## Docs & decisions
-
-- **Docs index:** [`docs/README.md`](docs/README.md) — architecture · quickstart · development · components · demo
-- **Spec (source of truth):** [`docs/spec/SPEC.md`](docs/spec/SPEC.md) (v0.8, build-frozen)
-- **Intentional deviations:** [`docs/spec/SPEC.amendments.md`](docs/spec/SPEC.amendments.md) (incl. the docker→local-PG18 substrate pivot)
-- **Decisions / rationale:** [`docs/spec/decisions.md`](docs/spec/decisions.md)
-- **Engineering principles:** [`CLAUDE.md`](CLAUDE.md) (red/green TDD · fail-closed · clean-room)
-- **Brief:** [`docs/spec/brief.md`](docs/spec/brief.md)
-- **Dev/test stack:** [`deploy/README.md`](deploy/README.md)
-- **Sprint epics:** [S0 #2](https://github.com/NikolayS/pg_bumpers/issues/2) · [S1 #19](https://github.com/NikolayS/pg_bumpers/issues/19) · [S2 #28](https://github.com/NikolayS/pg_bumpers/issues/28) · [S3 #35](https://github.com/NikolayS/pg_bumpers/issues/35)
-
-## What we deliberately do **not** claim
-
-- Not "physically impossible to break" / not "tamper-proof" — the audit chain is
-  **tamper-evident**, and read disclosure is **bounded + detected**, not prevented.
-- Reads can't be un-disclosed — exfiltration is bounded ≤ a per-role budget and
-  best-effort detected, **never zero**.
-- Full-auto write is a **narrow, certified, reversible** action set, not open-ended.
-- The LLM **reduces friction & catches more**, but is **never the safety guarantee
-  — the deterministic floor is.**
+Building on pg_bumpers? The engineering process — the red/green TDD discipline,
+the CI gates, the `PG_BUMPERS_IT` integration convention, the local test stack
+(`local-stack.sh` / `wall_matrix.sh` / `smoke.sh`), test-port discipline, and the
+PR lifecycle — lives in **[`docs/development.md`](docs/development.md)**. The deploy
+stack (the shipped `docker-compose.yml`, `local-stack.sh`, the `up.sh` runnable
+demo, and the WALL SQL/hba) is documented in [`deploy/README.md`](deploy/README.md).
 
 ## License
 
-[Apache-2.0](LICENSE). Dependencies are Apache/MIT/BSD/ISC only — GPL/AGPL are
-banned and enforced by `cargo deny` (Rust) and the `license-check` script (TS).
-This is a **clean-room** implementation; AGPL projects (e.g. pgDog) are studied
-for inspiration only, never copied (`CLAUDE.md` §6).
+[Apache-2.0](LICENSE). Dependencies are Apache / MIT / BSD / ISC only — GPL/AGPL
+are banned and enforced by `cargo deny` (Rust) and a `license-check` script (TS).
+This is a **clean-room** implementation.
