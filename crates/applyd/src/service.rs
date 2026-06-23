@@ -272,6 +272,18 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
         })?;
 
         let req_proposal = binding_proposal(record, dry);
+        let cap = req_proposal.cap;
+        // EPIC #91 PR-B §4 disclosure: the side-effecting triggers the write fires.
+        // Surfaced to the human at approval as a first-class fact (a trigger may write
+        // a relation OUTSIDE the captured inverse — e.g. an audit table — whose effect
+        // the typed-inverse does not undo).
+        let side_effecting_triggers: Vec<String> = dry
+            .blast_radius
+            .triggers_fired
+            .iter()
+            .filter(|t| t.rows > 0)
+            .map(|t| t.name.clone())
+            .collect();
         let op = operation_for(record, dry);
         let requester_id = record.session_id.clone();
         let _ = reason; // recorded by the flow's request payload
@@ -301,6 +313,9 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
                 .contract
                 .expires_at_unix_millis
                 .saturating_sub(clock.now_unix_millis()),
+            cap_max_rows: cap.max_rows,
+            cap_max_wal_bytes: cap.max_wal_bytes,
+            side_effecting_triggers,
         })
     }
 
@@ -669,16 +684,40 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
 
 // ---- helpers: build the binding source + the certified op -------------------
 
+/// The default ROW-cap headroom (EPIC #91 PR-B): the dry-run's measured row
+/// footprint, +10%, pre-filled as the suggested `max_rows`. The row count is a
+/// precise, low-noise measure (the same `pg_stat_xact_*` deltas at dry-run and
+/// apply), so a tight headroom is right. The approver may tighten/raise per §14.2.
+const DEFAULT_ROW_HEADROOM: f64 = 0.10;
+
+/// The default WAL-byte cap headroom — deliberately **generous** (a 4× multiplier
+/// plus a floor). The dry-run measures WAL on a **rolled-back** rehearsal, which
+/// systematically UNDER-counts a committed apply's WAL (commit records, full-page
+/// writes, `FOR UPDATE` heap-lock WAL, checkpoint timing). A tight WAL cap would
+/// false-positive on that normal commit overhead; the WAL cap is a backstop against
+/// **pathological** WAL blowup, not a precise pin (that is the row cap's job).
+const DEFAULT_WAL_HEADROOM: f64 = 3.0; // → 4× the measured WAL
+/// A WAL-cap floor so a tiny / zero dry-run WAL measure still admits a normal small
+/// commit's overhead (64 KiB).
+const DEFAULT_WAL_FLOOR_BYTES: u64 = 64 * 1024;
+
 /// Build the §14.3 [`RequestProposal`] (the flow's binding source) from the
 /// stored record + the cached dry-run.
 fn binding_proposal(record: &ProposalRecord, dry: &DryRunState) -> RequestProposal {
-    let checksum = dry
+    // EPIC #91 PR-B: the approver-authorized absolute cap replaces the dropped
+    // exact-PK-set checksum. Pre-fill `max_rows` from the dry-run row footprint +
+    // 10%, and `max_wal_bytes` generously (4× + a 64 KiB floor) since a rolled-back
+    // rehearsal under-measures a committed apply's WAL. The human reviews/adjusts.
+    let rows_cap = dry
         .blast_radius
-        .affected
-        .pk_set_checksum
-        .get(&record.relation)
-        .cloned()
-        .unwrap_or_default();
+        .suggested_cap(DEFAULT_ROW_HEADROOM)
+        .max_rows;
+    let wal_cap = dry
+        .blast_radius
+        .suggested_cap(DEFAULT_WAL_HEADROOM)
+        .max_wal_bytes
+        .max(DEFAULT_WAL_FLOOR_BYTES);
+    let cap = pgb_core::WriteCap::new(rows_cap, wal_cap);
     RequestProposal {
         proposal_id: record.proposal.id.clone(),
         statement_text: record.proposal.statement.clone(),
@@ -686,7 +725,7 @@ fn binding_proposal(record: &ProposalRecord, dry: &DryRunState) -> RequestPropos
         role: record.role.clone(),
         session_id: record.session_id.clone(),
         dry_run_lsn: dry.blast_radius.clone_lsn.clone(),
-        blast_radius_checksum: checksum,
+        cap,
     }
 }
 
@@ -767,14 +806,16 @@ fn dry_run_error_to_rpc(e: DryRunError) -> RpcError {
 }
 
 /// Map a [`GrantedApplyError`] to the matching recoverable code. Grant
-/// verification failures → `GRANT_REJECTED`; an apply-time PK-set drift →
-/// `BLAST_DRIFT`; anything else fail-closed.
+/// verification failures → `GRANT_REJECTED`; an apply-time magnitude over-cap or
+/// effect drift → `BLAST_DRIFT`; anything else fail-closed.
 fn granted_apply_error_to_rpc(e: &GrantedApplyError) -> RpcError {
     match e {
         GrantedApplyError::Grant(GrantError::BindingMismatch) => ErrorCode::GrantRejected
-            .error("grant binding mismatch (statement/param/session/proposal swap or data drift)"),
+            .error("grant binding mismatch (statement/param/session/proposal/cap swap)"),
         GrantedApplyError::Grant(g) => ErrorCode::GrantRejected.error(g.to_string()),
-        GrantedApplyError::Apply(ApplyError::PkSetDrift { .. }) => {
+        // EPIC #91 PR-B: the live write's magnitude exceeded the approved cap — a
+        // recoverable drift (re-propose / re-approve with a larger cap). → BLAST_DRIFT.
+        GrantedApplyError::Apply(ApplyError::CapExceeded { .. }) => {
             ErrorCode::BlastDrift.error(e.to_string())
         }
         GrantedApplyError::Apply(a) => ErrorCode::BlastDrift.error(a.to_string()),

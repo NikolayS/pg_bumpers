@@ -19,14 +19,24 @@ The **process** spec lives in GitHub issue #1.
 - The **deterministic floor** is the safety guarantee — native-role WALL, cost/byte
   budgets, timeouts, bounded-&-reversible writes (SPEC §3). No model is in that path.
 - **Fail closed:** absence of signal means least privilege; on any doubt, deny/abort.
-  Bounded-&-reversible is carried by the `pg_stat_xact_*` reconciliation +
-  `statement_timeout` budget (bounded) and the apply-time pre-image capture
-  (`FOR UPDATE`+`RETURNING`) + coverage guards (reversible) — **not** the PK-set
-  checksum. The apply-time PK-set checksum is an **authorization-freshness gate**: it
-  binds a human's §14.3 grant to the exact approved row-**identity** set (catches
-  same-count/different-PK drift that row count misses) and fails closed on drift.
-  Load-bearing only for stable explicitly-keyed writes; over a high-churn predicate it
-  is a no-op (quiescent) or self-abort (busy) — by design, drift ⇒ re-approve.
+  The deterministic floor on an **approved write** is carried by three orthogonal
+  pins (EPIC #91 — the exact-PK-set checksum is **removed**, founder decision):
+  - **bounded (magnitude):** the human-approved absolute **`WriteCap`** (`max_rows` +
+    `max_wal_bytes`, enforced inside the apply txn from the `pg_stat_xact_*` row
+    deltas + a WAL-byte measure → `CapExceeded` abort) **plus** the `pg_stat_xact_*`
+    **reconciliation** (the *relative* per-op-channel effect check) and the
+    `statement_timeout` budget;
+  - **reversible:** the apply-time pre-image capture (`FOR UPDATE`+`RETURNING`) + the
+    row/column coverage guards (a write that cannot be certifiably undone aborts);
+  - **authorization:** the signed §14.3 **binding** (statement + params + role +
+    session + proposal + dry-run LSN + **cap** + single-use nonce + expiry) **plus**
+    the **self-determined-predicate gate** (the grant-bound WHERE may reference only
+    the immutable PK + literals, so the approved `statement_text` itself pins the row
+    *identity* — `UPDATE … FROM` / `DELETE … USING` join-correlation is refused).
+  The exact-PK-set checksum that used to pin row identity is **gone**: identity is now
+  foreclosed structurally by the predicate gate, and magnitude by the cap — added in
+  the **same** change that dropped the checksum, so absolute magnitude is never
+  unpinned (net tighten-only).
 - The LLM risk-gate is **tighten-only** — it can block/hold/escalate but can **never
   loosen** below the floor. In the MVP the `RiskEngine` is a stub returning `Allow`
   and intent tiers T0–T2 are captured/logged only (SPEC §15.1).

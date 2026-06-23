@@ -40,9 +40,9 @@
     "defense_layer": "proxy-cutoff"
   },
   {
-    "id": "no-where-write-drift",
+    "id": "magnitude-drift-over-cap",
     "class": "dangerous",
-    "payload": "UPDATE public.orders SET status='x'  with injected post-snapshot PK drift (same count, diff PKs)",
+    "payload": "UPDATE public.orders SET status='x' WHERE id % 2 = 0; concurrent inserts swell the matching set from 5 (approved, cap=5) to 8 rows → CapExceeded (EPIC #91 PR-B; re-points the former no-where-write-drift checksum scenario onto the cap)",
     "vector": "naive",
     "expected_verdict": "REVERTED",
     "defense_layer": "guarded-apply",

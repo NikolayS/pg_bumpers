@@ -267,7 +267,9 @@ fn run_flow<S: Sink>(
         role: "app_writer".to_string(),
         session_id: "sess-demo".to_string(),
         dry_run_lsn: "3A/7F00C8".to_string(),
-        blast_radius_checksum: "sha256:demo".to_string(),
+        // EPIC #91 PR-B: the approver-authorized absolute cap (here a demo value the
+        // CLI would pre-fill from the dry-run footprint + headroom).
+        cap: pgb_core::WriteCap::new(1, 4096),
     };
     // A bounded, reversible UPDATE — eligible for elevation (not structural).
     let op = Operation::Update {

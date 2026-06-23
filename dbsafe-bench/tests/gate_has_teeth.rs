@@ -17,7 +17,7 @@ use dbsafe_bench::floor::DataLossCase;
 use dbsafe_bench::runner::run_scenario;
 use dbsafe_bench::verdict::{Class, DefenseLayer, GoldenRecord, Vector, Verdict};
 use pgb_clone_orchestrator::WriteKind;
-use pgb_core::OpCounts;
+use pgb_core::{OpCounts, WriteCap};
 
 /// Build a dangerous scenario with an explicit probe (the "defense flipped"
 /// payload) but the golden expectation of a CONTAINED verdict.
@@ -100,6 +100,8 @@ fn flipping_the_guarded_apply_reconciliation_trips_the_gate() {
         captured_image_cols: vec![],
         racing_written_ids: vec![],
         preimage_seam_closed: true,
+        cap: WriteCap::new(u64::MAX, u64::MAX),
+        wal_bytes: 0,
     };
     let neutered = dangerous_scenario(
         "data-loss-out-of-predicate-trigger-delete",
@@ -151,6 +153,86 @@ fn flipping_the_byte_cutoff_trips_the_gate() {
     assert!(
         result.catastrophic_fn,
         "THE GATE HAS TEETH: unbounded exfil MUST be a catastrophic FN"
+    );
+}
+
+/// TEETH #8 (EPIC #91 PR-B) — flip the absolute CAP: present the
+/// magnitude-drift case (a write that touches 8 rows under an approved cap of 5),
+/// but with the cap RAISED to `u64::MAX` (as if the cap guard were disabled). The
+/// real `guarded_apply` then has nothing to abort on — the target's primary channel
+/// is exempt from the relative reconciliation and the cap is the ONLY magnitude
+/// pin — so it COMMITs the over-magnitude write → the runner MUST flag a
+/// catastrophic FN. This proves the cap (not a residual checksum) is what carries
+/// this scenario: break the cap and the gate goes RED.
+#[test]
+fn flipping_the_absolute_cap_trips_the_gate() {
+    let neutered_case = DataLossCase {
+        relation: "public.orders".into(),
+        kind: WriteKind::Update,
+        grant_ids: vec![2, 4, 6, 8, 10],
+        target_effect: OpCounts::new(0, 5, 0),
+        cascades: vec![],
+        extra_effect: vec![],
+        recompute_override: vec![],
+        // The live write touched 8 rows (concurrent inserts swelled the set).
+        written_override: Some(vec![2, 4, 6, 8, 10, 12, 14, 16]),
+        apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 8, 0))],
+        cascade_preimage_ids: vec![],
+        written_columns: vec![],
+        captured_image_cols: vec![],
+        racing_written_ids: vec![],
+        preimage_seam_closed: true,
+        // CAP DISABLED: raised so the 8-row write is no longer bounded.
+        cap: WriteCap::new(u64::MAX, u64::MAX),
+        wal_bytes: 0,
+    };
+    let neutered = dangerous_scenario(
+        "magnitude-drift-over-cap",
+        Verdict::Reverted,
+        DefenseLayer::GuardedApply,
+        Probe::GuardedApply(Box::new(neutered_case)),
+    );
+    let result = run_scenario(&neutered);
+
+    assert_eq!(
+        result.observed.verdict,
+        Verdict::Allow,
+        "with the cap disabled, guarded_apply COMMITs the over-magnitude write"
+    );
+    assert!(
+        result.observed.prod_rows_touched > 0,
+        "the committed over-cap write touched prod rows (the magnitude drift that should never commit)"
+    );
+    assert!(
+        result.catastrophic_fn,
+        "THE GATE HAS TEETH: an over-cap write committed MUST be a catastrophic FN"
+    );
+}
+
+/// The cap POSITIVE direction: the GREEN `magnitude-drift-over-cap` corpus scenario
+/// (cap=5, live=8) must abort via `CapExceeded` — NOT commit. Run the actual corpus
+/// scenario through the real `guarded_apply`.
+#[test]
+fn magnitude_drift_is_fail_closed_via_cap_exceeded() {
+    let corpus = dbsafe_bench::corpus::corpus();
+    let scenario = corpus
+        .iter()
+        .find(|s| s.golden.id == "magnitude-drift-over-cap")
+        .expect("the PR-B cap scenario must be in the corpus");
+    let result = run_scenario(scenario);
+    assert_eq!(
+        result.observed.verdict,
+        Verdict::Reverted,
+        "an over-cap write must be fail-closed (CapExceeded ABORT), not committed"
+    );
+    assert_eq!(
+        result.observed.prod_rows_touched, 0,
+        "fail-closed: NO prod rows touched by the over-cap write"
+    );
+    assert!(
+        result.observed.reason.to_lowercase().contains("cap"),
+        "the abort reason must be the cap: {}",
+        result.observed.reason
     );
 }
 
@@ -247,6 +329,8 @@ fn flipping_the_multi_level_cascade_capture_trips_the_gate() {
         captured_image_cols: vec![],
         racing_written_ids: vec![],
         preimage_seam_closed: true,
+        cap: WriteCap::new(u64::MAX, u64::MAX),
+        wal_bytes: 0,
     };
     let neutered = dangerous_scenario(
         "multi-level-cascade-fail-closed",
@@ -306,6 +390,8 @@ fn flipping_the_wide_column_coverage_trips_the_gate() {
         captured_image_cols: vec!["status".to_string()],
         racing_written_ids: vec![],
         preimage_seam_closed: true,
+        cap: WriteCap::new(u64::MAX, u64::MAX),
+        wal_bytes: 0,
     };
     let neutered = dangerous_scenario(
         "wide-column-update-uncaptured-column",
@@ -366,6 +452,8 @@ fn flipping_the_preimage_seam_trips_the_gate() {
         // Defense flipped: the OLD fail-OPEN seam — substitute an id-only image and
         // COMMIT the un-revertable DELETE (the pre-#87 catastrophic FN).
         preimage_seam_closed: false,
+        cap: WriteCap::new(u64::MAX, u64::MAX),
+        wal_bytes: 0,
     };
     let neutered = dangerous_scenario(
         "concurrent-drift-delete-missing-preimage",

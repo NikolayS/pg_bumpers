@@ -32,7 +32,7 @@ pub mod pk_checksum;
 pub mod session;
 
 pub use barrier::{ApplyBarrier, ClosureBarrier, NoopBarrier};
-pub use blast_radius::{BlastRadius, LockHeld, LockMode, OpCounts, TriggerFired};
+pub use blast_radius::{BlastRadius, LockHeld, LockMode, OpCounts, TriggerFired, WriteCap};
 pub use clock::{Clock, MockClock, SystemClock};
 pub use inverse::{CertifiedAction, InverseKind, InversePlan, InverseRow, NotRestored, RefusedOp};
 pub use pk_checksum::{ChecksumError, PkChecksum, PkSetBuilder, PkTuple, PkValue};

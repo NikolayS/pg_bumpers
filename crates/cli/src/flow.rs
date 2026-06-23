@@ -238,8 +238,11 @@ impl<S: Sink, W: WebhookSender, N: NonceStore> ApprovalFlow<S, W, N> {
             Decision::Allow,
             "grant_signed",
             Some(format!(
-                "approver `{}` signed grant for request {id}; binding {}",
+                "approver `{}` signed grant for request {id}; cap(max_rows={}, max_wal_bytes={}); \
+                 binding {}",
                 approver.id,
+                binding.cap.max_rows,
+                binding.cap.max_wal_bytes,
                 binding.binding_hash_hex()
             )),
             &request.proposal.role,

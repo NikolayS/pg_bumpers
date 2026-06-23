@@ -13,11 +13,17 @@
 //!
 //! - a dry-run-validated UPDATE/DELETE **commits** under the guards; the
 //!   **typed-inverse** is captured + matches the changed rows;
-//! - **drift injected via `ApplyBarrier::pause_point()`** → apply-time PK-set
-//!   re-check **ABORTS** (0-tolerance): insert / delete-shrink / predicate-flip
-//!   (same count, different PKs) / trigger-amplification;
-//! - the **RETURNING written-set mismatch** (a post-snapshot trigger writing rows
-//!   OUTSIDE the predicate) → **ABORTS** (the carry-forward);
+//! - **over-count drift injected via `ApplyBarrier::pause_point()`** (a new matching
+//!   row committed before the forward op) → the symmetric `pg_stat_xact_*`
+//!   reconciliation sees the seed's audit trigger fire more than predicted →
+//!   **ABORTS** on the `account_audit.ins` over-write (EPIC #91 PR-B dropped the
+//!   apply-time exact-PK-set re-check; the reconciliation + cap + predicate-gate
+//!   carry the floor — see the §(2) section comment);
+//! - **same-count identity drift in the target** (a written row with no captured
+//!   `FOR UPDATE` pre-image) → **ABORTS** `MissingPreImage` (the #87 pre-image seam,
+//!   which replaced the dropped RETURNING written-set checksum);
+//! - the **absolute write cap** bounds magnitude (`CapExceeded`, exhaustively
+//!   unit-tested in `src/apply.rs`);
 //! - `statement_timeout` fires on a slow apply → abort, **no partial commit**;
 //! - a refused op → **never applied** (DB untouched).
 //!
@@ -39,7 +45,7 @@ use pgb_clone_orchestrator::{PitrConfig, RecoveryFence, WriteKind, guarded_apply
 use pgb_core::inverse::ImageValue;
 use pgb_core::{
     BlastRadius, ClosureBarrier, InverseKind, NoopBarrier, OpCounts, PkChecksum, PkSetBuilder,
-    PkTuple, PkValue, SystemClock,
+    PkTuple, PkValue, SystemClock, WriteCap,
 };
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
@@ -181,52 +187,6 @@ impl ApplyConn for PgApplyConn<'_> {
         // session, so the forward op's footprint is the delta against this).
         self.xact_baseline = self.read_xact_raw()?;
         Ok(())
-    }
-
-    fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-        // Recompute the affected-PK set on the SAME predicate, INSIDE the txn,
-        // BEFORE the forward op (the 0-tolerance drift check's apply-time side).
-        // A cascade relation (composite PK) is recomputed via its registered
-        // CascadeSelect; the target via the single-int-PK `where_sql`.
-        if let Some(c) = self.cascade_selects.get(relation).cloned() {
-            let rows = self
-                .client
-                .query(
-                    &format!(
-                        "SELECT {} FROM {} WHERE {} ORDER BY {}",
-                        c.pk_cols, c.relation, c.where_sql, c.pk_cols
-                    ),
-                    &[],
-                )
-                .map_err(|e| ApplyError::Backend(e.to_string()))?;
-            let mut b = PkSetBuilder::for_relation(relation);
-            for row in &rows {
-                // entries PK = (account_id int, line_no int).
-                let a: i32 = row.get(0);
-                let l: i32 = row.get(1);
-                b.push(PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap())
-                    .map_err(|e| ApplyError::Backend(e.to_string()))?;
-            }
-            return b.finalize().map_err(|e| ApplyError::Backend(e.to_string()));
-        }
-
-        let rows = self
-            .client
-            .query(
-                &format!(
-                    "SELECT id FROM {relation} WHERE {} ORDER BY id",
-                    self.where_sql
-                ),
-                &[],
-            )
-            .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        let mut b = PkSetBuilder::for_relation(relation);
-        for row in &rows {
-            let id: i32 = row.get(0);
-            b.push(PkTuple::single(PkValue::Int(id as i64)))
-                .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        }
-        b.finalize().map_err(|e| ApplyError::Backend(e.to_string()))
     }
 
     fn apply_forward(
@@ -642,6 +602,7 @@ fn dry_run_validated_update_commits_and_captures_matching_typed_inverse() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -715,6 +676,7 @@ fn dry_run_validated_delete_commits_and_captures_insert_inverse() {
             WriteKind::Delete,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -801,6 +763,7 @@ fn pitr_enabled_creates_a_real_restore_point_before_apply() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::enabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -820,12 +783,32 @@ fn pitr_enabled_creates_a_real_restore_point_before_apply() {
 }
 
 // ===========================================================================
-//  (2) DRIFT via ApplyBarrier::pause_point() → apply-time re-check ABORTS.
+//  (2) DRIFT via ApplyBarrier::pause_point() → the apply ABORTS.
+//
+//  EPIC #91 PR-B dropped the apply-time exact-PK-set re-check. The drift these
+//  cases inject (a NEW matching row committed through the §10.4 barrier before the
+//  forward op) now surfaces through the SURVIVING guards instead:
+//
+//   - An OVER-COUNT drift (a new matching even row) makes the seed's AFTER-UPDATE
+//     audit trigger fire ONE MORE TIME than the dry-run predicted → the symmetric
+//     per-op-type `pg_stat_xact_*` reconciliation sees `account_audit.ins` exceed
+//     its prediction → `RelationOverWrite` (a NON-primary, in-radius channel that
+//     stays strict). The over-count cannot commit.
+//
+//  The two former-checksum cases that DROPPED below an abort under a generous cap —
+//  the under-count "delete-shrink" (now a bounded, fully-reversible SUBSET write)
+//  and the same-count/different-PK "predicate-flip" — are removed-with-a-comment
+//  just below `t_drift_trigger_amplification_aborts`: the cap bounds *magnitude*
+//  (unit-tested in `src/apply.rs`: `cap_exceeded_on_rows_aborts_no_mutation` et al)
+//  and the self-determined-predicate gate fixes row *identity* (tested in
+//  `src/predicate.rs`); neither is what these env-gated apply tests can assert, and
+//  the dropped exact-PK-set checksum was the only thing that aborted them.
 // ===========================================================================
 
-/// Shared drift runner: inject `inject_sql` (committed on a second connection)
-/// through the barrier, run the guarded UPDATE, and assert the apply-time PK-set
-/// re-check ABORTED with no change.
+/// Shared over-count drift runner: inject `inject_sql` (committed on a second
+/// connection) through the barrier, run the guarded UPDATE with a GENEROUS cap, and
+/// assert it ABORTED via `RelationOverWrite` on the `account_audit` `ins` channel
+/// (the over-count amplified the audit trigger past its prediction) with no change.
 fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
     let (admin, dbname, _c) = setup(tag)?;
     let url = url_for(&admin, &dbname);
@@ -835,7 +818,7 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
     let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
 
     // The barrier opens a SEPARATE connection and commits the drift before the
-    // apply recomputes the checksum.
+    // forward op runs (the §10.4 seam).
     let inject_url = url.clone();
     let inject = inject_sql.to_string();
     let barrier = ClosureBarrier::new(move |_| {
@@ -851,6 +834,7 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &barrier,
@@ -863,21 +847,28 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
         "{tag}: barrier crossed exactly once"
     );
 
-    match result {
-        Err(ApplyError::PkSetDrift {
-            dry_run,
-            apply_time,
+    // The over-count fired the audit trigger one+ extra time → the per-op-type
+    // reconciliation aborts on the `account_audit` `ins` channel (predicted < actual).
+    match &result {
+        Err(ApplyError::RelationOverWrite {
+            relation,
+            channel,
+            p_ins,
+            a_ins,
             ..
         }) => {
-            assert_ne!(
-                dry_run, apply_time,
-                "{tag}: abort must be a checksum mismatch"
+            assert_eq!(relation, "public.account_audit", "{tag}");
+            assert_eq!(channel, &"ins", "{tag}: the over-count tripped audit ins");
+            assert!(
+                a_ins > p_ins,
+                "{tag}: actual audit ins ({a_ins}) > predicted ({p_ins})"
             );
             eprintln!(
-                "{tag}: GUARD ABORT (apply-time PK-set drift) dry_run={dry_run} apply_time={apply_time}"
+                "{tag}: GUARD ABORT (over-count amplified the audit trigger) \
+                 account_audit ins predicted={p_ins} actual={a_ins} → RelationOverWrite"
             );
         }
-        other => panic!("{tag}: expected PkSetDrift ABORT, got {other:?}"),
+        other => panic!("{tag}: expected RelationOverWrite on account_audit.ins, got {other:?}"),
     }
 
     // No partial commit: the even accounts' balances are UNCHANGED (the apply
@@ -903,7 +894,10 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
 
 #[test]
 fn t_drift_insert_aborts() {
-    // A new matching (even-id) row appears post-snapshot (over-count) → ABORT.
+    // A new matching (even-id) row appears post-snapshot (OVER-count). The seed's
+    // AFTER-UPDATE audit trigger fires 5× (one per updated even row, now 5) vs the
+    // predicted 4 → `account_audit.ins` over-write → ABORT. (Pre-PR-B the dropped
+    // exact-PK-set re-check caught this; the audit amplification carries it now.)
     let Some((admin, dbname)) = run_drift_case(
         "drift_insert",
         "INSERT INTO public.accounts(id, owner, balance) VALUES (100, 'drift', 9999)",
@@ -915,57 +909,13 @@ fn t_drift_insert_aborts() {
 }
 
 #[test]
-fn t_drift_delete_shrink_aborts() {
-    // A matching row vanishes post-snapshot (under-count) → ABORT.
-    let Some((admin, dbname)) =
-        run_drift_case("drift_shrink", "DELETE FROM public.accounts WHERE id = 8")
-    else {
-        return;
-    };
-    eprintln!("T-drift-delete-shrink PASS: under-count drift ABORTED");
-    drop_db(&admin, &dbname);
-}
-
-#[test]
-fn t_drift_predicate_flip_same_count_different_pks_aborts() {
-    // HEADLINE: id 8 leaves the matched set, id 10 enters it — count stays 4, the
-    // PK set changes. A row-count guard PASSES here; only the PK-set checksum
-    // catches it. (We delete the even id=8 and insert a new even id=10.)
-    let Some((admin, dbname)) = run_drift_case(
-        "drift_flip",
-        "DELETE FROM public.accounts WHERE id = 8; \
-         INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'flip', 1234);",
-    ) else {
-        return;
-    };
-    // Prove the COUNT is unchanged (so a count-only guard would have MISSED it).
-    let url = url_for(&admin, &dbname);
-    let mut c = Client::connect(&url, NoTls).unwrap();
-    let n: i64 = c
-        .query_one(
-            &format!("SELECT count(*) FROM public.accounts WHERE {EVEN_WHERE}"),
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    eprintln!("T-drift-predicate-flip: matching-row count is still {n} (count guard blind spot)");
-    assert_eq!(
-        n, 4,
-        "count unchanged — only the PK-set checksum catches this"
-    );
-    eprintln!("T-drift-predicate-flip PASS: identical count, different PK set → ABORTED");
-    drop_db(&admin, &dbname);
-}
-
-#[test]
 fn t_drift_trigger_amplification_aborts() {
     // A trigger is installed on `accounts` post-snapshot (amplifying the audit
     // side-effect footprint), and the same migration also shifts a NEW row INTO
-    // the predicate (an even id=12). The apply-time recompute observes the changed
-    // affected-PK set → ABORT. (Per §10.3/the spike: a pre-op recompute cannot see
-    // a trigger that writes *outside* the predicate during the forward op — that
-    // case is the RETURNING written-set check below — so this models the honest,
-    // catchable case where the migration shifts the matched set itself.)
+    // the predicate (an even id=12), so the audit trigger fires many more times
+    // than predicted → `account_audit.ins` over-write → ABORT. (Pre-PR-B this also
+    // tripped the exact-PK-set re-check on the shifted matched set; the
+    // reconciliation's audit-ins over-write carries it now.)
     let Some((admin, dbname)) = run_drift_case(
         "drift_amplify",
         "CREATE FUNCTION public.accounts_amplify() RETURNS trigger LANGUAGE plpgsql AS $$ \
@@ -979,6 +929,28 @@ fn t_drift_trigger_amplification_aborts() {
     eprintln!("T-drift-trigger-amplification PASS: post-snapshot trigger+row shift ABORTED");
     drop_db(&admin, &dbname);
 }
+
+// REMOVED (EPIC #91 PR-B): `t_drift_delete_shrink_aborts` and
+// `t_drift_predicate_flip_same_count_different_pks_aborts`.
+//
+// Both relied on the apply-time exact-PK-set checksum re-check, which PR-B dropped.
+// With a generous cap and the seed's audit trigger:
+//   - the under-count "delete-shrink" (DELETE id=8 before the apply) now commits a
+//     BOUNDED, fully-reversible SUBSET write of {2,4,6} — there is no over-write to
+//     catch (an under-count never exceeds a strict channel or the cap), and the
+//     inverse correctly captures exactly the 3 rows it wrote, so it is safe (not a
+//     silent data-loss commit, just a smaller-than-approved reversible write);
+//   - the same-count/different-PK "predicate-flip" (DELETE id=8 + INSERT id=10)
+//     commits {2,4,6,10} (audit ins 4 == predicted 4, primary channel exempt) — the
+//     dropped checksum was the ONLY guard that pinned the row IDENTITY at the same
+//     count.
+// Magnitude is now pinned by the cap (unit-tested in `src/apply.rs`:
+// `cap_exceeded_on_rows_aborts_no_mutation`, `cap_exceeded_on_wal_bytes_aborts`,
+// `cap_below_dry_run_footprint_is_refused_before_txn`) and row IDENTITY by the
+// self-determined-predicate gate (the grant-bound WHERE may reference only the
+// immutable PK; tested in `src/predicate.rs`). Neither role is assertable from these
+// env-gated apply tests, so these two cases are removed rather than left asserting a
+// guard that no longer fires.
 
 // ===========================================================================
 //  (3) THE DATA-LOSS BLOCKERS — a post-snapshot trigger / cascade that writes
@@ -1026,6 +998,7 @@ fn t_after_trigger_deletes_out_of_predicate_row_aborts_id7_intact() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1148,6 +1121,7 @@ fn t_op_type_substitution_predicted_insert_actual_delete_on_audit_aborts() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1248,6 +1222,7 @@ fn t_after_trigger_wipes_separate_table_aborts_mirror_intact() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1318,22 +1293,23 @@ fn t_cascade_drift_more_children_than_predicted_aborts() {
             WriteKind::Delete,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
             &SystemClock::new(),
         )
     };
-    // The cascade child PK-set drifted (new rows under id=2) — caught at the
-    // pre-op cascade re-check (step 5) OR the stat-delta over-write (step 6).
+    // The cascade child set drifted (+50 new rows under the in-predicate parent
+    // id=2). The parent PK set is UNCHANGED ({2,4,6,8}), so the now-dropped
+    // exact-PK-set re-check is irrelevant here; the DELETE still cascades and
+    // destroys MORE children than predicted. `entries` is a CASCADE relation, so
+    // its `del` channel is NOT the target's primary channel and stays strict — the
+    // symmetric per-op-type `pg_stat_xact_*` reconciliation sees del(58) >
+    // predicted del(8) → `RelationOverWrite` on `public.entries` `del` channel →
+    // ABORT, children intact. (Pre-PR-B this could also surface as the cascade
+    // PK-set re-check; that re-check is dropped, the reconciliation carries it.)
     match result {
-        Err(ApplyError::PkSetDrift { relation, .. }) => {
-            assert_eq!(relation, "public.entries");
-            eprintln!(
-                "T-cascade-drift PASS: cascade child PK-set drift (predicted {predicted_children} \
-                 children, +50 added post-snapshot) caught at the cascade re-check → ABORTED"
-            );
-        }
         Err(ApplyError::RelationOverWrite {
             relation,
             channel,
@@ -1344,12 +1320,13 @@ fn t_cascade_drift_more_children_than_predicted_aborts() {
             assert_eq!(relation, "public.entries");
             assert_eq!(channel, "del");
             assert!(a_del > p_del);
+            let _ = predicted_children;
             eprintln!(
                 "T-cascade-drift PASS: cascade destroyed {a_del} children > predicted {p_del} \
                  (per-op-type pg_stat_xact reconciliation, del channel) → ABORTED"
             );
         }
-        other => panic!("expected cascade PkSetDrift / RelationOverWrite, got {other:?}"),
+        other => panic!("expected cascade RelationOverWrite on entries.del, got {other:?}"),
     }
     // Children + parents INTACT.
     let children_after: i64 = {
@@ -1406,6 +1383,7 @@ fn t_before_trigger_value_hijack_inverse_captures_actual_old_values() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1571,6 +1549,7 @@ fn t_wide_column_update_is_fully_reversible_revert_restores_all_columns() {
             WriteKind::Update,
             "public.wide",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1721,6 +1700,7 @@ fn t_concurrent_insert_into_predicate_delete_aborts_missing_preimage_read_commit
             WriteKind::Delete,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1792,6 +1772,7 @@ fn t_concurrent_insert_into_predicate_update_aborts_missing_preimage_read_commit
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1857,6 +1838,7 @@ fn t_repeatable_read_closes_the_concurrent_insert_gap_production_conn_commits_re
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1944,6 +1926,7 @@ fn t_repeatable_read_concurrent_update_of_target_row_serialization_failure_abort
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1979,9 +1962,12 @@ fn t_repeatable_read_concurrent_update_of_target_row_serialization_failure_abort
 }
 
 // ===========================================================================
-//  (3b) RETURNING written-set check — same-relation, same-COUNT identity drift
-//       that the stat-delta count check cannot see. The forward op writes a
-//       DIFFERENT set of the SAME size in the target → step 7 ABORTS.
+//  (3b) SAME-COUNT identity drift in the target — the forward op writes a
+//       DIFFERENT set of the SAME size than the predicate the pre-image was
+//       captured over. The dropped (EPIC #91 PR-B) RETURNING written-set checksum
+//       used to catch this by row-identity; it is now caught structurally by the
+//       fail-CLOSED pre-image seam (#87): a written row with no captured
+//       `FOR UPDATE` pre-image → `MissingPreImage` → ABORT, no mutation.
 // ===========================================================================
 
 #[test]
@@ -1992,21 +1978,19 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
     let url = url_for(&admin, &dbname);
     let before = read_accounts(&url);
 
-    // The grant is for {2,4,6,8} (the EVEN_WHERE predicate the recompute uses). The
-    // forward op writes a DIFFERENT set of the SAME cardinality 4 — {2,4,6,1}
-    // (id=8 OUT via `id<>8`, id=1 IN). The pre-op recompute on EVEN_WHERE → {2,4,6,8}
-    // == grant (PASS), and the txn changes exactly 4 target rows (stat-delta count
-    // matches), but the RETURNING set {1,2,4,6} differs from the predicted {2,4,6,8}.
-    // This is same-count identity drift in the target.
+    // The grant is for {2,4,6,8} (the EVEN_WHERE predicate the pre-image capture
+    // uses). The forward op writes a DIFFERENT set of the SAME cardinality 4 —
+    // {1,2,4,6} (id=8 OUT via `id<>8`, id=1 IN). The txn changes exactly 4 target
+    // rows (stat-delta count matches), but the RETURNING set {1,2,4,6} differs from
+    // the captured {2,4,6,8}.
     //
-    // Two fail-closed guards now catch it, BOTH of which abort with no mutation:
-    //   - the P1 (#87) fail-CLOSED pre-image seam fires FIRST: the written id=1 is
-    //     NOT in the `FOR UPDATE` pre-image capture (taken over EVEN_WHERE = {2,4,6,8}),
-    //     so it has no pre-image → `MissingPreImage`;
-    //   - failing that (e.g. if the capture predicate matched), step-7's written-set
-    //     checksum would catch the {1,2,4,6} ≠ {2,4,6,8} mismatch → `WrittenSetMismatch`.
-    // Either is a correct, byte-for-byte-unchanged abort; we accept both (the seam is
-    // strictly a tightening — it catches the uncaptured written row even earlier).
+    // The former exact RETURNING written-set checksum (dropped in PR-B) pinned this
+    // by row identity. It is now caught structurally and EARLIER by the P1 (#87)
+    // fail-CLOSED pre-image seam: the written id=1 is NOT in the `FOR UPDATE`
+    // pre-image capture (taken over EVEN_WHERE = {2,4,6,8}), so it has no pre-image
+    // → `MissingPreImage` → ROLLBACK (no un-revertable write commits). Byte-for-byte
+    // unchanged, exactly as before — the surviving guard that owns same-count target
+    // identity drift.
     let grant = grant_for("p-ret", &url, EVEN_WHERE, 50);
     let forward = "UPDATE public.accounts SET balance = 0 WHERE (id % 2 = 0 AND id <> 8) OR id = 1";
 
@@ -2018,6 +2002,7 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2025,15 +2010,6 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
         )
     };
     match result {
-        Err(ApplyError::WrittenSetMismatch {
-            predicted, written, ..
-        }) => {
-            assert_ne!(predicted, written);
-            eprintln!(
-                "T-returning-written-set PASS: same-count identity drift in the target \
-                 (predicted={predicted} written={written}) → WrittenSetMismatch ABORT"
-            );
-        }
         Err(ApplyError::MissingPreImage { relation, pk }) => {
             assert_eq!(relation, "public.accounts");
             assert_eq!(
@@ -2042,11 +2018,11 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
             );
             eprintln!(
                 "T-returning-written-set PASS: same-count identity drift — the written id=1 has \
-                 no captured pre-image → MissingPreImage ABORT (the P1 #87 seam catches it even \
-                 earlier than the step-7 written-set check)"
+                 no captured pre-image → MissingPreImage ABORT (the P1 #87 seam owns this since \
+                 PR-B dropped the step-7 written-set checksum)"
             );
         }
-        other => panic!("expected WrittenSetMismatch or MissingPreImage, got {other:?}"),
+        other => panic!("expected MissingPreImage (same-count identity drift), got {other:?}"),
     }
     let after = read_accounts(&url);
     assert_eq!(
@@ -2082,6 +2058,7 @@ fn statement_timeout_fires_and_leaves_no_partial_commit() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2129,6 +2106,7 @@ fn refused_op_is_never_applied_db_untouched() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),

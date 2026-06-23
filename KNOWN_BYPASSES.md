@@ -184,38 +184,54 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
 - **SPEC.amendments tie:** "#80 — MVP spec-faithfulness closeout" → *Gap 2*
   (`replica.dsn` inert + §10.8 degraded budgets recorded as deferred → #77).
 
-## B8 — Exact-set apply-time re-check makes guarded writes a low-churn / re-review-on-drift tool, not a bulk applier
+## B8 — A grant authorizes "this statement, ≤ N rows, reversibly, immutable-PK predicate"; AFTER-trigger effects are NOT undone (EPIC #91 — exact-set checksum REMOVED)
 
-> _(Filed under #87 as "B5" in the issue; B5–B7 were already allocated, so it lands
-> here as **B8**.)_
+> _(Originally filed under #87 as the exact-set re-check residual; EPIC #91 **dropped** that
+> checksum, so B8 is rewritten to disclose the replacement — predicate gate + cap — and its
+> honest residual.)_
 
-- **Damage class:** N/A (scope/UX of the guarded-write tool, not a floor guarantee).
-  **Defense layer:** guarded-apply PK-set authorization-freshness re-check (§14.3 binding).
-- **What it is:** the apply-time affected-PK-set checksum re-check is 0-tolerance exact-set
-  equality (the live `SELECT id … WHERE <pred> ORDER BY id` must equal the approved set
-  byte-for-byte) — an authorization-freshness property by design. Consequence: on a stable
-  explicitly-keyed write (`WHERE id=42`, `IN (…)`) it is meaningful + cheap; on a predicate over
-  mutable/high-churn data (`WHERE status='open'`, `created < $1`, `id%2=0`) any concurrent
-  committed change to the predicate's extension between approval and apply flips the set and
-  aborts the already-approved write (`PkSetDrift`/`BindingMismatch`) — no tolerance band. Net:
-  guarded apply is a small, stable, re-review-on-drift instrument for surgical keyed writes, NOT
-  a bulk applier over hot tables; drift forces re-approval (single-use point-in-time grant), it
-  is not retried through. **Bounded-ness and reversibility do NOT depend on this re-check** (see
-  `CLAUDE.md` §2): bounded comes from the `pg_stat_xact_*` reconciliation + `statement_timeout`
-  budget; reversibility from the pre-image capture (`FOR UPDATE`+`RETURNING`) + the coverage
-  guards (incl. the #87 fail-closed `MissingPreImage` seam).
-- **Why it is not closed:** it is not a defect — exact-set equality is exactly the anti-TOCTOU
-  binding §14.3 needs (it pins the human's grant to the precise approved row-identity set). A
-  tolerance band would loosen the binding. The "limitation" is the honest UX consequence: this is
-  a surgical, low-churn instrument, not a hot-table bulk tool.
-- **Repro:** `dbsafe-bench` `no-where-write-drift` (same-count/different-PK flip → `PkSetDrift`
-  abort) + the env-gated PG18 ITs `apply_it::t_drift_predicate_flip_same_count_different_pks_aborts`
-  and `apply_grant_it`'s data-drift case (`BindingMismatch`); the #87 ITs prove the bound/undo
-  guards are the ones carrying capping + reversibility (`t_repeatable_read_*`,
-  `t_concurrent_insert_*`).
-- **SPEC.amendments tie:** "#87 — moat-seam fix" (the PK-set re-check re-attributed as an
-  authorization-freshness gate; bound → budget + reconciliation, undo → pre-image capture +
-  coverage guards).
+- **Damage class:** N/A (scope of the guarded-write grant, not a floor false-negative).
+  **Defense layer:** the self-determined-predicate gate (identity) + the absolute `WriteCap`
+  (magnitude), the EPIC #91 replacements for the dropped exact-PK-set checksum.
+- **What it is:** a §14.3 grant now authorizes exactly "**this statement_text, up to N rows
+  / W WAL bytes (`WriteCap`), reversibly, over a self-determined immutable-PK predicate**".
+  The exact affected-PK-**set** checksum is **gone** (founder decision): a grant no longer
+  pins the precise row-*identity* set. Instead —
+  - **identity** is pinned structurally by the **predicate gate**: the grant-bound WHERE may
+    reference only the immutable single-column PK + literals (+ immutable functions on it), so
+    the approved `statement_text` itself fixes the row set; a non-PK column, a subquery, or a
+    **`UPDATE … FROM` / `DELETE … USING`** join-correlation is **refused** (steerable);
+  - **magnitude** is pinned by the **cap**, enforced inside the apply txn (rows from
+    `pg_stat_xact_*` + WAL bytes → `CapExceeded`).
+  Consequence: a self-determined predicate (e.g. `id % 2 = 0`, `id IN (…)`, `id BETWEEN`) may
+  legitimately match **more rows at apply than at dry-run** (concurrent inserts) — that is now
+  **allowed up to the cap** (it is no longer a `PkSetDrift` self-abort), which makes guarded
+  apply usable over keyed predicates, not only fully-enumerated `WHERE id=42`. Over the cap →
+  abort (`CapExceeded`), re-propose / re-approve with a larger cap.
+- **The honest residual (DISCLOSED):** side-effecting **AFTER-triggers fire on the approved
+  rows**. The typed-inverse restores the *target + cascade* rows, but a trigger that writes a
+  relation **OUTSIDE** the captured inverse (e.g. an audit/log table, or any
+  non-cascade-non-target write) has its **effect NOT undone** by the revert (the reconciliation
+  refuses an *unpredicted* / over-predicted such write, but a *predicted* in-radius trigger
+  write — e.g. an INSERT into an audit table the dry-run measured — is committed and its row is
+  not removed on revert). This is **surfaced to the human at approval** as a first-class fact
+  (`RequestElevationResult.side_effecting_triggers` lists the trigger names that fire), so
+  approving is an informed "I accept these side effects on the approved rows".
+- **Why it is not closed:** dropping the checksum is the founder's decision; the cap + predicate
+  gate carry the absolute floor (bounded magnitude + pinned identity + reversibility), proven by
+  the gate's 0-FN/0-FP corpus and the `gate_has_teeth` cap flip. Effect-undo of arbitrary
+  trigger writes is out of scope for the typed-inverse MVP (it would require a generic
+  trigger-effect inverse); the honest move is to **disclose + surface**, not to silently claim
+  it is reverted.
+- **Repro:** `dbsafe-bench` `magnitude-drift-over-cap` (cap=5, live=8 → `CapExceeded` →
+  REVERTED) + `gate_has_teeth::flipping_the_absolute_cap_trips_the_gate`; the env-gated PG18
+  ITs `apply_grant_it::apply_time_magnitude_drift_rejects_via_cap_no_mutation`,
+  `within_cap_concurrent_insert_still_commits_reversibly`,
+  `join_correlated_update_from_is_refused_before_txn`; the cap unit tests
+  `apply::tests::cap_exceeded_on_{rows,wal_bytes}_*`; binding v2
+  `grant::tests::t_grant_v1_token_fails_closed_under_v2`.
+- **SPEC.amendments tie:** "EPIC #91 — the exact-PK-set checksum is DROPPED; identity →
+  predicate gate, magnitude → absolute cap".
 
 ---
 
@@ -227,6 +243,7 @@ empty (0 FN / 0 FP over the frozen corpus). B1–B8 are the honest **scope** of 
 MVP — bounded (not zero) read disclosure, a cooperative MCP, single-int-PK apply,
 deferred cross-process attestation, a file-anchor stand-in, a stubbed (tighten-only)
 RiskEngine, an inert `replica.dsn` (no replica read-routing / degraded-budget
-differential yet, deferred → #77), and the exact-set apply-time re-check that makes
-guarded writes a surgical, re-review-on-drift tool (B8) — each disclosed here with a
-repro and tied to its SPEC.amendments entry.
+differential yet, deferred → #77), and (B8, EPIC #91) the grant scope — identity by the
+predicate gate + magnitude by the cap (the exact-PK-set checksum is **removed**), with the
+honest residual that AFTER-trigger effects on the approved rows are not undone (surfaced at
+approval) — each disclosed here with a repro and tied to its SPEC.amendments entry.

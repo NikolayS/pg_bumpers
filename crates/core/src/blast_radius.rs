@@ -94,6 +94,47 @@ pub struct Affected {
     pub total_rows: u64,
 }
 
+/// The **absolute apply-time cap** a human approves for a guarded write (EPIC #91
+/// PR-B). This is the **absolute-magnitude anchor** on an approved write that
+/// replaced the exact-PK-set checksum (founder decision): the checksum pinned the
+/// exact row *identity* set, but reconciliation is *relative* to the dry-run
+/// prediction, `statement_timeout` is wall-clock, and the read-path `RoleBudget`
+/// does not touch the write path — so without an absolute cap, nothing pinned the
+/// absolute *magnitude* of an approved write once the checksum was dropped.
+///
+/// The cap is enforced **inside the apply txn** ([`crate::ApplyError`]-style abort
+/// in `pgb_clone_orchestrator`): if the live write's actual magnitude (rows changed,
+/// from `pg_stat_xact_*`, or WAL bytes generated) exceeds the approved cap, the
+/// apply ABORTs (`CapExceeded`) with no mutation. Together with the
+/// self-determined-predicate gate (identity), the `pg_stat_xact_*` reconciliation
+/// (relative effect), and the pre-image coverage (reversibility), the cap carries
+/// the deterministic floor without the exact-set checksum.
+///
+/// The cap is part of the signed §14.3 grant binding (a bound field), so a swapped
+/// or absent cap fails the binding-hash check closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteCap {
+    /// The maximum number of rows the approved write may change **across its full
+    /// footprint** (target + cascades + trigger-written tables), measured from the
+    /// apply txn's `pg_stat_xact_n_tup_{ins,upd,del}` deltas. An apply whose summed
+    /// tuple changes exceed this aborts before commit.
+    pub max_rows: u64,
+    /// The maximum WAL bytes the approved write's apply txn may generate
+    /// (`pg_current_wal_insert_lsn()` delta across the forward op, the same measure
+    /// the dry-run records). An apply that generates more WAL than this aborts.
+    pub max_wal_bytes: u64,
+}
+
+impl WriteCap {
+    /// Construct a cap from explicit row + WAL-byte ceilings.
+    pub const fn new(max_rows: u64, max_wal_bytes: u64) -> Self {
+        WriteCap {
+            max_rows,
+            max_wal_bytes,
+        }
+    }
+}
+
 /// A trigger that the proposed write would fire, and how many rows it touches
 /// (SPEC §10.1 `triggers_fired`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +247,71 @@ impl BlastRadius {
         let direct: u64 = self.affected.by_table.values().copied().sum();
         let cascade: u64 = self.affected.cascade_by_table.values().copied().sum();
         direct.saturating_add(cascade)
+    }
+
+    /// The **full predicted footprint magnitude** the apply reconciles against:
+    /// the sum of every relation's `pg_stat_xact_*` op counts in
+    /// [`Affected::effect_by_table`] (target + cascades + trigger-written tables),
+    /// across all three op channels. This is the dry-run's measured **absolute
+    /// magnitude** — the basis for the suggested cap. Falls back to
+    /// [`computed_total_rows`](Self::computed_total_rows) when the backend recorded
+    /// no `effect_by_table` (an older record), so the suggestion is never zero for a
+    /// write that touched rows.
+    pub fn predicted_total_tuples(&self) -> u64 {
+        let measured: u64 = self
+            .affected
+            .effect_by_table
+            .values()
+            .map(|c| c.total())
+            .fold(0u64, |a, b| a.saturating_add(b));
+        if measured == 0 {
+            self.computed_total_rows()
+        } else {
+            measured
+        }
+    }
+
+    /// A **suggested absolute cap** (EPIC #91 PR-B) the CLI pre-fills the approval
+    /// with, sized from the dry-run's measured magnitude plus `headroom` (a fraction
+    /// such as `0.10` for +10%). The human may then tighten it (a smaller bound) or
+    /// raise it per §14.2 — the suggestion is a starting point, not a ceiling on the
+    /// approver.
+    ///
+    /// - `max_rows` = `ceil(predicted_total_tuples × (1 + headroom))`, with a floor of
+    ///   the predicted total itself (so a 0% headroom still admits the predicted
+    ///   write) and a floor of 1 for a measured-but-rounding-to-zero footprint;
+    /// - `max_wal_bytes` = `ceil(wal_bytes × (1 + headroom))`, floored at the measured
+    ///   `wal_bytes` (and at 0 when the dry-run generated no WAL — the apply then
+    ///   commits only if it likewise generates none).
+    ///
+    /// Saturating throughout so a pathological prediction cannot overflow the cap.
+    pub fn suggested_cap(&self, headroom: f64) -> WriteCap {
+        let headroom = if headroom.is_finite() && headroom >= 0.0 {
+            headroom
+        } else {
+            0.0
+        };
+        let with_headroom = |base: u64| -> u64 {
+            // base + ceil(base * headroom), saturating, never below `base`. We add
+            // the headroom as a separate ceil'd term (rather than `base * (1 +
+            // headroom)`) so binary-float drift cannot inflate the result by a whole
+            // unit (e.g. `100 * 1.10 == 110.0000000001` ceil'ing to 111). A tiny
+            // epsilon absorbs the residual float error in the extra term itself.
+            let extra = (base as f64) * headroom;
+            if !extra.is_finite() {
+                return u64::MAX;
+            }
+            let extra_ceiled = (extra - 1e-9).ceil().max(0.0);
+            if extra_ceiled >= (u64::MAX as f64) {
+                return u64::MAX;
+            }
+            base.saturating_add(extra_ceiled as u64)
+        };
+        let rows_base = self.predicted_total_tuples().max(1);
+        WriteCap {
+            max_rows: with_headroom(rows_base),
+            max_wal_bytes: with_headroom(self.wal_bytes),
+        }
     }
 }
 
@@ -383,5 +489,103 @@ mod tests {
             Some(LockMode::RowExclusiveLock)
         );
         assert_eq!(br.computed_total_rows(), br.affected.total_rows);
+    }
+
+    // ---- WriteCap + suggested_cap (EPIC #91 PR-B absolute magnitude anchor) ----
+
+    #[test]
+    fn write_cap_round_trips_through_serde() {
+        let cap = WriteCap::new(42, 4096);
+        let json = serde_json::to_string(&cap).expect("serialize cap");
+        let back: WriteCap = serde_json::from_str(&json).expect("re-parse cap");
+        assert_eq!(cap, back);
+        assert_eq!(back.max_rows, 42);
+        assert_eq!(back.max_wal_bytes, 4096);
+    }
+
+    /// `predicted_total_tuples` sums the FULL measured footprint across all op
+    /// channels (target + cascade + trigger-written tables), not a single relation.
+    #[test]
+    fn predicted_total_tuples_sums_the_full_effect_footprint() {
+        let mut effect = BTreeMap::new();
+        effect.insert("public.orders".to_string(), OpCounts::new(0, 4, 0));
+        effect.insert("public.order_items".to_string(), OpCounts::new(0, 0, 6));
+        effect.insert("public.orders_audit".to_string(), OpCounts::new(4, 0, 0));
+        let br = BlastRadius {
+            proposal_id: "p".into(),
+            clone_lsn: "0/0".into(),
+            staleness_lsn_bytes: 0,
+            affected: Affected {
+                by_table: BTreeMap::new(),
+                cascade_by_table: BTreeMap::new(),
+                pk_set_checksum: BTreeMap::new(),
+                effect_by_table: effect,
+                total_rows: 10,
+            },
+            triggers_fired: vec![],
+            locks: vec![],
+            max_lock_mode: LockMode::RowExclusiveLock,
+            duration_ms: 5,
+            wal_bytes: 1000,
+            constraint_violations: vec![],
+            reversible: true,
+            inverse_kind: InverseKind::PreimageUpsert,
+            predicate_volatile: false,
+        };
+        // 4 + 6 + 4 = 14 tuples across the full footprint.
+        assert_eq!(br.predicted_total_tuples(), 14);
+    }
+
+    /// `suggested_cap(0.10)` sizes both ceilings at +10% (ceiled), never below the
+    /// measured base — so the predicted write always fits the suggestion.
+    #[test]
+    fn suggested_cap_adds_headroom_and_never_under_predicts() {
+        let mut effect = BTreeMap::new();
+        effect.insert("public.orders".to_string(), OpCounts::new(0, 100, 0));
+        let br = BlastRadius {
+            proposal_id: "p".into(),
+            clone_lsn: "0/0".into(),
+            staleness_lsn_bytes: 0,
+            affected: Affected {
+                by_table: BTreeMap::new(),
+                cascade_by_table: BTreeMap::new(),
+                pk_set_checksum: BTreeMap::new(),
+                effect_by_table: effect,
+                total_rows: 100,
+            },
+            triggers_fired: vec![],
+            locks: vec![],
+            max_lock_mode: LockMode::RowExclusiveLock,
+            duration_ms: 5,
+            wal_bytes: 2000,
+            constraint_violations: vec![],
+            reversible: true,
+            inverse_kind: InverseKind::PreimageUpsert,
+            predicate_volatile: false,
+        };
+        let cap = br.suggested_cap(0.10);
+        assert_eq!(cap.max_rows, 110, "100 rows +10% = 110");
+        assert_eq!(cap.max_wal_bytes, 2200, "2000 WAL bytes +10% = 2200");
+        // Zero headroom still admits the predicted write exactly.
+        let tight = br.suggested_cap(0.0);
+        assert_eq!(tight.max_rows, 100);
+        assert_eq!(tight.max_wal_bytes, 2000);
+        // A negative / non-finite headroom is clamped to 0 (fail-safe, never < base).
+        let clamped = br.suggested_cap(-1.0);
+        assert_eq!(clamped.max_rows, 100);
+        let nan = br.suggested_cap(f64::NAN);
+        assert_eq!(nan.max_rows, 100);
+    }
+
+    /// With no measured `effect_by_table` (a legacy record) the suggestion falls
+    /// back to `computed_total_rows` so it is never zero for a write that touched
+    /// rows, and `max_rows` is floored at 1.
+    #[test]
+    fn suggested_cap_falls_back_when_no_effect_measured() {
+        let br: BlastRadius = serde_json::from_str(SAMPLE_JSON).expect("sample must parse");
+        // SAMPLE has empty effect_by_table → falls back to computed_total_rows.
+        assert!(br.affected.effect_by_table.is_empty());
+        let cap = br.suggested_cap(0.0);
+        assert_eq!(cap.max_rows, br.computed_total_rows().max(1));
     }
 }

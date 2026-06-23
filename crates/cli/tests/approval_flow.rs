@@ -55,7 +55,7 @@ fn sample_proposal() -> Proposal {
         role: "app_writer".to_string(),
         session_id: "sess-abc".to_string(),
         dry_run_lsn: "3A/7F00C8".to_string(),
-        blast_radius_checksum: "sha256:abc123".to_string(),
+        cap: pgb_core::WriteCap::new(8, 4096),
     }
 }
 
@@ -152,6 +152,18 @@ fn approve_then_grant_verifies_at_apply() {
     assert_eq!(chain[0].payload.decision, Decision::Block);
     assert_eq!(chain[1].payload.decision, Decision::Allow);
     assert_eq!(chain[2].payload.decision, Decision::Allow);
+    // EPIC #91 PR-B: the grant_signed audit record discloses the approved cap (the
+    // magnitude anchor) as a first-class fact, so the chain records WHAT magnitude
+    // the human authorized — not just that they signed.
+    let grant_signed_reason = chain[1]
+        .payload
+        .reason
+        .as_deref()
+        .expect("grant_signed has a reason");
+    assert!(
+        grant_signed_reason.contains("cap(max_rows=8, max_wal_bytes=4096)"),
+        "grant_signed audit must record the approved cap, got: {grant_signed_reason}"
+    );
 }
 
 // ----------------------------------------------------------------------------
