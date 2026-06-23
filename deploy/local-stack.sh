@@ -34,8 +34,10 @@ IFS=$'\n\t'
 # back-compat) → the Homebrew keg path (macOS dev fallback).
 PGBIN="${PG_BUMPERS_PG18_BIN:-${PGBIN:-/opt/homebrew/opt/postgresql@18/bin}}"
 
-# Repo root = parent of this script's dir, so paths work from any cwd.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Repo root = parent of this script's dir, so paths work from any cwd. The
+# ${BASH_SOURCE[0]:-$0} fallback keeps this robust under `set -u` when the file is sourced
+# (the issue #16 test seam sources it to unit-test validate_root / pid_is_ours).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ROOT="${PG_BUMPERS_LOCALSTACK_DIR:-$REPO_ROOT/.localstack}"
@@ -96,8 +98,57 @@ require_bins() {
   done
 }
 
+# Canonicalize an ABSOLUTE path to its real, symlink-resolved, '.'/'..'-normalized form
+# WITHOUT requiring the whole path to exist yet (issue #16). The data dir may not exist on
+# first `up`, so we canonicalize the longest EXISTING leading ancestor (cd + `pwd -P`,
+# which resolves symlinks and collapses '.'/'..') and re-attach the not-yet-existing tail.
+# Portable across macOS (BSD, no `realpath -m`) and Linux (GNU). Prints the canonical path;
+# returns non-zero (prints nothing) if the input is empty or not absolute. The result is
+# used ONLY for comparison/confinement checks — never to drive a write or a kill on its own.
+canonicalize_path() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  case "$p" in /*) : ;; *) return 1 ;; esac
+  # Strip a trailing slash (but keep "/" itself intact).
+  while [ "${p%/}" != "$p" ] && [ -n "${p%/}" ]; do p="${p%/}"; done
+  # Walk down from the full path, peeling the trailing segment until what remains is an
+  # existing directory. `tail` accumulates the peeled (not-yet-existing) suffix.
+  local existing="$p" tail=""
+  while [ -n "$existing" ] && [ ! -d "$existing" ]; do
+    local seg="${existing##*/}"        # last path segment
+    tail="${seg}${tail:+/}$tail"       # prepend onto the suffix
+    local parent="${existing%/*}"      # drop the last segment
+    [ -n "$parent" ] || parent="/"     # parent of a top-level entry is /
+    existing="$parent"
+  done
+  # `existing` is now an existing directory (worst case "/"). Canonicalize it physically.
+  local realbase
+  realbase="$(cd "$existing" 2>/dev/null && pwd -P)" || return 1
+  if [ -n "$tail" ]; then
+    if [ "$realbase" = "/" ]; then printf '/%s\n' "$tail"; else printf '%s/%s\n' "$realbase" "$tail"; fi
+  else
+    printf '%s\n' "$realbase"
+  fi
+}
+
+# True iff the path contains a '..' path SEGMENT (so we can refuse traversal outright,
+# before canonicalization, rather than rely solely on the resolved prefix check).
+has_dotdot_segment() {
+  case "/$1/" in
+    */../*) return 0 ;;
+    *)      return 1 ;;
+  esac
+}
+
 # Refuse to operate on a dangerous $ROOT before any rm -rf. Defaults are safe
 # ($REPO_ROOT/.localstack); this guards a caller exporting a broad path.
+#
+# Hardening (issue #16): the under-repo / *localstack* confinement is checked against the
+# CANONICALIZED path, and any '..' segment is refused OUTRIGHT. A hostile
+# PG_BUMPERS_LOCALSTACK_DIR like "$REPO_ROOT/.localstack/../../../tmp/x" string-prefixes
+# the repo yet RESOLVES outside it; the old string-prefix check let it through, so the
+# later `rm -rf "$ROOT"` (files only — NEVER the kill path) could run OUTSIDE confinement.
+# We now (1) reject '..' segments, (2) canonicalize, and (3) confine on the canonical path.
 validate_root() {
   [ -n "$ROOT" ]            || die "PG_BUMPERS_LOCALSTACK_DIR resolved to empty — refusing"
   [ "$ROOT" != "/" ]       || die "PG_BUMPERS_LOCALSTACK_DIR='/' — refusing"
@@ -105,18 +156,37 @@ validate_root() {
     /*) : ;;  # absolute, good
     *)  die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' is not an absolute path — refusing" ;;
   esac
-  # Disallow $HOME itself and other obviously-too-broad roots.
-  [ "$ROOT" != "${HOME:-/nonexistent}" ] || die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' is \$HOME — refusing"
-  # The basename must be a recognizable localstack dir, OR the path must be
-  # confined under the repo. This keeps teardown defensible against typos.
-  local base; base="$(basename "$ROOT")"
-  case "$ROOT" in
-    "$REPO_ROOT"/*) return 0 ;;  # under the repo — always fine
+  # Refuse traversal outright: a '..' segment is never legitimate for our throwaway root,
+  # and refusing it up front means confinement can never be tricked by a path that
+  # string-prefixes an allowed root but climbs back out via '..'.
+  if has_dotdot_segment "$ROOT"; then
+    die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' contains a '..' segment — refusing (path traversal)"
+  fi
+  # Canonicalize (symlink-resolve + normalize) the nearest existing ancestor + remaining
+  # tail; the dir may not exist yet on first `up`. All confinement checks run on this.
+  local canon
+  canon="$(canonicalize_path "$ROOT")" \
+    || die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' could not be canonicalized — refusing"
+  [ -n "$canon" ] && [ "$canon" != "/" ] \
+    || die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' canonicalizes to '$canon' — refusing"
+  # Likewise canonicalize the repo root so the under-repo check compares real path to real
+  # path (e.g. /var vs /private/var on macOS, or a symlinked checkout).
+  local repo_canon
+  repo_canon="$(canonicalize_path "$REPO_ROOT")" || repo_canon="$REPO_ROOT"
+  # Disallow $HOME itself and other obviously-too-broad roots (compare canonical forms).
+  local home_canon
+  home_canon="$(canonicalize_path "${HOME:-/nonexistent}" 2>/dev/null || true)"
+  [ "$canon" != "${home_canon:-/nonexistent}" ] \
+    || die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' is \$HOME — refusing"
+  # The CANONICAL path must be under the repo, OR have a recognizable *localstack* basename.
+  case "$canon" in
+    "$repo_canon"/*) return 0 ;;  # under the (canonical) repo — always fine
   esac
+  local base; base="$(basename "$canon")"
   case "$base" in
     .localstack|*localstack*) return 0 ;;
   esac
-  die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' is neither under the repo ($REPO_ROOT) nor a *localstack* dir — refusing rm -rf"
+  die "PG_BUMPERS_LOCALSTACK_DIR='$ROOT' (resolves to '$canon') is neither under the repo ($repo_canon) nor a *localstack* dir — refusing rm -rf"
 }
 
 # Record a started postmaster's PID, keyed by port, in the out-of-tree ledger so
@@ -133,25 +203,52 @@ record_started() {
   printf '%s\t%s\n' "${pid:-?}" "$dir" > "$PID_DIR/$port.pid"
 }
 
-# Is $pid a postmaster WE own? True only if its `postgres -D <dir>` data dir is
-# one of ours (under $ROOT or a recorded data dir). Never matches the founder's
-# 5432 cluster or any unrelated process.
+# Is $pid a postmaster WE own? True ONLY if its `postgres -D <dir>` data dir, canonicalized,
+# is EXACTLY one of our (canonicalized) cluster data dirs. Never matches the founder's 5432
+# cluster or any unrelated process.
+#
+# Hardening (issue #16): the old check used an UNANCHORED substring match
+# (`*"-D $PRIMARY_DIR"*`, `*"-D $ROOT/"*`). A process whose args merely CONTAIN our datadir
+# string — e.g. a sibling ".../primary-evil" (our ".../primary" is a string PREFIX of it),
+# or our path embedded in some longer argument — would falsely read as "ours" and become a
+# kill candidate. We now parse the actual `-D <value>` token and compare it to our known
+# data dirs by EXACT EQUALITY OF CANONICALIZED ABSOLUTE PATHS. Fail closed: if we cannot
+# positively extract and match the data dir, we return 1 (NOT ours) → stop_pid does NOT kill.
 pid_is_ours() {
   local pid="$1"
   [ -n "$pid" ] && [ "$pid" != "?" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  # Resolve the data dir from the live process args.
+  # Resolve the command line from the live process args.
   local args
   args="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  [ -n "$args" ] || return 1
   case "$args" in
     *postgres*) : ;;
     *)          return 1 ;;
   esac
-  # Match the -D data dir against our roots.
+  # Extract the value following the FIRST "-D " token: drop everything up to and including
+  # "-D ", then keep up to the next space. Our data dirs never contain spaces (they live
+  # under $ROOT, which is space-free by construction), so this cleanly isolates the path.
   case "$args" in
-    *"-D $PRIMARY_DIR"*|*"-D $REPLICA_DIR"*|*"-D $META_DIR"*) return 0 ;;
-    *"-D $ROOT/"*)                                            return 0 ;;
+    *"-D "*) : ;;
+    *)       return 1 ;;   # no -D at all → cannot prove identity → fail closed
   esac
+  local after datadir
+  after="${args#*-D }"      # text after the first "-D "
+  datadir="${after%% *}"    # up to the next space
+  [ -n "$datadir" ] || return 1
+  case "$datadir" in /*) : ;; *) return 1 ;; esac  # must be absolute
+  # Canonicalize the candidate and compare for EXACT equality against each of ours.
+  local cand
+  cand="$(canonicalize_path "$datadir")" || return 1
+  local ours
+  for ours in "$PRIMARY_DIR" "$REPLICA_DIR" "$META_DIR"; do
+    [ -n "$ours" ] || continue
+    local ours_canon
+    ours_canon="$(canonicalize_path "$ours" 2>/dev/null || true)"
+    [ -n "$ours_canon" ] || ours_canon="$ours"
+    [ "$cand" = "$ours_canon" ] && return 0
+  done
   return 1
 }
 
@@ -510,4 +607,10 @@ main() {
   esac
 }
 
-main "$@"
+# Test seam (issue #16): when sourced with PG_BUMPERS_LOCALSTACK_TEST=1, define the
+# functions but do NOT run main — so the guard unit tests (deploy/test/local_stack_guards.sh)
+# can drive validate_root / pid_is_ours / canonicalize_path directly with controlled
+# inputs, with no PG and nothing real ever started or killed.
+if [ "${PG_BUMPERS_LOCALSTACK_TEST:-0}" != "1" ]; then
+  main "$@"
+fi

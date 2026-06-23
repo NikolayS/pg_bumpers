@@ -55,6 +55,15 @@ jobs:
         with:
           command: check
 
+      # local-stack.sh PATH/PID guard unit tests (issue #16). Pure path/PID logic —
+      # NO PostgreSQL required and nothing real is ever started or killed — so it runs in
+      # this FAST gate (not the PG18 integration job). bash -n first as a syntax gate.
+      # No untrusted GitHub-event input is used; both commands are static.
+      - name: deploy guard tests — local-stack.sh validate_root / pid_is_ours
+        run: |
+          bash -n deploy/local-stack.sh
+          bash deploy/test/local_stack_guards.sh
+
   # NOTE: the deployable MCP server is the native Rust `pgb-mcp` (crate
   # `crates/mcp`), which is a workspace member — the `rust` job above already
   # builds + tests it (`cargo {build,test} --workspace`), and `cargo deny`
