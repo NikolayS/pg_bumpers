@@ -421,11 +421,22 @@ impl ApplyConn for PgApplyConn<'_> {
     }
 
     fn begin(&mut self, timeout_ms: u64) -> Result<(), ApplyError> {
+        // P2 (#87): open the apply txn at REPEATABLE READ (NOT the default READ
+        // COMMITTED, NOT SERIALIZABLE). RR gives the whole apply ONE stable snapshot,
+        // so the step-5 PK-set recompute, the `FOR UPDATE` pre-image capture, the
+        // `RETURNING` write, and the `pg_stat_xact_*` reconciliation all observe a
+        // consistent view — closing the READ COMMITTED window in which a row could
+        // commit INTO the predicate between the capture and the write. RR + `FOR
+        // UPDATE` first-updater-wins is the intended behavior: a concurrent change
+        // the snapshot cannot serialize raises SQLSTATE 40001, which `classify_apply`
+        // maps to `ApplyError::SerializationFailure` → abort (the engine ROLLBACKs).
+        // SERIALIZABLE is deliberately NOT used (its extra predicate-locking buys
+        // nothing here and would only widen the abort surface).
         self.client
             .batch_execute(&format!(
-                "BEGIN; SET LOCAL statement_timeout = {timeout_ms};"
+                "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL statement_timeout = {timeout_ms};"
             ))
-            .map_err(|e| ApplyError::Backend(e.to_string()))?;
+            .map_err(|e| classify_apply(&e, timeout_ms))?;
         self.in_txn = true;
         self.statement_timeout_ms = timeout_ms;
         self.xact_baseline = self.read_xact_raw()?;
@@ -525,10 +536,24 @@ impl ApplyConn for PgApplyConn<'_> {
             let id: i32 = row
                 .try_get(0)
                 .map_err(|e| ApplyError::Backend(format!("non-int4 PK on `{relation}`: {e}")))?;
-            let before_image = preimage
-                .get(&(id as i64))
-                .cloned()
-                .unwrap_or_else(|| vec![("id".into(), PkValue::Int(id as i64))]);
+            // FAIL-CLOSED pre-image seam (P1, #87). A `RETURNING` id that is NOT in
+            // the `FOR UPDATE` pre-image snapshot is a row that committed INTO the
+            // predicate between the capture and the write (a READ COMMITTED /
+            // concurrent-insert TOCTOU). The earlier code substituted an id-only
+            // image here, so a DELETE of such a row committed `reversible:true` with
+            // an un-revertable restore (a re-insert holding only the PK, not the
+            // row). We refuse instead: a written row with no complete captured
+            // pre-image ABORTS the apply (ROLLBACK, no mutation) — a written row must
+            // ALWAYS carry a full captured pre-image to be reversible.
+            let before_image = match preimage.get(&(id as i64)) {
+                Some(image) => image.clone(),
+                None => {
+                    return Err(ApplyError::MissingPreImage {
+                        relation: relation.to_string(),
+                        pk: format!("{id}"),
+                    });
+                }
+            };
             written.push(CapturedRow {
                 pk: PkTuple::single(PkValue::Int(id as i64)),
                 before_image,
@@ -585,13 +610,20 @@ impl ApplyConn for PgApplyConn<'_> {
 }
 
 /// Map a `postgres::Error` to the engine's [`ApplyError`], surfacing a
-/// `statement_timeout` cancel distinctly so a timeout abort is not conflated with
-/// a drift abort.
+/// `statement_timeout` cancel and a `40001` serialization failure distinctly so
+/// neither is conflated with a drift abort.
+///
+/// P2 (#87): under REPEATABLE READ the apply can hit SQLSTATE `40001`
+/// (`T_R_SERIALIZATION_FAILURE`) — a first-updater-wins conflict on a `FOR UPDATE`
+/// row, or a concurrent change the snapshot cannot serialize. It is classified as
+/// [`ApplyError::SerializationFailure`] (previously it fell through to `Backend`).
+/// Policy is **abort, do NOT retry**: a retry would burn the already-consumed
+/// single-use §14.3 grant nonce and re-open the TOCTOU the grant binding closes.
 fn classify_apply(e: &postgres::Error, timeout_ms: u64) -> ApplyError {
-    if e.code() == Some(&SqlState::QUERY_CANCELED) {
-        ApplyError::Timeout { timeout_ms }
-    } else {
-        ApplyError::Backend(e.to_string())
+    match e.code() {
+        Some(c) if c == &SqlState::QUERY_CANCELED => ApplyError::Timeout { timeout_ms },
+        Some(c) if c == &SqlState::T_R_SERIALIZATION_FAILURE => ApplyError::SerializationFailure,
+        _ => ApplyError::Backend(e.to_string()),
     }
 }
 

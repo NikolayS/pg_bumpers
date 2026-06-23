@@ -98,6 +98,8 @@ fn flipping_the_guarded_apply_reconciliation_trips_the_gate() {
         cascade_preimage_ids: vec![],
         written_columns: vec![],
         captured_image_cols: vec![],
+        racing_written_ids: vec![],
+        preimage_seam_closed: true,
     };
     let neutered = dangerous_scenario(
         "data-loss-out-of-predicate-trigger-delete",
@@ -243,6 +245,8 @@ fn flipping_the_multi_level_cascade_capture_trips_the_gate() {
         ],
         written_columns: vec![],
         captured_image_cols: vec![],
+        racing_written_ids: vec![],
+        preimage_seam_closed: true,
     };
     let neutered = dangerous_scenario(
         "multi-level-cascade-fail-closed",
@@ -300,6 +304,8 @@ fn flipping_the_wide_column_coverage_trips_the_gate() {
         // COMMITs. This is exactly the pre-#75 silent un-revertable commit.
         written_columns: vec![],
         captured_image_cols: vec!["status".to_string()],
+        racing_written_ids: vec![],
+        preimage_seam_closed: true,
     };
     let neutered = dangerous_scenario(
         "wide-column-update-uncaptured-column",
@@ -324,5 +330,64 @@ fn flipping_the_wide_column_coverage_trips_the_gate() {
         result.catastrophic_fn,
         "THE GATE HAS TEETH: a wide-column UPDATE committed with an uncaptured written \
          column MUST be a catastrophic FN"
+    );
+}
+
+/// TEETH #6 (the #87 moat-seam fix, inverted) — prove the green
+/// `concurrent-drift-delete-missing-preimage` scenario depends specifically on the
+/// fail-CLOSED pre-image seam (`MissingPreImage`).
+///
+/// We start from the FN model (id=10 deleted with no captured pre-image, all other
+/// guards reconcile) and *flip the defense*: set `preimage_seam_closed=false`, the
+/// OLD fail-OPEN behavior — the scripted conn substitutes an id-only image for the
+/// racing id=10 and the DELETE COMMITs `reversible:true` with an un-revertable
+/// restore. Because the PK-set re-check, written-set, and pg_stat_xact reconciliation
+/// all reconcile (id=10 is in the drifted approved set + footprint), NO other guard
+/// fires — so the commit slips through and the runner MUST flag the catastrophic FN.
+/// If the green scenario aborted for any OTHER reason, this flip would NOT commit and
+/// the test would fail — so it pins the green scenario to the #87 pre-image seam.
+#[test]
+fn flipping_the_preimage_seam_trips_the_gate() {
+    let neutered_case = DataLossCase {
+        relation: "public.orders".into(),
+        kind: WriteKind::Delete,
+        grant_ids: vec![2, 4, 6, 8, 10],
+        target_effect: OpCounts::new(0, 0, 5),
+        cascades: vec![],
+        extra_effect: vec![],
+        recompute_override: vec![],
+        written_override: None,
+        apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 0, 5))],
+        cascade_preimage_ids: vec![],
+        written_columns: vec![],
+        captured_image_cols: vec![],
+        // id=10 written (deleted) with no captured pre-image.
+        racing_written_ids: vec![10],
+        // Defense flipped: the OLD fail-OPEN seam — substitute an id-only image and
+        // COMMIT the un-revertable DELETE (the pre-#87 catastrophic FN).
+        preimage_seam_closed: false,
+    };
+    let neutered = dangerous_scenario(
+        "concurrent-drift-delete-missing-preimage",
+        Verdict::Reverted,
+        DefenseLayer::GuardedApply,
+        Probe::GuardedApply(Box::new(neutered_case)),
+    );
+    let result = run_scenario(&neutered);
+
+    assert_eq!(
+        result.observed.verdict,
+        Verdict::Allow,
+        "with the pre-image seam fail-OPEN, the racing id=10 gets an id-only image and the \
+         DELETE COMMITs un-revertably (the pre-#87 catastrophic commit)"
+    );
+    assert!(
+        result.observed.prod_rows_touched > 0,
+        "the committed DELETE destroyed prod rows whose pre-image the inverse cannot restore"
+    );
+    assert!(
+        result.catastrophic_fn,
+        "THE GATE HAS TEETH: an un-revertable DELETE committed because a written row had no \
+         captured pre-image MUST be a catastrophic FN"
     );
 }

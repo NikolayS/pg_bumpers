@@ -19,7 +19,14 @@ The **process** spec lives in GitHub issue #1.
 - The **deterministic floor** is the safety guarantee — native-role WALL, cost/byte
   budgets, timeouts, bounded-&-reversible writes (SPEC §3). No model is in that path.
 - **Fail closed:** absence of signal means least privilege; on any doubt, deny/abort.
-  The guard is the **PK-set checksum**, not row count (catches identity drift).
+  Bounded-&-reversible is carried by the `pg_stat_xact_*` reconciliation +
+  `statement_timeout` budget (bounded) and the apply-time pre-image capture
+  (`FOR UPDATE`+`RETURNING`) + coverage guards (reversible) — **not** the PK-set
+  checksum. The apply-time PK-set checksum is an **authorization-freshness gate**: it
+  binds a human's §14.3 grant to the exact approved row-**identity** set (catches
+  same-count/different-PK drift that row count misses) and fails closed on drift.
+  Load-bearing only for stable explicitly-keyed writes; over a high-churn predicate it
+  is a no-op (quiescent) or self-abort (busy) — by design, drift ⇒ re-approve.
 - The LLM risk-gate is **tighten-only** — it can block/hold/escalate but can **never
   loosen** below the floor. In the MVP the `RiskEngine` is a stub returning `Allow`
   and intent tiers T0–T2 are captured/logged only (SPEC §15.1).

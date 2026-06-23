@@ -28,6 +28,8 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::thread;
+use std::time::Duration;
 
 use common::{base_pgurl, create_seeded_db, drop_db, it_enabled};
 use pgb_clone_orchestrator::apply::{
@@ -314,14 +316,20 @@ impl ApplyConn for PgApplyConn<'_> {
         let mut written = Vec::with_capacity(returned.len());
         for row in &returned {
             let id: i32 = row.get(0);
-            let before_image = preimage.get(&(id as i64)).cloned().unwrap_or_else(|| {
-                // A RETURNING id with no captured pre-image means the forward op
-                // wrote a row OUTSIDE the FOR UPDATE pre-image snapshot (e.g. a
-                // trigger inserted/touched an out-of-predicate row). We still
-                // surface the PK so the written-set checksum catches the drift;
-                // the pre-image is best-effort (the row will trip the guards anyway).
-                vec![("id".into(), PkValue::Int(id as i64))]
-            });
+            // FAIL-CLOSED (P1, #87) — mirror the production conn.rs seam. A
+            // `RETURNING` id with no captured `FOR UPDATE` pre-image is a row that
+            // committed INTO the predicate after the pre-image snapshot; its change
+            // cannot be reversibly restored, so the apply must ABORT rather than
+            // commit `reversible:true` with an id-only (un-revertable) image.
+            let before_image = match preimage.get(&(id as i64)) {
+                Some(image) => image.clone(),
+                None => {
+                    return Err(ApplyError::MissingPreImage {
+                        relation: relation.to_string(),
+                        pk: format!("{id}"),
+                    });
+                }
+            };
             written.push(CapturedRow {
                 pk: PkTuple::single(PkValue::Int(id as i64)),
                 before_image,
@@ -1612,6 +1620,365 @@ fn t_wide_column_update_is_fully_reversible_revert_restores_all_columns() {
 }
 
 // ===========================================================================
+//  (3d) THE MOAT SEAM (#87) — the fail-OPEN pre-image hole + REPEATABLE READ.
+//
+//  A row that commits INTO the predicate between the `FOR UPDATE` pre-image
+//  capture and the `RETURNING` write (a READ COMMITTED / concurrent-insert TOCTOU)
+//  is written but has NO captured pre-image. The OLD code substituted an id-only
+//  image, so a DELETE committed `reversible:true` with an UN-revertable restore (a
+//  re-insert holding only the PK) — a catastrophic false-negative against the
+//  "0 catastrophic data-loss FN by construction" claim.
+//
+//  Two layered fixes, BOTH proven here against real PG18, deterministically:
+//   - P1 (fail-CLOSED backstop): a written row with no captured pre-image ⇒
+//     `MissingPreImage` ⇒ ROLLBACK (no mutation, row intact). Proven via the
+//     READ-COMMITTED local fixture, which can still produce the gap.
+//   - P2 (close it at the source): the PRODUCTION conn opens the apply txn at
+//     REPEATABLE READ, so the FOR UPDATE capture, the RETURNING write, and the
+//     reconciliation share ONE snapshot — the concurrent-insert can no longer
+//     appear only in RETURNING. A concurrent UPDATE of a target row instead raises
+//     SQLSTATE 40001 ⇒ `SerializationFailure` ⇒ abort (NOT retried).
+//
+//  The deterministic race: a helper connection holds a `FOR UPDATE` lock on the
+//  MAX even row (id=8) so the apply's FOR UPDATE scan BLOCKS on it; while blocked,
+//  the helper commits the racing change and releases the lock. Verified against
+//  PG18: under READ COMMITTED the apply's FOR UPDATE captures {2,4,6,8} but the
+//  later RETURNING sees {2,4,6,8,10}; under REPEATABLE READ both see {2,4,6,8}.
+// ===========================================================================
+
+/// Spawn a helper that locks the MAX even row (id=8) `FOR UPDATE` in an open txn,
+/// waits `hold` so the apply's FOR UPDATE scan blocks on it, runs `racing_sql`
+/// (the concurrent change that commits INTO the predicate), and COMMITs — releasing
+/// the lock so the apply proceeds. Returns the join handle.
+fn spawn_race_helper(
+    url: &str,
+    racing_sql: &'static str,
+    hold: Duration,
+) -> thread::JoinHandle<()> {
+    let url = url.to_string();
+    thread::spawn(move || {
+        let mut c = Client::connect(&url, NoTls).expect("race-helper connect");
+        let mut txn = c.transaction().expect("race-helper begin");
+        // Lock id=8 (the last even row the apply's FOR UPDATE will reach) so the
+        // apply BLOCKS there, giving us a deterministic window.
+        txn.execute(
+            "SELECT id FROM public.accounts WHERE id = 8 FOR UPDATE",
+            &[],
+        )
+        .expect("race-helper lock id=8");
+        // Hold the lock while the apply thread reaches + blocks on the FOR UPDATE.
+        thread::sleep(hold);
+        // Commit the racing change INTO the predicate, then COMMIT to release id=8.
+        txn.batch_execute(racing_sql)
+            .expect("race-helper racing sql");
+        txn.commit().expect("race-helper commit");
+    })
+}
+
+/// **P1 (fail-CLOSED backstop) — the un-revertable DELETE now ABORTS.**
+///
+/// Under READ COMMITTED (the local fixture), a row (id=10) commits INTO the
+/// predicate between the FOR UPDATE pre-image capture and the DELETE RETURNING, so
+/// the forward op writes id=10 with no captured pre-image. RED (pre-fix): the
+/// id-only fallback let the DELETE commit `reversible:true` with an un-revertable
+/// restore. GREEN (this fix): `MissingPreImage` ⇒ ROLLBACK, nothing deleted, id=10
+/// (and every even row) intact.
+#[test]
+fn t_concurrent_insert_into_predicate_delete_aborts_missing_preimage_read_committed() {
+    let Some((admin, dbname, _c)) = setup("preimage_seam_delete_rc") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    // The local fixture opens a bare READ COMMITTED txn, so the FOR UPDATE snapshot
+    // and the RETURNING snapshot differ — reproducing the concurrent-insert gap.
+    let forward = "DELETE FROM public.accounts WHERE id % 2 = 0";
+    let grant = grant_for_forward(
+        "p-seam-del",
+        &url,
+        EVEN_WHERE,
+        forward,
+        WriteKind::Delete,
+        50,
+    );
+
+    // Helper races id=10 INTO the even predicate while the apply blocks on id=8.
+    let helper = spawn_race_helper(
+        &url,
+        "INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'race', 999)",
+        Duration::from_millis(700),
+    );
+    // Give the helper time to acquire the id=8 lock before the apply starts.
+    thread::sleep(Duration::from_millis(250));
+
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Delete)
+            .with_cascade(entries_cascade(EVEN_WHERE));
+        guarded_apply(
+            "p-seam-del",
+            WriteKind::Delete,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    helper.join().expect("race helper joined");
+
+    match result {
+        Err(ApplyError::MissingPreImage { relation, pk }) => {
+            assert_eq!(relation, "public.accounts");
+            assert_eq!(
+                pk, "10",
+                "the un-captured racing row is the one that aborts"
+            );
+            eprintln!(
+                "T-preimage-seam-DELETE PASS: a row (id=10) committed INTO the predicate \
+                 between the FOR UPDATE capture and the DELETE RETURNING was written with NO \
+                 captured pre-image → MissingPreImage ABORT (no un-revertable DELETE)"
+            );
+        }
+        other => panic!(
+            "a DELETE of a row with no captured pre-image MUST abort MissingPreImage \
+             (the un-revertable-DELETE seam), got {other:?}"
+        ),
+    }
+
+    // NOTHING was deleted: every original even row + id=10 are all intact.
+    let after = read_accounts(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(after[&id], before[&id], "even {id} intact (apply aborted)");
+    }
+    assert!(
+        after.contains_key(&10),
+        "the racing row id=10 must survive (apply rolled back; nothing committed)"
+    );
+    eprintln!("[preimage-seam-DELETE] DB intact — the un-revertable DELETE never happened");
+    drop_db(&admin, &dbname);
+}
+
+/// **P1 (UPDATE path) — the un-captured written row also ABORTS.**
+///
+/// The same concurrent-insert gap for an UPDATE: id=10 commits into the predicate
+/// between the FOR UPDATE capture and the UPDATE RETURNING, so it is written
+/// without a pre-image. `MissingPreImage` ⇒ ROLLBACK, no row updated.
+#[test]
+fn t_concurrent_insert_into_predicate_update_aborts_missing_preimage_read_committed() {
+    let Some((admin, dbname, _c)) = setup("preimage_seam_update_rc") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let grant = grant_for("p-seam-upd", &url, EVEN_WHERE, 50);
+
+    let helper = spawn_race_helper(
+        &url,
+        "INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'race', 999)",
+        Duration::from_millis(700),
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, forward, EVEN_WHERE, WriteKind::Update);
+        guarded_apply(
+            "p-seam-upd",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    helper.join().expect("race helper joined");
+
+    match result {
+        Err(ApplyError::MissingPreImage { relation, pk }) => {
+            assert_eq!(relation, "public.accounts");
+            assert_eq!(pk, "10");
+            eprintln!(
+                "T-preimage-seam-UPDATE PASS: an UPDATE-written row with no captured pre-image \
+                 → MissingPreImage ABORT"
+            );
+        }
+        other => panic!("UPDATE path: expected MissingPreImage abort, got {other:?}"),
+    }
+    // No row was zeroed; every original balance is intact.
+    let after = read_accounts(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(after[&id].1, before[&id].1, "even {id} balance intact");
+    }
+    drop_db(&admin, &dbname);
+}
+
+/// **P2 — the PRODUCTION conn (REPEATABLE READ) closes the seam at the source.**
+///
+/// Driving the SAME concurrent-insert race through the PRODUCTION `conn.rs`
+/// `PgApplyConn` (now `BEGIN ISOLATION LEVEL REPEATABLE READ`), the FOR UPDATE
+/// capture and the RETURNING write share ONE snapshot, so the racing id=10 is
+/// invisible to BOTH — the apply commits exactly the approved set {2,4,6,8}
+/// reversibly, and the inverse restores them byte-for-byte. (No `MissingPreImage`
+/// is needed because RR removed the gap; the backstop is defense-in-depth.) Modeled
+/// as an UPDATE so it stays within the production conn's single-`int4`-PK shape (a
+/// composite-PK cascade is a separate, dry-run-gated path).
+#[test]
+fn t_repeatable_read_closes_the_concurrent_insert_gap_production_conn_commits_reversibly() {
+    let Some((admin, dbname, _c)) = setup("preimage_seam_rr_commit") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let grant = grant_for("p-seam-rr", &url, EVEN_WHERE, 50);
+
+    let helper = spawn_race_helper(
+        &url,
+        "INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'race', 999)",
+        Duration::from_millis(700),
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    // PRODUCTION conn (REPEATABLE READ) — what pgb-applyd runs.
+    let mut apply_client = Client::connect(&url, NoTls).expect("apply connect");
+    let applied = {
+        let mut conn =
+            pgb_clone_orchestrator::PgApplyConn::new(&mut apply_client, forward, EVEN_WHERE);
+        guarded_apply(
+            "p-seam-rr",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+        .expect(
+            "under REPEATABLE READ the racing insert is invisible → the approved UPDATE commits",
+        )
+    };
+    helper.join().expect("race helper joined");
+
+    // Exactly the 4 approved even rows were updated (id=10 — the racing row — was
+    // NOT in the RR snapshot, so it was never part of the approved set and is
+    // untouched at its inserted balance 999).
+    assert_eq!(
+        applied.rows_written, 4,
+        "only the approved {{2,4,6,8}} were updated"
+    );
+    let after = read_accounts(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(after[&id].1, 0, "approved even {id} zeroed (committed)");
+    }
+    assert_eq!(
+        after[&10].1, 999,
+        "the racing id=10 was NOT in the RR snapshot — untouched by the apply"
+    );
+
+    // Reversibly applied: revert via the production conn restores {2,4,6,8} exactly.
+    {
+        let mut rclient = Client::connect(&url, NoTls).expect("revert connect");
+        let mut rconn = pgb_clone_orchestrator::PgRevertConn::new(&mut rclient);
+        let report = pgb_clone_orchestrator::revert(&applied.inverse, &mut rconn)
+            .expect("revert restores the updated rows");
+        assert_eq!(report.total_restored, 4, "the 4 updated rows restored");
+    }
+    let after_revert = read_accounts(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(
+            after_revert[&id], before[&id],
+            "RR-committed UPDATE is byte-for-byte reversible for even {id}"
+        );
+    }
+    eprintln!(
+        "T-preimage-seam-RR PASS: REPEATABLE READ made the racing insert invisible to BOTH the \
+         FOR UPDATE capture and the RETURNING write → the approved UPDATE committed + reverted \
+         byte-for-byte (the seam is closed at the source)"
+    );
+    drop_db(&admin, &dbname);
+}
+
+/// **P2 — a concurrent UPDATE of a target row → `SerializationFailure` (40001),
+/// abort, no mutation, NOT retried.**
+///
+/// Under REPEATABLE READ, when the apply's FOR UPDATE blocks on a target row that a
+/// concurrent txn UPDATEs + commits, PG raises SQLSTATE 40001
+/// (`could not serialize access due to concurrent update`). `conn.rs::classify_apply`
+/// maps it to `ApplyError::SerializationFailure`; the engine ROLLBACKs. Policy is
+/// abort-not-retry (a retry would burn the single-use grant + re-open the TOCTOU).
+#[test]
+fn t_repeatable_read_concurrent_update_of_target_row_serialization_failure_aborts() {
+    let Some((admin, dbname, _c)) = setup("preimage_seam_rr_40001") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    let forward = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
+    let grant = grant_for("p-seam-40001", &url, EVEN_WHERE, 50);
+
+    // The helper UPDATEs id=8 (a TARGET row) + commits while the apply blocks on it
+    // under RR → the apply cannot serialize against the concurrent update → 40001.
+    let helper = spawn_race_helper(
+        &url,
+        "UPDATE public.accounts SET balance = 88888 WHERE id = 8",
+        Duration::from_millis(700),
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let mut apply_client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn =
+            pgb_clone_orchestrator::PgApplyConn::new(&mut apply_client, forward, EVEN_WHERE);
+        guarded_apply(
+            "p-seam-40001",
+            WriteKind::Update,
+            "public.accounts",
+            &grant,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &SystemClock::new(),
+        )
+    };
+    helper.join().expect("race helper joined");
+
+    match result {
+        Err(ApplyError::SerializationFailure) => {
+            eprintln!(
+                "T-preimage-seam-RR-40001 PASS: a concurrent UPDATE of target row id=8 made the \
+                 REPEATABLE READ apply unable to serialize → SerializationFailure (40001) ABORT \
+                 (no mutation, not retried)"
+            );
+        }
+        other => panic!(
+            "a concurrent UPDATE of a target row under RR MUST abort SerializationFailure (40001), \
+             got {other:?}"
+        ),
+    }
+    // No partial commit: the helper's id=8 change is the ONLY committed change; the
+    // apply touched nothing (its even rows are NOT zeroed).
+    let after = read_accounts(&url);
+    assert_eq!(after[&8].1, 88888, "the helper's committed UPDATE stands");
+    for &id in &[2, 4, 6] {
+        assert_eq!(
+            after[&id].1, before[&id].1,
+            "even {id} untouched — the apply aborted with no partial commit"
+        );
+    }
+    drop_db(&admin, &dbname);
+}
+
+// ===========================================================================
 //  (3b) RETURNING written-set check — same-relation, same-COUNT identity drift
 //       that the stat-delta count check cannot see. The forward op writes a
 //       DIFFERENT set of the SAME size in the target → step 7 ABORTS.
@@ -1630,7 +1997,16 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
     // (id=8 OUT via `id<>8`, id=1 IN). The pre-op recompute on EVEN_WHERE → {2,4,6,8}
     // == grant (PASS), and the txn changes exactly 4 target rows (stat-delta count
     // matches), but the RETURNING set {1,2,4,6} differs from the predicted {2,4,6,8}.
-    // Only the written-set checksum (step 7) catches this same-count identity drift.
+    // This is same-count identity drift in the target.
+    //
+    // Two fail-closed guards now catch it, BOTH of which abort with no mutation:
+    //   - the P1 (#87) fail-CLOSED pre-image seam fires FIRST: the written id=1 is
+    //     NOT in the `FOR UPDATE` pre-image capture (taken over EVEN_WHERE = {2,4,6,8}),
+    //     so it has no pre-image → `MissingPreImage`;
+    //   - failing that (e.g. if the capture predicate matched), step-7's written-set
+    //     checksum would catch the {1,2,4,6} ≠ {2,4,6,8} mismatch → `WrittenSetMismatch`.
+    // Either is a correct, byte-for-byte-unchanged abort; we accept both (the seam is
+    // strictly a tightening — it catches the uncaptured written row even earlier).
     let grant = grant_for("p-ret", &url, EVEN_WHERE, 50);
     let forward = "UPDATE public.accounts SET balance = 0 WHERE (id % 2 = 0 AND id <> 8) OR id = 1";
 
@@ -1655,10 +2031,22 @@ fn t_returning_written_set_mismatch_same_count_aborts() {
             assert_ne!(predicted, written);
             eprintln!(
                 "T-returning-written-set PASS: same-count identity drift in the target \
-                 (predicted={predicted} written={written}) → ABORTED"
+                 (predicted={predicted} written={written}) → WrittenSetMismatch ABORT"
             );
         }
-        other => panic!("expected WrittenSetMismatch, got {other:?}"),
+        Err(ApplyError::MissingPreImage { relation, pk }) => {
+            assert_eq!(relation, "public.accounts");
+            assert_eq!(
+                pk, "1",
+                "the written-but-uncaptured id=1 trips the pre-image seam"
+            );
+            eprintln!(
+                "T-returning-written-set PASS: same-count identity drift — the written id=1 has \
+                 no captured pre-image → MissingPreImage ABORT (the P1 #87 seam catches it even \
+                 earlier than the step-7 written-set check)"
+            );
+        }
+        other => panic!("expected WrittenSetMismatch or MissingPreImage, got {other:?}"),
     }
     let after = read_accounts(&url);
     assert_eq!(

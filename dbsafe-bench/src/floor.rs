@@ -165,6 +165,12 @@ struct ScriptedConn {
     /// wide-column FN models a write that DECLARES `notes` written but CAPTURED only
     /// `(status)` — the column-coverage guard must abort it.
     captured_image_cols: Vec<String>,
+    /// #87: target ids written with NO captured pre-image (the concurrent-insert
+    /// TOCTOU). Modeled exactly like the production `conn.rs::apply_forward`: a
+    /// `RETURNING` id not in the `FOR UPDATE` pre-image snapshot.
+    racing_written_ids: Vec<i64>,
+    /// #87: whether the pre-image seam fails CLOSED (production) or OPEN (old bug).
+    preimage_seam_closed: bool,
     committed: bool,
     rolled_back: bool,
 }
@@ -214,7 +220,7 @@ impl ApplyConn for ScriptedConn {
     fn apply_forward(
         &mut self,
         _kind: WriteKind,
-        _relation: &str,
+        relation: &str,
         cascade_relations: &[String],
     ) -> Result<ForwardResult, ApplyError> {
         let mut cascade_preimages = BTreeMap::new();
@@ -226,11 +232,31 @@ impl ApplyConn for ScriptedConn {
                 .unwrap_or_default();
             cascade_preimages.insert(rel.clone(), captured(&ids));
         }
-        let written = if self.captured_image_cols.is_empty() {
+        let mut written = if self.captured_image_cols.is_empty() {
             captured(&self.written_ids)
         } else {
             captured_with_cols(&self.written_ids, &self.captured_image_cols)
         };
+        // #87 — the fail-OPEN pre-image seam, modeled exactly as production conn.rs.
+        // A racing id was WRITTEN (it is in RETURNING) but has NO captured FOR UPDATE
+        // pre-image (it committed INTO the predicate after the capture). The
+        // production conn now ABORTs `MissingPreImage`; the OLD code substituted an
+        // id-only (un-revertable) image and let the write commit.
+        for &id in &self.racing_written_ids {
+            if self.preimage_seam_closed {
+                // Production behavior: a written row with no pre-image fails closed.
+                return Err(ApplyError::MissingPreImage {
+                    relation: relation.to_string(),
+                    pk: format!("{id}"),
+                });
+            }
+            // OLD fail-OPEN behavior (RED): id-only image — un-revertable, but it
+            // commits because the footprint/set/column guards all reconcile.
+            written.push(CapturedRow {
+                pk: PkTuple::single(PkValue::Int(id)),
+                before_image: vec![("id".to_string(), PkValue::Int(id))],
+            });
+        }
         Ok(ForwardResult {
             written,
             cascade_preimages,
@@ -287,6 +313,21 @@ pub struct DataLossCase {
     /// — the column-coverage guard must abort (the captured pre-image cannot restore
     /// the written `notes`). Empty ⇒ the default `[status]` pre-image.
     pub captured_image_cols: Vec<String>,
+    /// #87: target ids the forward op WROTE (in `RETURNING`) that have NO captured
+    /// `FOR UPDATE` pre-image — a row that committed INTO the predicate between the
+    /// pre-image capture and the write (a READ COMMITTED / concurrent-insert TOCTOU).
+    /// These ids are part of the (drifted) approved set the grant predicts AND the
+    /// footprint reconciles, so the PK-set / written-set / `pg_stat_xact_*` guards
+    /// all PASS — the ONLY thing standing between an un-revertable commit and a
+    /// fail-closed abort is the pre-image seam itself (`preimage_seam_closed`). Empty
+    /// ⇒ every written row has a captured pre-image (the normal case).
+    pub racing_written_ids: Vec<i64>,
+    /// #87: whether the conn's pre-image seam fails CLOSED (production: a written row
+    /// with no captured pre-image ⇒ `MissingPreImage` abort) or OPEN (the OLD bug:
+    /// substitute an id-only image and let the un-revertable write COMMIT). The green
+    /// corpus pins this `true`; `gate_has_teeth` flips it `false` to prove the gate
+    /// catches the catastrophic un-revertable commit.
+    pub preimage_seam_closed: bool,
 }
 
 /// Run a [`DataLossCase`] through the real `guarded_apply`. Returns the observed
@@ -356,10 +397,22 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
     for (rel, ids) in &case.recompute_override {
         recompute_ids.insert(rel.clone(), ids.clone());
     }
-    let written_ids = case
+    // The CAPTURED (pre-imaged) written ids. The racing ids (#87) are written too
+    // but have NO captured pre-image, so they are EXCLUDED from the captured set here
+    // and re-added id-only inside `apply_forward` — exactly the production conn's
+    // FOR-UPDATE-capture-then-RETURNING-write split. The TOTAL written set
+    // (captured ∪ racing) therefore still equals the predicted set, so the PK-set /
+    // written-set / footprint guards all reconcile and ONLY the pre-image seam
+    // decides (commit-un-revertably vs fail-closed abort).
+    let base_written = case
         .written_override
         .clone()
         .unwrap_or_else(|| case.grant_ids.clone());
+    let written_ids: Vec<i64> = base_written
+        .iter()
+        .copied()
+        .filter(|id| !case.racing_written_ids.contains(id))
+        .collect();
     let tuple_deltas: Vec<RelationChange> = if case.apply_deltas.is_empty() {
         // Default: the target changed exactly its grant footprint (clean reconcile).
         vec![RelationChange {
@@ -389,6 +442,8 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
         cascade_preimage_ids,
         written_columns: case.written_columns.clone(),
         captured_image_cols: case.captured_image_cols.clone(),
+        racing_written_ids: case.racing_written_ids.clone(),
+        preimage_seam_closed: case.preimage_seam_closed,
         committed: false,
         rolled_back: false,
     };
@@ -509,6 +564,8 @@ mod tests {
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         };
         let o = probe_guarded_apply(&case);
         assert_eq!(o.verdict, crate::verdict::Verdict::Reverted);

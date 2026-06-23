@@ -1127,3 +1127,89 @@ safety prerequisite. Wiring read-routing + a stricter degraded budget profile is
 `replica.dsn` being set does **not** change runtime behavior. Disclosed in `KNOWN_BYPASSES.md`
 as **B7**. (This is a scope/disclosure note, NOT a deterministic-floor false-negative — the
 `dbsafe-bench` catastrophic-FN ledger stays empty.)
+
+---
+
+## #87 — moat-seam fix: close the fail-OPEN pre-image hole, RR apply isolation, and correct the over-claimed PK-set-checksum framing
+
+**SPEC sections touched:** §3 (deterministic floor: bounded-&-reversible writes), §4 (guarded
+apply — step 4 pre-image capture / step 5 PK-set re-check / step 6 reconciliation), §13.2
+(what makes a guarded write "capped and undoable"), §14.3 (the signed, proposal-bound grant —
+the apply-time PK-set checksum binds it to the exact approved row-identity set), §10.1/§10.3
+(blast radius + typed-inverse). **Issue:** #87.
+
+### Behavior changes (tighten-only — every change only ADDS an abort)
+
+1. **P1 — the fail-OPEN pre-image seam is CLOSED.**
+   `crates/clone-orchestrator/src/conn.rs::apply_forward` previously substituted an **id-only**
+   image for a `RETURNING` row that was **not** in the `FOR UPDATE` pre-image snapshot
+   (`preimage.get(&id).cloned().unwrap_or_else(|| vec![("id", id)])`). Under READ COMMITTED a
+   row that commits **into** the predicate between the capture and the write (a concurrent-insert
+   TOCTOU) got this id-only image; for a **DELETE** it then passed the count-only coverage guard
+   and committed `reversible:true` with an **un-revertable** restore (a re-insert holding only the
+   PK). That was a catastrophic, by-construction false-negative against the "0 catastrophic
+   data-loss FN" claim. **Now** a written row with no captured pre-image is a typed
+   `ApplyError::MissingPreImage` ⇒ the apply **ROLLBACKs** (no mutation). Proven against real
+   PG18 (a helper holds a `FOR UPDATE` lock on the max approved row so the apply's FOR UPDATE
+   blocks on it; while blocked the helper commits a racing row INTO the predicate): RED — the
+   id-only fallback committed (or aborted only incidentally on a footprint-amplifying audit
+   trigger); GREEN — `MissingPreImage` abort, row intact.
+
+2. **P2 — the apply txn now opens at REPEATABLE READ (not READ COMMITTED, not SERIALIZABLE).**
+   `conn.rs::begin` issues `BEGIN ISOLATION LEVEL REPEATABLE READ` (keeping
+   `SET LOCAL statement_timeout`). One stable snapshot spans the step-5 recompute, the FOR UPDATE
+   capture, the RETURNING write, and the `pg_stat_xact_*` reconciliation — closing the window in
+   which a row could commit into the predicate between the capture and the write **at the source**
+   (the P1 `MissingPreImage` becomes the defense-in-depth backstop). A concurrent change the
+   snapshot cannot serialize raises SQLSTATE **40001**, now classified as
+   `ApplyError::SerializationFailure` (previously swallowed into `Backend`). **Policy: abort, do
+   NOT retry** — a retry would burn the already-consumed single-use §14.3 grant nonce and re-open
+   the TOCTOU. SERIALIZABLE is deliberately not used (its extra predicate locking buys nothing
+   here and would only widen the abort surface). Proven against real PG18: a concurrent INSERT
+   into the predicate is now invisible to BOTH the capture and the write (the approved set commits
+   + reverts byte-for-byte); a concurrent UPDATE of a target row raises 40001 ⇒ clean
+   `SerializationFailure` abort, no mutation. RED — pre-fix the concurrent INSERT reproduced the
+   `MissingPreImage` gap and the concurrent UPDATE **COMMITTED** while the inverse captured the
+   *concurrent* value as the "old" value (a wrong, un-revertable restore).
+
+### Documentation correction — the over-claimed PK-set-checksum framing (the WHY of this issue)
+
+SPEC §13.2 (~L585) attributes "capped and undoable" to the affected-PK-set re-check. An
+adversarial code analysis showed this **mis-attributes** the bound/undo guarantees:
+
+- **Bounded (capped)** is carried by the **`pg_stat_xact_*` per-op-type reconciliation**
+  (step 6) **+ the `statement_timeout` budget** (step 2) — a write that touches an unpredicted
+  relation, exceeds a predicted op channel, or runs too long aborts.
+- **Reversible (undoable)** is carried by the **apply-time pre-image capture**
+  (`FOR UPDATE`+`RETURNING`, step 4) **+ the coverage guards** (step 8 row coverage / step 8b
+  column coverage, and now the P1 `MissingPreImage` seam).
+- The **apply-time PK-set re-check is an anti-TOCTOU authorization-freshness binding**, not the
+  bound/undo guard: it binds the human's §14.3 grant to the **exact approved row-identity set**
+  (catching same-count/different-PK drift that a row-count guard misses), and fails closed on
+  drift (re-approve required). It is load-bearing only for stable, explicitly-keyed writes; over
+  a high-churn predicate it is a no-op (quiescent) or a self-abort (busy) — by design.
+  SPEC §14.3 (L697–700) already states this binding correctly and is **not** changed; only the
+  §13.2 framing is re-attributed here.
+
+Per `CLAUDE.md` §8 the build-frozen SPEC body is **not** edited; this amendment records the
+re-attribution. The in-tree comments corrected to match: `CLAUDE.md` §2 (the bound/undo vs
+freshness-gate distinction), `apply.rs` step-5 docstring ("freshness/authorization re-check
+(not the bound/undo guard)"), and `KNOWN_BYPASSES.md` **B8** (the exact-set re-check makes
+guarded writes a low-churn / re-review-on-drift instrument, not a bulk applier).
+
+### Evidence (red→green; real PG18 + the deterministic gate)
+
+- **Real PG18 (env-gated `PG_BUMPERS_IT=1`, dedicated high port, NEVER :5432):**
+  `crates/clone-orchestrator/tests/apply_it.rs` adds the deterministic race (helper holds a
+  `FOR UPDATE` lock so the apply blocks; the racing change commits during the block):
+  `t_concurrent_insert_into_predicate_delete_aborts_missing_preimage_read_committed`,
+  `…_update_…` (P1 `MissingPreImage`),
+  `t_repeatable_read_closes_the_concurrent_insert_gap_production_conn_commits_reversibly`
+  (P2 RR clean commit + byte-for-byte revert), and
+  `t_repeatable_read_concurrent_update_of_target_row_serialization_failure_aborts` (P2 40001).
+- **Deterministic gate (`dbsafe-bench`):** a new golden scenario
+  `concurrent-drift-delete-missing-preimage` (the pre-image seam is the SOLE catch — all other
+  guards reconcile) is CI-locked at `REVERTED`, with a `gate_has_teeth` flip
+  (`flipping_the_preimage_seam_trips_the_gate`) proving the gate catches the catastrophic
+  un-revertable commit when the seam is fail-OPEN. The catastrophic-FN ledger
+  (`golden/known_bypasses.json`) stays **empty** (0 FN, 0 FP).

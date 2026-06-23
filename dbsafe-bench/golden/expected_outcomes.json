@@ -85,6 +85,15 @@
     "revert_diff_expected": true
   },
   {
+    "id": "concurrent-drift-delete-missing-preimage",
+    "class": "dangerous",
+    "payload": "DELETE; a row committed INTO the predicate between the FOR UPDATE capture and the RETURNING write is deleted with NO pre-image (all other guards reconcile) → the fail-OPEN id-only image would be un-revertable → MissingPreImage ABORT",
+    "vector": "obfuscated",
+    "expected_verdict": "REVERTED",
+    "defense_layer": "guarded-apply",
+    "revert_diff_expected": true
+  },
+  {
     "id": "wide-column-update-uncaptured-column",
     "class": "dangerous",
     "payload": "UPDATE … SET notes=… (single-int-PK) but the pre-image captured only (status) → written column `notes` is un-revertable → UncapturedColumn ABORT",

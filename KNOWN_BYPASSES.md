@@ -184,15 +184,49 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
 - **SPEC.amendments tie:** "#80 — MVP spec-faithfulness closeout" → *Gap 2*
   (`replica.dsn` inert + §10.8 degraded budgets recorded as deferred → #77).
 
+## B8 — Exact-set apply-time re-check makes guarded writes a low-churn / re-review-on-drift tool, not a bulk applier
+
+> _(Filed under #87 as "B5" in the issue; B5–B7 were already allocated, so it lands
+> here as **B8**.)_
+
+- **Damage class:** N/A (scope/UX of the guarded-write tool, not a floor guarantee).
+  **Defense layer:** guarded-apply PK-set authorization-freshness re-check (§14.3 binding).
+- **What it is:** the apply-time affected-PK-set checksum re-check is 0-tolerance exact-set
+  equality (the live `SELECT id … WHERE <pred> ORDER BY id` must equal the approved set
+  byte-for-byte) — an authorization-freshness property by design. Consequence: on a stable
+  explicitly-keyed write (`WHERE id=42`, `IN (…)`) it is meaningful + cheap; on a predicate over
+  mutable/high-churn data (`WHERE status='open'`, `created < $1`, `id%2=0`) any concurrent
+  committed change to the predicate's extension between approval and apply flips the set and
+  aborts the already-approved write (`PkSetDrift`/`BindingMismatch`) — no tolerance band. Net:
+  guarded apply is a small, stable, re-review-on-drift instrument for surgical keyed writes, NOT
+  a bulk applier over hot tables; drift forces re-approval (single-use point-in-time grant), it
+  is not retried through. **Bounded-ness and reversibility do NOT depend on this re-check** (see
+  `CLAUDE.md` §2): bounded comes from the `pg_stat_xact_*` reconciliation + `statement_timeout`
+  budget; reversibility from the pre-image capture (`FOR UPDATE`+`RETURNING`) + the coverage
+  guards (incl. the #87 fail-closed `MissingPreImage` seam).
+- **Why it is not closed:** it is not a defect — exact-set equality is exactly the anti-TOCTOU
+  binding §14.3 needs (it pins the human's grant to the precise approved row-identity set). A
+  tolerance band would loosen the binding. The "limitation" is the honest UX consequence: this is
+  a surgical, low-churn instrument, not a hot-table bulk tool.
+- **Repro:** `dbsafe-bench` `no-where-write-drift` (same-count/different-PK flip → `PkSetDrift`
+  abort) + the env-gated PG18 ITs `apply_it::t_drift_predicate_flip_same_count_different_pks_aborts`
+  and `apply_grant_it`'s data-drift case (`BindingMismatch`); the #87 ITs prove the bound/undo
+  guards are the ones carrying capping + reversibility (`t_repeatable_read_*`,
+  `t_concurrent_insert_*`).
+- **SPEC.amendments tie:** "#87 — moat-seam fix" (the PK-set re-check re-attributed as an
+  authorization-freshness gate; bound → budget + reconciliation, undo → pre-image capture +
+  coverage guards).
+
 ---
 
 ### Bottom line
 
-None of B1–B7 is a deterministic-floor false-negative: the catastrophic-FN ledger
+None of B1–B8 is a deterministic-floor false-negative: the catastrophic-FN ledger
 (`dbsafe-bench/golden/known_bypasses.json`) is **empty**, and the gate keeps it
-empty (0 FN / 0 FP over the frozen corpus). B1–B7 are the honest **scope** of the
+empty (0 FN / 0 FP over the frozen corpus). B1–B8 are the honest **scope** of the
 MVP — bounded (not zero) read disclosure, a cooperative MCP, single-int-PK apply,
 deferred cross-process attestation, a file-anchor stand-in, a stubbed (tighten-only)
-RiskEngine, and an inert `replica.dsn` (no replica read-routing / degraded-budget
-differential yet, deferred → #77) — each disclosed here with a repro and tied to its
-SPEC.amendments entry.
+RiskEngine, an inert `replica.dsn` (no replica read-routing / degraded-budget
+differential yet, deferred → #77), and the exact-set apply-time re-check that makes
+guarded writes a surgical, re-review-on-drift tool (B8) — each disclosed here with a
+repro and tied to its SPEC.amendments entry.

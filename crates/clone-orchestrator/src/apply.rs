@@ -231,6 +231,39 @@ pub enum ApplyError {
         missing: Vec<String>,
     },
 
+    /// **A forward-written row has NO captured pre-image** (step 4, the
+    /// fail-CLOSED pre-image seam). The forward op's `RETURNING` reported a PK that
+    /// was **not** in the `FOR UPDATE` pre-image snapshot — a row that committed
+    /// **into** the predicate between the capture and the write (a READ COMMITTED /
+    /// concurrent-insert TOCTOU). The earlier code substituted an **id-only** image
+    /// for such a row, so a `DELETE` would commit `reversible:true` with an
+    /// **un-revertable** restore (the re-insert has only the PK, not the row). The
+    /// guard fails closed: a written row lacking a complete captured pre-image
+    /// ABORTS before commit (no mutation). → ROLLBACK. This is a connection-level
+    /// abort surfaced typed so the caller can tell it from a drift abort.
+    #[error(
+        "GUARD ABORT (missing pre-image on `{relation}` pk={pk}): the forward op wrote a row with no captured FOR UPDATE pre-image (a row committed INTO the predicate after the pre-image snapshot) — its change cannot be reversibly restored"
+    )]
+    MissingPreImage {
+        /// The relation whose written row had no captured pre-image.
+        relation: String,
+        /// The PK of the written row missing a pre-image (for diagnostics).
+        pk: String,
+    },
+
+    /// **The apply txn hit a serialization failure** (SQLSTATE `40001`) under
+    /// REPEATABLE READ isolation (step 2). A concurrent transaction made the apply's
+    /// snapshot unable to serialize (e.g. a first-updater-wins conflict on a
+    /// `FOR UPDATE` row, or a concurrent change the snapshot cannot see). **Policy:
+    /// abort, do NOT retry** — a retry would fight the already-consumed single-use
+    /// §14.3 grant nonce and re-open the TOCTOU the grant binding closes. Surfaced
+    /// distinctly so a serialization abort is not conflated with a drift or timeout
+    /// abort. → ROLLBACK, nothing committed.
+    #[error(
+        "APPLY SERIALIZATION FAILURE (40001): the REPEATABLE READ apply txn could not serialize against a concurrent transaction — aborted, nothing committed (NOT retried: a retry would burn the single-use grant + re-open the TOCTOU)"
+    )]
+    SerializationFailure,
+
     /// The apply txn exceeded its `statement_timeout` (step 2) and was aborted by
     /// the server — **no partial commit**. Surfaced distinctly so the caller can
     /// tell a timeout abort from a drift abort.
@@ -686,12 +719,19 @@ fn guarded_body(
     //     is a no-op; the drift tests mutate world state here.
     barrier.pause_point("between dry_run and apply");
 
-    // (5) FULL-blast-radius apply-time PK-set re-check (0-tolerance destructive).
-    //     Recompute the affected-PK-set checksum INSIDE the txn (before the forward
-    //     op) for the TARGET *and every cascade relation* and compare each to its
-    //     dry-run checksum. The guard is the checksum, not the count — it catches a
-    //     predicate-flip (same count, different PKs) on the target AND cascade-child
-    //     drift (post-snapshot child rows that swelled the cascade set).
+    // (5) FULL-blast-radius apply-time PK-set re-check — a freshness/authorization
+    //     re-check (NOT the bound/undo guard). Recompute the affected-PK-set
+    //     checksum INSIDE the txn (before the forward op) for the TARGET *and every
+    //     cascade relation* and compare each to its dry-run/grant checksum. This
+    //     binds the §14.3 human grant to the EXACT approved row-identity set: it is
+    //     an anti-TOCTOU authorization-freshness gate (0-tolerance, catches a
+    //     predicate-flip — same count, different PKs — on the target AND cascade-child
+    //     drift), NOT the mechanism that makes the write bounded-&-reversible.
+    //     Bounded-ness comes from the `pg_stat_xact_*` reconciliation (step 6) +
+    //     `statement_timeout` budget (step 2); reversibility from the pre-image
+    //     capture (step 4) + the coverage guards (steps 8/8b). A drifted identity set
+    //     fails this check CLOSED (re-approve required) — it does not loosen any
+    //     bound/undo guard.
     let apply_time = conn.recompute_pk_checksum(relation)?;
     if apply_time.as_prefixed() != predicted.target_checksum {
         return Err(ApplyError::PkSetDrift {

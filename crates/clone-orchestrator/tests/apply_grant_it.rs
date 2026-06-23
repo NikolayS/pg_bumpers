@@ -768,8 +768,18 @@ fn s3_pk_set_guard_still_fires_under_the_grant_path() {
     let live = live_for("p-s3");
     // Sign the grant; the LIVE recompute at the grant gate still matches (the drift
     // is injected LATER, at the §10.4 barrier inside guarded_apply, AFTER the grant
-    // gate's recompute). So the grant VERIFIES, then the S3 apply-time re-check
-    // inside the txn catches the barrier-injected drift → PkSetDrift abort.
+    // gate's recompute). So the grant VERIFIES, then the §4 apply-time guards inside
+    // the txn catch the barrier-injected drift → fail-closed abort.
+    //
+    // #87 / REPEATABLE READ note: the §10.4 barrier fires AFTER `conn.begin()` pins
+    // the apply's RR snapshot, so the barrier's committed `DELETE id=8` is NOT visible
+    // to the step-5 PK-set recompute (it reads the consistent snapshot) — instead the
+    // apply's `FOR UPDATE` on id=8 cannot serialize against the concurrent delete and
+    // raises SQLSTATE 40001 → `SerializationFailure`. Both are equally fail-closed
+    // aborts with NO mutation; the grant gate remains tighten-only either way. (A
+    // drift that commits BEFORE the apply snapshot — the realistic dry-run→apply
+    // window — is still caught by the PK-set re-check; this test injects at the §10.4
+    // seam, which under RR surfaces as the serialization abort.)
     let grant = sign_grant(&sk, &live, &br, "n-s3", 10_000);
     let pol = policy();
     let mut nonces = InMemoryNonceStore::new();
@@ -802,8 +812,12 @@ fn s3_pk_set_guard_still_fires_under_the_grant_path() {
         )
         .map(|_| ())
     };
-    // The grant VERIFIED (nonce consumed), but the S3 apply-time PK-set re-check
-    // inside guarded_apply caught the barrier-injected drift → fail-closed abort.
+    // The grant VERIFIED (nonce consumed), but a §4 apply-time guard inside
+    // guarded_apply caught the barrier-injected drift → fail-closed abort. Under RR
+    // the post-snapshot barrier drift surfaces as a serialization failure (the apply's
+    // FOR UPDATE cannot serialize against the concurrent DELETE); a pre-snapshot drift
+    // would surface as the PK-set re-check mismatch. Accept BOTH — each is fail-closed
+    // and proves the grant gate did NOT weaken the S3 guards.
     match result {
         Err(GrantedApplyError::Apply(ApplyError::PkSetDrift {
             dry_run,
@@ -817,7 +831,18 @@ fn s3_pk_set_guard_still_fires_under_the_grant_path() {
                  → ABORT. The grant gate is tighten-only; it did NOT weaken the S3 guards."
             );
         }
-        other => panic!("expected S3 PkSetDrift under the grant path, got {other:?}"),
+        Err(GrantedApplyError::Apply(ApplyError::SerializationFailure)) => {
+            eprintln!(
+                "S3-guard-intact PASS: grant verified, then under REPEATABLE READ the §10.4 \
+                 barrier-injected concurrent DELETE made the apply's FOR UPDATE unable to \
+                 serialize → SerializationFailure (40001) ABORT. Still fail-closed, no mutation; \
+                 the grant gate is tighten-only and did NOT weaken the S3 guards."
+            );
+        }
+        other => panic!(
+            "expected a fail-closed S3 abort (PkSetDrift or SerializationFailure) under the \
+             grant path, got {other:?}"
+        ),
     }
     assert_eq!(barrier.crossings(), 1, "barrier crossed once");
     // No even account was zeroed (apply rolled back); only the injected DELETE of

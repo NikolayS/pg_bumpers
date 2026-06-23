@@ -123,6 +123,8 @@ mod dl {
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -151,6 +153,8 @@ mod dl {
             cascade_preimage_ids: vec![(cascade, vec![20, 40, 60, 80])],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -176,6 +180,8 @@ mod dl {
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -197,6 +203,8 @@ mod dl {
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -259,6 +267,8 @@ mod dl {
             cascade_preimage_ids: vec![(child, vec![20, 40, 60, 80])],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -279,6 +289,8 @@ mod dl {
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -307,6 +319,8 @@ mod dl {
             // the written `notes`).
             written_columns: vec!["notes".to_string()],
             captured_image_cols: vec!["status".to_string()],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
         }
     }
 
@@ -328,6 +342,51 @@ mod dl {
             cascade_preimage_ids: vec![],
             written_columns: vec!["notes".to_string()],
             captured_image_cols: vec!["notes".to_string()],
+            racing_written_ids: vec![],
+            preimage_seam_closed: true,
+        }
+    }
+
+    /// **#87 — CONCURRENT-DRIFT DELETE, missing pre-image: fail-closed.** A
+    /// `DELETE … WHERE <pred>` where a row (id=10) committed INTO the predicate
+    /// between the `FOR UPDATE` pre-image capture and the `RETURNING` write (a READ
+    /// COMMITTED / concurrent-insert TOCTOU). id=10 is in the (drifted) approved set
+    /// the grant pins, the apply's PK-set recompute matches, the written set matches,
+    /// and the `pg_stat_xact_*` footprint reconciles — so EVERY other guard (PK-set
+    /// re-check, written-set, per-op-type reconciliation, row/column coverage) PASSES.
+    /// The ONLY thing standing between a catastrophic un-revertable DELETE and a
+    /// fail-closed abort is the pre-image seam itself: id=10 was WRITTEN (deleted) but
+    /// has NO captured pre-image, so its restore re-insert would hold only the PK.
+    ///
+    /// Pre-fix (the OLD fail-OPEN fallback) substituted an id-only image and COMMITTED
+    /// `reversible:true` — the catastrophic FN this scenario CI-locks against forever.
+    /// The #87 fix fails closed: `MissingPreImage` ABORT (REVERTED,
+    /// `prod_rows_touched=0`). Modeled with `racing_written_ids=[10]` +
+    /// `preimage_seam_closed=true` so the SCRIPTED conn reproduces exactly the
+    /// production `conn.rs::apply_forward` seam.
+    pub fn concurrent_drift_delete_missing_preimage() -> DataLossCase {
+        DataLossCase {
+            relation: "public.orders".into(),
+            kind: WriteKind::Delete,
+            // The grant pins {2,4,6,8,10} — id=10 is in the (drifted) approved set, so
+            // the PK-set re-check + written-set both reconcile; only id=10's pre-image
+            // is missing.
+            grant_ids: vec![2, 4, 6, 8, 10],
+            target_effect: OpCounts::new(0, 0, 5),
+            cascades: vec![],
+            extra_effect: vec![],
+            recompute_override: vec![],
+            written_override: None,
+            // The apply deletes all 5 (del=5) — exactly the predicted footprint, so the
+            // per-op-type reconciliation PASSES.
+            apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 0, 5))],
+            cascade_preimage_ids: vec![],
+            written_columns: vec![],
+            captured_image_cols: vec![],
+            // id=10 was written (deleted) but has NO captured FOR UPDATE pre-image.
+            racing_written_ids: vec![10],
+            // Production behavior: the seam fails CLOSED → MissingPreImage abort.
+            preimage_seam_closed: true,
         }
     }
 }
@@ -459,6 +518,24 @@ pub fn corpus() -> Vec<Scenario> {
             DefenseLayer::GuardedApply,
             Some(true),
             Probe::GuardedApply(Box::new(dl::multi_level_cascade_fail_closed())),
+        ),
+        // --- concurrent-drift DELETE (#87): fail-OPEN pre-image seam closed ---
+        // A row commits INTO the predicate between the FOR UPDATE pre-image capture
+        // and the DELETE RETURNING write (a READ COMMITTED / concurrent-insert
+        // TOCTOU). It is written (deleted) with NO captured pre-image, yet the PK-set
+        // re-check, written-set, and pg_stat_xact reconciliation all PASS — so the
+        // pre-image seam is the SOLE catch. Pre-fix it committed an un-revertable
+        // DELETE (id-only restore image) — the moat-critical catastrophic FN. The #87
+        // fix fails closed (MissingPreImage). This golden cell CI-locks it forever.
+        Scenario::new(
+            "concurrent-drift-delete-missing-preimage",
+            Class::Dangerous,
+            "DELETE; a row committed INTO the predicate between the FOR UPDATE capture and the RETURNING write is deleted with NO pre-image (all other guards reconcile) → the fail-OPEN id-only image would be un-revertable → MissingPreImage ABORT",
+            Vector::Obfuscated,
+            Verdict::Reverted,
+            DefenseLayer::GuardedApply,
+            Some(true),
+            Probe::GuardedApply(Box::new(dl::concurrent_drift_delete_missing_preimage())),
         ),
         // --- wide-column UPDATE (S5 #75): uncaptured written column, fail-closed
         // A single-int-PK `UPDATE … SET notes = …` whose pre-image captured only
