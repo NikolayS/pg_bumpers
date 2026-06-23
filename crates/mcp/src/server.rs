@@ -47,7 +47,7 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 
-use pgb_policy::{AllowStub, IntentTiers, MeasuredStats, RiskEngine, RiskInput};
+use pgb_policy::{AllowStub, MeasuredStats, RiskEngine, RiskInput};
 
 use crate::applyd::{ApplydClient, ApplydOutcome};
 use crate::audit::AuditReader;
@@ -249,34 +249,23 @@ impl PgBumpersMcp {
         )
     }
 
-    /// Capture the T0–T2 intent for a write statement (SPEC §11.2/§11.5). This is
-    /// **captured/logged only** — the RiskEngine stub returns Allow and NOTHING
-    /// here gates the floor (the deterministic floor in applyd is the guarantee).
-    /// We derive intent from the statement exactly like the proxy/applyd path
-    /// (`IntentTiers::from_statement`: T0 role + T1 SQL class + any `/* intent: … */`
-    /// annotation). `application_name` defaults to this server's wire app name.
-    fn capture_write_intent(&self, sql: &str, application_name: Option<String>) -> IntentTiers {
-        IntentTiers::from_statement(
-            &self.role,
-            sql,
-            application_name.or_else(|| Some(crate::proxy::DEFAULT_APP_NAME.to_string())),
-        )
-    }
-
     /// `propose_write` → applyd `propose`. Mints a TTL'd proposal bound to the
     /// session's role/session_id (pinned in applyd's stored record). A structural /
     /// steerable-predicate shape is refused by applyd's classify choke → a
-    /// recoverable `NOT_REHEARSABLE` block. The intent is captured/logged here
-    /// (RiskEngine stub = Allow; T0–T2 captured, never given teeth).
+    /// recoverable `NOT_REHEARSABLE` block. The DURABLE T0–T2 intent record is
+    /// captured by applyd (the audit-chain owner), not here — see the body.
     async fn tool_propose_write(
         &self,
         sql: &str,
         expected_rows: Option<u64>,
-        application_name: Option<String>,
+        _application_name: Option<String>,
     ) -> CallToolResult {
-        // Capture/log the T0–T2 intent (no gate). The applyd path ALSO populates the
-        // audit-chain intent (the durable record); this is the MCP-side capture.
-        let _intent = self.capture_write_intent(sql, application_name);
+        // No MCP-side intent capture: the DURABLE T0–T2 intent record is owned by
+        // applyd, which populates the audit-chain `intent` from the SAME statement
+        // (`IntentTiers::from_statement`, see crates/applyd/src/service.rs) when it
+        // mints the proposal. Capturing it again here would be a dead computation —
+        // this crate has no durable sink to thread it into (it only READS `_meta`),
+        // and the RiskEngine stub is captured/logged only and never gates the floor.
         let Some(applyd) = &self.applyd else {
             return structured_block(&Self::no_applyd_block());
         };
@@ -492,7 +481,9 @@ impl ServerHandler for PgBumpersMcp {
                  the deterministic floor (proxy + WALL + applyd + warden) is the real boundary. \
                  Call whoami to see the posture. Reads (query/explain_plan/discover_schema/\
                  get_audit) go THROUGH the proxy/_meta; writes (propose_write→dry_run→\
-                 apply_write) are being wired (EPIC #83 PR3).",
+                 request_elevation→apply_write) traverse the live pgb-applyd deterministic \
+                 floor (the grant-gated §4 apply path). The operator approve hop carries the \
+                 signing key and stays OUT of the agent stdio — there is no approve tool.",
             )
     }
 

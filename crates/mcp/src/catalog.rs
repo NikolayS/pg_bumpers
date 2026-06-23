@@ -104,7 +104,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "dry_run",
-            description: "Rehearse a proposal → blast radius incl. affected-PK-set checksum.",
+            description: "Rehearse a proposal → blast radius (bounded row/WAL-byte estimate vs the WriteCap).",
             input_schema: object_schema(
                 &[(
                     "proposal_id",
@@ -115,7 +115,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "apply_write",
-            description: "Apply a dry-run proposal under the PK-set guard (needs confirm_rows).",
+            description: "Apply a dry-run proposal under the grant-gated WriteCap floor (needs confirm_rows).",
             input_schema: object_schema(
                 &[
                     ("proposal_id", string_prop("The dry-run proposal to apply.")),

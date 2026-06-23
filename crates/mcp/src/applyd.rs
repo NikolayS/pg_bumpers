@@ -24,7 +24,9 @@
 //! - **A dropped applyd socket can't crash the process:** if the socket closes
 //!   mid-stream, the held connection is dropped and the next call re-dials; a
 //!   persistent failure surfaces a recoverable `APPLYD_UNAVAILABLE` block. There is
-//!   no `panic`/`unwrap` on the wire path.
+//!   no `panic`/`unwrap` on a fallible wire operation; the one `expect` in `call`
+//!   is a structurally-unreachable post-dial invariant (`Some` immediately after the
+//!   dial block sets it), not a wire-error path.
 //!
 //! The cap + self-determined-predicate gate (EPIC #91) is enforced INSIDE applyd
 //! (the exact-PK-set checksum is gone; the floor is the predicate gate + absolute
@@ -225,6 +227,9 @@ impl ApplydClient {
                     Err(block) => return ApplydOutcome::Blocked(block),
                 }
             }
+            // invariant: Some immediately after the dial block above (we either
+            // re-used a held conn or just set `*guard = Some(...)`), so this expect
+            // is structurally unreachable — never a fallible wire operation.
             let conn = guard.as_mut().expect("conn present after dial");
             match self.round_trip(conn, method, &params).await {
                 Ok(resp) => return map_response(resp),
@@ -548,5 +553,363 @@ mod tests {
             ApplydOutcome::Blocked(b) => assert_eq!(b.code, "APPLYD_ERROR"),
             ApplydOutcome::Ok(_) => panic!("a result-less, error-less response must fail closed"),
         }
+    }
+
+    // =========================================================================
+    //  In-process applyd-socket stub tests (fast/default CI — NO PG18, NO real
+    //  applyd). A `tokio::net::UnixListener` bound to a unique temp socket path
+    //  with a scripted accept loop emulates the line-delimited JSON-RPC 2.0 wire
+    //  (`crates/applyd/src/protocol.rs`), so the success round-trip + the
+    //  reconnect-on-drop / timeout / `apply(confirm_token=None)` branches that the
+    //  env-gated e2e exercises with a REAL daemon also execute in fast CI.
+    // =========================================================================
+
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU32;
+    use tokio::net::UnixListener;
+
+    /// A unique throwaway socket path per test (pid + a process-global counter), so
+    /// concurrent tests never collide. Removed on `StubGuard` drop.
+    fn unique_socket_path(tag: &str) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "pgb-mcp-applyd-stub-{}-{tag}-{n}.sock",
+            std::process::id()
+        ))
+    }
+
+    /// RAII cleanup for a stub socket path (best-effort unlink on drop).
+    struct StubGuard {
+        path: PathBuf,
+    }
+    impl Drop for StubGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Read exactly one JSON-RPC request line from `reader`, parse it, and assert the
+    /// base wire shape the client must serialize for EVERY method: `jsonrpc == "2.0"`,
+    /// a present non-empty `method`, and a trailing newline (one object per line).
+    /// Returns the parsed request value (so the caller can branch on `method` /
+    /// inspect `params`). `None` ⇒ the peer closed before sending.
+    ///
+    /// Note: `params.role` / `params.session_id` are pinned ONLY on `propose` (the
+    /// apply path re-derives role/session from applyd's STORED record, so `dry_run`
+    /// / `apply` carry just their own params). The propose-specific pinning is
+    /// asserted by [`assert_propose_pins_role_session`].
+    async fn read_and_assert_request<R>(reader: &mut R) -> Option<serde_json::Value>
+    where
+        R: AsyncBufReadExt + Unpin,
+    {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .expect("read request line");
+        if n == 0 {
+            return None;
+        }
+        assert!(
+            line.ends_with('\n'),
+            "each JSON-RPC request is one newline-terminated line, got {line:?}"
+        );
+        let req: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("request is valid JSON");
+        assert_eq!(
+            req["jsonrpc"],
+            serde_json::json!("2.0"),
+            "the request carries the JSON-RPC 2.0 version literal"
+        );
+        assert!(
+            req["method"].as_str().is_some_and(|m| !m.is_empty()),
+            "the request carries a non-empty method: {req}"
+        );
+        Some(req)
+    }
+
+    /// Assert a `propose` request pins the role + session_id into its params (the
+    /// proposal-binding fields the client sources from its config).
+    fn assert_propose_pins_role_session(req: &serde_json::Value) {
+        assert_eq!(req["method"], serde_json::json!("propose"));
+        assert!(
+            req["params"]["role"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            "propose params pin the role: {req}"
+        );
+        assert!(
+            req["params"]["session_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "propose params pin the session_id: {req}"
+        );
+    }
+
+    /// Write one canned JSON-RPC success line (`{jsonrpc, id, result}`) back over
+    /// `writer`, echoing the request `id` (the client ignores it, but a real daemon
+    /// echoes it). One object per line (newline-terminated).
+    async fn write_result<W>(writer: &mut W, id: &serde_json::Value, result: serde_json::Value)
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let mut line = serde_json::to_string(&resp).unwrap();
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await.expect("write resp");
+        writer.flush().await.expect("flush resp");
+    }
+
+    fn stub_client(socket_path: &std::path::Path, timeout_ms: u64) -> ApplydClient {
+        ApplydClient::new(ApplydConfig {
+            socket_path: socket_path.to_string_lossy().to_string(),
+            role: "app_writer".into(),
+            session_id: "sess-stub".into(),
+            timeout_ms,
+        })
+    }
+
+    /// (a) **Success round-trip.** The stub accepts ONE connection, reads one
+    /// request, ASSERTS its shape (method/params/role/session_id + newline framing),
+    /// and replies a canned `result`. Proves request serialization + `read_line`
+    /// parse + `map_response` Ok-mapping in fast CI (no real applyd).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn success_round_trip_serializes_request_and_maps_ok_payload() {
+        let path = unique_socket_path("ok");
+        let _guard = StubGuard { path: path.clone() };
+        let listener = UnixListener::bind(&path).expect("bind stub socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("a request line");
+            // FIX 1(a): the propose request pins method + role + session_id + sql.
+            assert_propose_pins_role_session(&req);
+            assert_eq!(
+                req["params"]["sql"],
+                serde_json::json!("UPDATE t SET x=1 WHERE id=1")
+            );
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "proposal_id": "p-42", "ttl_millis": 1_800_000 }),
+            )
+            .await;
+        });
+
+        let c = stub_client(&path, 5_000);
+        match c.propose("UPDATE t SET x=1 WHERE id=1", Some(1)).await {
+            ApplydOutcome::Ok(v) => {
+                assert_eq!(v["proposal_id"], serde_json::json!("p-42"));
+                assert_eq!(v["ttl_millis"], serde_json::json!(1_800_000));
+            }
+            ApplydOutcome::Blocked(b) => panic!("a scripted success must map to Ok, got {b:?}"),
+        }
+        server.await.expect("stub server task");
+    }
+
+    /// (b) **Reconnect-on-drop.** The stub serves ONE request→response then CLOSES
+    /// the connection; the NEXT client call must transparently re-dial (a fresh
+    /// accept) and succeed. This drives the `WireError::Lost` → `*guard = None` →
+    /// re-dial-on-attempt-0 retry branch — the resilience claim's headline path,
+    /// which NO prior test exercised (the down-applyd test never establishes a
+    /// connection to drop).
+    ///
+    /// Teeth: if the conn-reset+`continue` retry in `call` is removed, the second
+    /// call sees the held-but-dead socket, fails to re-dial, and surfaces a
+    /// `Blocked` instead of `Ok` — this assertion then FAILS (captured RED).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_socket_transparently_reconnects_on_the_next_call() {
+        let path = unique_socket_path("reconnect");
+        let _guard = StubGuard { path: path.clone() };
+        let listener = UnixListener::bind(&path).expect("bind stub socket");
+
+        let server = tokio::spawn(async move {
+            // Connection #1: serve exactly one request, reply, then CLOSE (drop the
+            // stream → EOF on the client's held read half on its NEXT round-trip).
+            let (stream, _) = listener.accept().await.expect("accept #1");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #1");
+            assert_eq!(req["method"], serde_json::json!("propose"));
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "proposal_id": "p-1", "ttl_millis": 1 }),
+            )
+            .await;
+            drop(reader);
+            drop(writer); // close connection #1
+
+            // Connection #2: the client RE-DIALS here. Serve its request + reply.
+            let (stream, _) = listener.accept().await.expect("accept #2 (the re-dial)");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #2 (re-dial)");
+            assert_eq!(req["method"], serde_json::json!("dry_run"));
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "total_rows": 4, "reversible": true, "confirm_token": "ct" }),
+            )
+            .await;
+        });
+
+        let c = stub_client(&path, 5_000);
+        // Call #1 succeeds and leaves a HELD connection in the client.
+        match c.propose("UPDATE t SET x=1 WHERE id=1", None).await {
+            ApplydOutcome::Ok(v) => assert_eq!(v["proposal_id"], serde_json::json!("p-1")),
+            ApplydOutcome::Blocked(b) => panic!("call #1 must succeed, got {b:?}"),
+        }
+        // Call #2: the held socket is now dead (the stub closed it). The client must
+        // transparently re-dial and succeed — the reconnect-on-drop guarantee.
+        match c.dry_run("p-1").await {
+            ApplydOutcome::Ok(v) => assert_eq!(v["total_rows"], serde_json::json!(4)),
+            ApplydOutcome::Blocked(b) => {
+                panic!("call #2 must transparently re-dial + succeed, got {b:?}")
+            }
+        }
+        server.await.expect("stub server task");
+    }
+
+    /// (c) **Timeout.** A stub that ACCEPTS the request but never replies, with a low
+    /// per-call timeout → a `Blocked` outcome that is `retryable == true` with the
+    /// `APPLYD_UNAVAILABLE` code (a timed-out call is a recoverable block, never a
+    /// silent success). Then a FOLLOW-UP call against a responsive stub succeeds —
+    /// proving the timed-out socket was dropped + cleanly re-dialed (no line-framing
+    /// desync from a late response landing on a reused socket).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_call_is_a_retryable_block_then_a_clean_redial_succeeds() {
+        let path = unique_socket_path("timeout");
+        let _guard = StubGuard { path: path.clone() };
+        let listener = UnixListener::bind(&path).expect("bind stub socket");
+
+        let server = tokio::spawn(async move {
+            // Connection #1: accept + read the request, then HANG (never reply) so
+            // the client's round-trip exceeds its per-call timeout. Hold the stream
+            // open across the timeout window so the failure is a timeout, not an EOF.
+            let (stream, _) = listener.accept().await.expect("accept #1");
+            let (read_half, _writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let _req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #1");
+            // Keep the connection alive (no reply) until the client times out + drops
+            // its end; then this read returns 0 and we move on to serve the re-dial.
+            let mut sink = String::new();
+            let _ = reader.read_line(&mut sink).await;
+
+            // Connection #2: the client re-dials a clean socket; serve it normally.
+            let (stream, _) = listener.accept().await.expect("accept #2 (re-dial)");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #2");
+            assert_eq!(req["method"], serde_json::json!("dry_run"));
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "total_rows": 1, "reversible": true, "confirm_token": "ct2" }),
+            )
+            .await;
+        });
+
+        // A SHORT timeout so the never-answered call trips it fast.
+        let c = stub_client(&path, 200);
+        match c.propose("UPDATE t SET x=1 WHERE id=1", None).await {
+            ApplydOutcome::Blocked(b) => {
+                assert_eq!(
+                    b.code, "APPLYD_UNAVAILABLE",
+                    "a timeout is APPLYD_UNAVAILABLE"
+                );
+                assert!(b.retryable, "a timed-out call is retryable (re-dial)");
+            }
+            ApplydOutcome::Ok(_) => panic!("a never-answered call cannot return Ok"),
+        }
+        // The timed-out socket was dropped; the next call re-dials a CLEAN socket and
+        // succeeds — no late response desyncs the line framing.
+        match c.dry_run("p-1").await {
+            ApplydOutcome::Ok(v) => assert_eq!(v["total_rows"], serde_json::json!(1)),
+            ApplydOutcome::Blocked(b) => {
+                panic!("the post-timeout re-dial must succeed cleanly, got {b:?}")
+            }
+        }
+        server.await.expect("stub server task");
+    }
+
+    /// (d) **`confirm_token=None`.** `apply(pid, n, None)` must serialize params
+    /// WITHOUT a `confirm_token` key (the only untested branch of the `apply`
+    /// param builder); `Some(token)` includes it. The stub asserts BOTH on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_with_none_confirm_token_omits_the_key_on_the_wire() {
+        let path = unique_socket_path("apply-token");
+        let _guard = StubGuard { path: path.clone() };
+        let listener = UnixListener::bind(&path).expect("bind stub socket");
+
+        let server = tokio::spawn(async move {
+            // Connection #1: apply WITHOUT a confirm_token → the key is ABSENT.
+            let (stream, _) = listener.accept().await.expect("accept #1");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #1");
+            assert_eq!(req["method"], serde_json::json!("apply"));
+            assert_eq!(req["params"]["proposal_id"], serde_json::json!("p-1"));
+            assert_eq!(req["params"]["confirm_rows"], serde_json::json!(4));
+            assert!(
+                req["params"].get("confirm_token").is_none(),
+                "apply(_, _, None) must NOT serialize a confirm_token key: {req}"
+            );
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "applied": true, "rows_written": 4, "reversible": true }),
+            )
+            .await;
+            drop(reader);
+            drop(writer);
+
+            // Connection #2: apply WITH a confirm_token → the key is PRESENT (the
+            // contrasting branch, so the test pins both serialization paths).
+            let (stream, _) = listener.accept().await.expect("accept #2");
+            let (read_half, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let req = read_and_assert_request(&mut reader)
+                .await
+                .expect("request #2");
+            assert_eq!(req["method"], serde_json::json!("apply"));
+            assert_eq!(
+                req["params"]["confirm_token"],
+                serde_json::json!("ct-9"),
+                "apply(_, _, Some(t)) serializes the confirm_token: {req}"
+            );
+            write_result(
+                &mut writer,
+                &req["id"],
+                serde_json::json!({ "applied": true, "rows_written": 4, "reversible": true }),
+            )
+            .await;
+        });
+
+        let c = stub_client(&path, 5_000);
+        match c.apply("p-1", 4, None).await {
+            ApplydOutcome::Ok(v) => assert_eq!(v["applied"], serde_json::json!(true)),
+            ApplydOutcome::Blocked(b) => panic!("apply (no token) must succeed, got {b:?}"),
+        }
+        match c.apply("p-1", 4, Some("ct-9")).await {
+            ApplydOutcome::Ok(v) => assert_eq!(v["applied"], serde_json::json!(true)),
+            ApplydOutcome::Blocked(b) => panic!("apply (with token) must succeed, got {b:?}"),
+        }
+        server.await.expect("stub server task");
     }
 }
