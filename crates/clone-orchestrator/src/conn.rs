@@ -425,6 +425,9 @@ pub struct PgApplyConn<'a> {
     forward_sql: String,
     where_sql: String,
     xact_baseline: BTreeMap<String, (i64, i64, i64)>,
+    /// WAL insert LSN captured at `begin`, for the EPIC #91 PR-B WAL-byte cap
+    /// (`xact_wal_bytes` reports the delta from here).
+    wal_baseline_lsn: Option<String>,
     in_txn: bool,
     statement_timeout_ms: u64,
 }
@@ -437,6 +440,7 @@ impl<'a> PgApplyConn<'a> {
             forward_sql: forward_sql.to_string(),
             where_sql: where_sql.to_string(),
             xact_baseline: BTreeMap::new(),
+            wal_baseline_lsn: None,
             in_txn: false,
             statement_timeout_ms: 0,
         }
@@ -519,35 +523,40 @@ impl ApplyConn for PgApplyConn<'_> {
         self.in_txn = true;
         self.statement_timeout_ms = timeout_ms;
         self.xact_baseline = self.read_xact_raw()?;
+        // EPIC #91 PR-B WAL-byte cap baseline: the WAL insert LSN at txn start. The
+        // cap is enforced against the delta to this, the same `pg_current_wal_*`
+        // measure the dry-run's `wal_bytes` records (so they are comparable).
+        let row = self
+            .client
+            .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+            .map_err(|e| classify_apply(&e, timeout_ms))?;
+        self.wal_baseline_lsn = Some(row.get::<_, String>(0));
         Ok(())
     }
 
-    fn recompute_pk_checksum(
-        &mut self,
-        relation: &str,
-    ) -> Result<pgb_core::PkChecksum, ApplyError> {
-        let rows = self
+    fn xact_wal_bytes(&mut self) -> Result<u64, ApplyError> {
+        // The WAL bytes generated since `begin`, as the `pg_wal_lsn_diff` from the
+        // captured baseline LSN to the current insert LSN. Fail-closed on a missing
+        // baseline (begin not called) — refuse rather than under-report the cap.
+        let before = self.wal_baseline_lsn.clone().ok_or_else(|| {
+            ApplyError::Backend("WAL baseline not captured (begin not called)".into())
+        })?;
+        let after: String = self
             .client
-            .query(
+            .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+            .map_err(|e| classify_apply(&e, self.statement_timeout_ms))?
+            .get(0);
+        let bytes: i64 = self
+            .client
+            .query_one(
                 &format!(
-                    "SELECT id FROM {relation} WHERE {} ORDER BY id",
-                    self.where_sql
+                    "SELECT GREATEST(pg_wal_lsn_diff('{after}'::pg_lsn, '{before}'::pg_lsn), 0)::bigint"
                 ),
                 &[],
             )
-            .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        let mut b = PkSetBuilder::for_relation(relation);
-        for row in &rows {
-            // Fail-closed on a non-int4 PK rather than panic: a wider PK type is
-            // gated at dry_run (NOT_REHEARSABLE); if one ever reaches here, surface
-            // a typed Backend error so the apply aborts cleanly (no poisoned conn).
-            let id: i32 = row
-                .try_get(0)
-                .map_err(|e| ApplyError::Backend(format!("non-int4 PK on `{relation}`: {e}")))?;
-            b.push(PkTuple::single(PkValue::Int(id as i64)))
-                .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        }
-        b.finalize().map_err(|e| ApplyError::Backend(e.to_string()))
+            .map_err(|e| ApplyError::Backend(e.to_string()))?
+            .get(0);
+        Ok(bytes.max(0) as u64)
     }
 
     fn self_determined_pk_column(&mut self, relation: &str) -> Option<String> {

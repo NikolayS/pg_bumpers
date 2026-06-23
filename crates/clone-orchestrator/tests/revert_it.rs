@@ -39,7 +39,7 @@ use pgb_clone_orchestrator::{PitrConfig, WriteKind, guarded_apply};
 use pgb_core::inverse::{ImageValue, Operation, certify};
 use pgb_core::{
     BlastRadius, InverseKind, NoopBarrier, NotRestored, OpCounts, PkChecksum, PkSetBuilder,
-    PkTuple, PkValue, RefusedOp, SystemClock,
+    PkTuple, PkValue, RefusedOp, SystemClock, WriteCap,
 };
 use postgres::{Client, NoTls};
 
@@ -335,47 +335,6 @@ impl ApplyConn for PgApplyConn<'_> {
         self.xact_baseline = self.read_xact_raw()?;
         Ok(())
     }
-    fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-        if let Some(c) = self.cascade.clone()
-            && c.relation == relation
-        {
-            let rows = self
-                .client
-                .query(
-                    &format!(
-                        "SELECT account_id, line_no FROM {} WHERE {} ORDER BY account_id, line_no",
-                        c.relation, c.where_sql
-                    ),
-                    &[],
-                )
-                .map_err(|e| ApplyError::Backend(e.to_string()))?;
-            let mut b = PkSetBuilder::for_relation(relation);
-            for row in &rows {
-                let a: i32 = row.get(0);
-                let l: i32 = row.get(1);
-                b.push(PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap())
-                    .map_err(|e| ApplyError::Backend(e.to_string()))?;
-            }
-            return b.finalize().map_err(|e| ApplyError::Backend(e.to_string()));
-        }
-        let rows = self
-            .client
-            .query(
-                &format!(
-                    "SELECT id FROM {relation} WHERE {} ORDER BY id",
-                    self.where_sql
-                ),
-                &[],
-            )
-            .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        let mut b = PkSetBuilder::for_relation(relation);
-        for row in &rows {
-            let id: i32 = row.get(0);
-            b.push(PkTuple::single(PkValue::Int(id as i64)))
-                .map_err(|e| ApplyError::Backend(e.to_string()))?;
-        }
-        b.finalize().map_err(|e| ApplyError::Backend(e.to_string()))
-    }
     fn apply_forward(
         &mut self,
         _kind: WriteKind,
@@ -665,6 +624,7 @@ fn t_marquee_no_where_update_balance_zero_auto_reverts_to_golden() {
             WriteKind::Update,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -778,6 +738,7 @@ fn t_delete_cascade_revert_restores_target_and_cascade_to_golden() {
             WriteKind::Delete,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1002,6 +963,7 @@ fn t_cardinality_invariant_held_across_revert_round_trip() {
             WriteKind::Delete,
             "public.accounts",
             &grant,
+            WriteCap::new(u64::MAX, u64::MAX),
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),

@@ -165,7 +165,7 @@ fn proxy_reject_and_cli_approve_share_one_anchored_meta_chain() {
         role: "app_writer".to_string(),
         session_id: "cli-sess".to_string(),
         dry_run_lsn: "3A/7F00C8".to_string(),
-        blast_radius_checksum: "sha256:demo".to_string(),
+        cap: pgb_core::WriteCap::new(8, 4096),
     };
     let op = Operation::Update {
         has_preimage: true,

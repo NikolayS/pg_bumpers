@@ -17,8 +17,8 @@
 //! [`crate::runner::assert_coverage_floor`] enforces it.
 
 use pgb_clone_orchestrator::WriteKind;
-use pgb_core::OpCounts;
 use pgb_core::inverse::Operation;
+use pgb_core::{OpCounts, WriteCap};
 
 use crate::floor::DataLossCase;
 use crate::verdict::{Class, DefenseLayer, GoldenRecord, Vector, Verdict};
@@ -135,6 +135,8 @@ mod dl {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -165,6 +167,8 @@ mod dl {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -192,29 +196,44 @@ mod dl {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
-    /// No-WHERE write with injected drift: a mass UPDATE whose apply-time PK set
-    /// drifted (a row flipped in post-snapshot) → the PK-set re-check aborts. The
-    /// PK-set guard (not row count) is what catches the same-count identity drift.
-    pub fn no_where_write_with_drift() -> DataLossCase {
+    /// **Magnitude drift over the approved cap (EPIC #91 PR-B).** Re-points the
+    /// former `no-where-write-drift` scenario, which relied on the now-dropped
+    /// exact-PK-set checksum to catch a same-count identity flip. With the checksum
+    /// gone, that pure-identity flip is the **predicate gate's** job (a no-WHERE /
+    /// steerable write is refused before approval — corpus
+    /// `steerable-*-predicate-*`); MAGNITUDE is the **cap's** job, which this
+    /// scenario exercises: the human approved a 5-row `id % 2 = 0` write with a cap
+    /// of 5, but concurrent inserts swelled the predicate's matching set so the live
+    /// apply changes 8 rows. The summed `pg_stat_xact_*` delta (8) > cap (5) →
+    /// `CapExceeded` ABORT, no mutation (REVERTED, 0 prod rows touched). The target's
+    /// own primary `upd` channel is exempt from the relative reconciliation (the cap
+    /// governs it), so the **cap alone** carries this magnitude bound.
+    pub fn magnitude_drift_over_cap() -> DataLossCase {
         DataLossCase {
             relation: "public.orders".into(),
             kind: WriteKind::Update,
+            // Dry-run approved 5 rows; the cap matches (5). The pre-check passes.
             grant_ids: vec![2, 4, 6, 8, 10],
             target_effect: OpCounts::new(0, 5, 0),
             cascades: vec![],
             extra_effect: vec![],
-            // same cardinality (5), different PKs: 10 flipped OUT, 1 flipped IN.
-            recompute_override: vec![("public.orders".into(), vec![1, 2, 4, 6, 8])],
-            written_override: None,
-            apply_deltas: vec![],
+            recompute_override: vec![],
+            // The live write changed 8 rows (concurrent inserts swelled the set).
+            written_override: Some(vec![2, 4, 6, 8, 10, 12, 14, 16]),
+            apply_deltas: vec![("public.orders".into(), OpCounts::new(0, 8, 0))],
             cascade_preimage_ids: vec![],
             written_columns: vec![],
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            // The approved cap is exactly the 5 rows the human saw at dry-run.
+            cap: WriteCap::new(5, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -279,6 +298,8 @@ mod dl {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -301,6 +322,8 @@ mod dl {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -331,6 +354,8 @@ mod dl {
             captured_image_cols: vec!["status".to_string()],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -354,6 +379,8 @@ mod dl {
             captured_image_cols: vec!["notes".to_string()],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 
@@ -397,6 +424,8 @@ mod dl {
             racing_written_ids: vec![10],
             // Production behavior: the seam fails CLOSED → MissingPreImage abort.
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         }
     }
 }
@@ -479,14 +508,14 @@ pub fn corpus() -> Vec<Scenario> {
         ),
         // --- data-loss reproductions (guarded-apply → REVERTED/abort) --------
         Scenario::new(
-            "no-where-write-drift",
+            "magnitude-drift-over-cap",
             Class::Dangerous,
-            "UPDATE public.orders SET status='x'  with injected post-snapshot PK drift (same count, diff PKs)",
+            "UPDATE public.orders SET status='x' WHERE id % 2 = 0; concurrent inserts swell the matching set from 5 (approved, cap=5) to 8 rows → CapExceeded (EPIC #91 PR-B; re-points the former no-where-write-drift checksum scenario onto the cap)",
             Vector::Naive,
             Verdict::Reverted,
             DefenseLayer::GuardedApply,
             Some(true),
-            Probe::GuardedApply(Box::new(dl::no_where_write_with_drift())),
+            Probe::GuardedApply(Box::new(dl::magnitude_drift_over_cap())),
         ),
         Scenario::new(
             "data-loss-out-of-predicate-trigger-delete",

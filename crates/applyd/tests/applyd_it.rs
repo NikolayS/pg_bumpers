@@ -323,7 +323,8 @@ fn apply_without_a_grant_is_approval_required_no_mutation() {
 }
 
 // ===========================================================================
-//  (3) DRIFT — a destructive DELETE whose data drifts at apply ABORTS, no mutation.
+//  (3) DRIFT — a destructive DELETE whose MAGNITUDE drifts past the approved cap
+//      at apply ABORTS (EPIC #91 PR-B: CapExceeded → BLAST_DRIFT), no mutation.
 // ===========================================================================
 
 #[test]
@@ -349,11 +350,17 @@ fn destructive_delete_drift_aborts_with_no_mutation() {
         "nonce-del",
     );
 
-    // DRIFT: a NEW even row appears AFTER the grant was signed, so the apply-time
-    // recompute sees {2,4,6,8,10} — a different PK set than the grant was bound to.
+    // MAGNITUDE DRIFT (EPIC #91 PR-B): SEVERAL new even rows appear AFTER the grant
+    // was signed, so the live `DELETE … WHERE id % 2 = 0` now destroys far more rows
+    // (accounts + their cascade entries + audit inserts) than the human approved —
+    // the full footprint exceeds the cap (pre-filled from the dry-run + 10%). The cap
+    // is the absolute-magnitude anchor that replaced the dropped exact-PK-set checksum.
     Client::connect(&url, NoTls)
         .unwrap()
-        .batch_execute("INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'drift', 5)")
+        .batch_execute(
+            "INSERT INTO public.accounts(id, owner, balance) VALUES \
+             (10,'d',5),(12,'d',5),(14,'d',5),(16,'d',5),(18,'d',5),(20,'d',5)",
+        )
         .unwrap();
     let before_drift = read_accounts(&url);
     let count_before: i64 = Client::connect(&url, NoTls)
@@ -375,13 +382,14 @@ fn destructive_delete_drift_aborts_with_no_mutation() {
         )
         .unwrap_err()
     };
-    // The grant was bound to {2,4,6,8}; the live recompute sees {2,4,6,8,10} →
-    // BindingMismatch → GRANT_REJECTED, BEFORE any apply txn opens. (Had the drift
-    // been injected post-gate it would be BLAST_DRIFT; either way NO mutation.)
-    assert!(
-        err.data.code == ErrorCode::GrantRejected.as_str()
-            || err.data.code == ErrorCode::BlastDrift.as_str(),
-        "expected GRANT_REJECTED or BLAST_DRIFT, got {}",
+    // The live DELETE's full footprint exceeds the approved cap → CapExceeded →
+    // BLAST_DRIFT, the apply txn rolled back (or the cap/footprint pre-check refused),
+    // NO mutation. (The grant itself still verified — statement + cap + nonce match;
+    // the magnitude is what the floor caught.)
+    assert_eq!(
+        err.data.code,
+        ErrorCode::BlastDrift.as_str(),
+        "expected BLAST_DRIFT (CapExceeded magnitude drift), got {}",
         err.data.code
     );
     let count_after: i64 = Client::connect(&url, NoTls)

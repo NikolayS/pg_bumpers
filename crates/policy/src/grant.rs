@@ -6,31 +6,44 @@
 //!
 //! ```text
 //! { statement_text, normalized_params, role, session/principal id,
-//!   proposal_id, dry_run_lsn, blast_radius_checksum, nonce, expiry }
+//!   proposal_id, dry_run_lsn, cap{max_rows,max_wal_bytes}, nonce, expiry }
 //! ```
 //!
 //! At apply time the apply path re-derives the binding hash from the **live**
 //! request and re-verifies the signature + the single-use nonce + the expiry
 //! against the injected [`Clock`]. Any divergence — a swapped statement, swapped
-//! prepared params, a replay onto a different session, a reused nonce, or an
-//! expired TTL — makes [`GrantToken::verify_for_apply`] **REJECT**. The binding
-//! hash is the reason statement-text-plus-blast-radius alone is insufficient
-//! (round-3 fix): it pins the *principal* and *session* too, defeating
+//! prepared params, a replay onto a different session, a reused nonce, an expired
+//! TTL, **or a swapped/absent cap** — makes [`GrantToken::verify_for_apply`]
+//! **REJECT**. The binding hash is the reason statement-text-plus-cap alone is
+//! insufficient (round-3 fix): it pins the *principal* and *session* too, defeating
 //! cross-session replay.
 //!
-//! **Status (S5 — consumed at a real apply path).** This token is now re-verified
-//! at a **production apply path**:
-//! `pgb_clone_orchestrator::guarded_apply_with_grant`
-//! (`crates/clone-orchestrator/src/apply_grant.rs`, #66) re-derives the live
-//! binding from the live request **plus the apply-time recomputed PK-set
-//! checksum** and calls [`GrantToken::verify_for_apply`] **before** any apply txn
-//! opens — no valid grant ⇒ fail-closed abort, no mutation. The grant gate binds
-//! the signed `blast_radius_checksum` to the live data set, so a drifted proposal
-//! also rejects. (The CLI's in-process approval demo, `pgb_cli::flow`, still
-//! mints + verifies too.) **Remaining gap:** the live agent → MCP → proxy wiring
-//! that *invokes* that caller over a served transport is **not** built yet
-//! (S5 assembly, #63) — proven by unit + real-PG18 integration tests, not yet by
-//! a running proxy/MCP binary. See `docs/spec/SPEC.amendments.md` §S5.
+//! ## EPIC #91 PR-B — the exact-PK-set checksum is DROPPED; the cap is its anchor
+//!
+//! Earlier the binding carried a `blast_radius_checksum` (the exact dry-run
+//! affected-PK-set checksum), which the apply path re-derived from the **live** DB
+//! and re-verified — pinning the grant to the exact row-*identity* set. That guard
+//! is **removed** (founder decision): identity-steerability is now foreclosed by
+//! the **self-determined-predicate gate** (the grant-bound WHERE may reference only
+//! the immutable PK + literals, so the approved `statement_text` itself pins the
+//! row set — `pgb_clone_orchestrator::predicate`), and absolute **magnitude** is
+//! pinned by the **`cap`** ([`pgb_core::WriteCap`]) the human approves — enforced
+//! inside the apply txn from the `pg_stat_xact_*` row deltas + a WAL-bytes measure
+//! (`CapExceeded` abort). The cap is a bound field, so a swapped cap fails closed.
+//! The [`BINDING_DOMAIN`] is bumped to **v2** so any old **v1** token (which signed
+//! over `blast_radius_checksum`, not `cap`) fails the signature/binding check under
+//! v2 verification — old grants cannot authorize a write on the new floor.
+//!
+//! **Status (S5 — consumed at a real apply path).** This token is re-verified at a
+//! **production apply path**: `pgb_clone_orchestrator::guarded_apply_with_grant`
+//! (`crates/clone-orchestrator/src/apply_grant.rs`) re-derives the live binding from
+//! the live request **plus the approved `cap`** and calls
+//! [`GrantToken::verify_for_apply`] **before** any apply txn opens — no valid grant
+//! ⇒ fail-closed abort, no mutation. The cap is then enforced **inside** the apply
+//! txn against the live magnitude. (The CLI's in-process approval demo,
+//! `pgb_cli::flow`, still mints + verifies too.) **Remaining gap:** the live agent →
+//! MCP → proxy wiring that *invokes* that caller over a served transport is **not**
+//! built yet (S5 assembly, #63). See `docs/spec/SPEC.amendments.md`.
 //!
 //! Cryptography: Ed25519 via `ed25519-dalek` v2 (BSD-3-Clause). The signed
 //! message is the 32-byte SHA-256 binding hash; verification uses
@@ -42,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use pgb_core::Clock;
+use pgb_core::{Clock, WriteCap};
 
 /// The exact set of fields the grant's signature binds to (SPEC §14.3).
 ///
@@ -66,9 +79,10 @@ pub struct GrantBinding {
     pub proposal_id: String,
     /// The LSN of the clone the dry-run ran against.
     pub dry_run_lsn: String,
-    /// The dry-run affected-PK-set checksum (`"sha256:…"`), from the
-    /// blast-radius record (SPEC §10.2).
-    pub blast_radius_checksum: String,
+    /// The **absolute apply-time cap** (EPIC #91 PR-B) the human approved — the
+    /// magnitude anchor that replaced the dropped exact-PK-set checksum. Bound into
+    /// the signature, so a swapped or raised cap fails the binding-hash check closed.
+    pub cap: WriteCap,
     /// A single-use nonce (uniqueness enforced by the verifier's nonce store).
     pub nonce: String,
     /// Expiry as a unix-millis instant; compared against
@@ -78,7 +92,12 @@ pub struct GrantBinding {
 
 /// A domain separator mixed into the hash so a grant binding can never collide
 /// with some other SHA-256 pre-image used elsewhere in the system.
-const BINDING_DOMAIN: &[u8] = b"pg_bumpers.grant.binding.v1";
+///
+/// **v2** (EPIC #91 PR-B): the binding now signs over the approved [`WriteCap`]
+/// `cap` instead of the dropped `blast_radius_checksum`. Bumping the domain means a
+/// v1 token (signed under `…v1` over the old field set) can never verify under v2 —
+/// old grants fail closed on the new floor, even if their other fields are re-used.
+pub const BINDING_DOMAIN: &[u8] = b"pg_bumpers.grant.binding.v2";
 
 impl GrantBinding {
     /// Compute the canonical, stable, collision-resistant binding hash.
@@ -102,7 +121,11 @@ impl GrantBinding {
         absorb_str(&mut h, &self.session_id);
         absorb_str(&mut h, &self.proposal_id);
         absorb_str(&mut h, &self.dry_run_lsn);
-        absorb_str(&mut h, &self.blast_radius_checksum);
+        // The approved cap (EPIC #91 PR-B) — both ceilings, fixed-width big-endian,
+        // in this fixed order. A swapped/raised `max_rows` or `max_wal_bytes` changes
+        // the hash, so the cap is as tamper-evident as every other bound field.
+        h.update(self.cap.max_rows.to_be_bytes());
+        h.update(self.cap.max_wal_bytes.to_be_bytes());
         absorb_str(&mut h, &self.nonce);
         h.update(self.expiry_unix_millis.to_be_bytes());
 
@@ -170,10 +193,9 @@ impl GrantToken {
     /// module-level note and `docs/spec/SPEC.amendments.md` §S4).
     ///
     /// `live` is the binding re-derived from the *current* request (live
-    /// statement text, live prepared params, live session id, the apply-time
-    /// blast-radius checksum, …). This must equal the signed binding, the
-    /// signature must verify, the nonce must be unused, and the grant must not
-    /// be expired against `clock`.
+    /// statement text, live prepared params, live session id, the approved cap,
+    /// …). This must equal the signed binding, the signature must verify, the
+    /// nonce must be unused, and the grant must not be expired against `clock`.
     ///
     /// On success the nonce is **consumed** in `nonces` so a second apply with
     /// the same token is a replay and fails. Fail-closed: every check rejects.
@@ -189,8 +211,10 @@ impl GrantToken {
         self.verify_signature(verifying_key)?;
 
         // 2. The live request must match the signed binding **exactly**. A
-        //    mismatch is the SQL-swap / param-swap / cross-session / data-drift
-        //    family — compare the binding hashes (covers every bound field).
+        //    mismatch is the SQL-swap / param-swap / cross-session / cap-swap
+        //    family — compare the binding hashes (covers every bound field). A v1
+        //    token also lands here: its signature was made over the `…v1` domain +
+        //    the old field set, so its hash cannot equal a v2-derived live binding.
         if live.binding_hash() != self.binding.binding_hash() {
             return Err(GrantError::BindingMismatch);
         }
@@ -255,7 +279,8 @@ pub enum GrantError {
     #[error("signature does not verify")]
     BadSignature,
     /// The live request's binding did not match the signed binding (SQL swap,
-    /// param swap, cross-session replay, or data drift).
+    /// param swap, cross-session replay, cap swap, or a stale **v1** token under v2
+    /// verification).
     #[error("grant binding mismatch: the live request differs from what was approved")]
     BindingMismatch,
     /// The nonce was already consumed (single-use violated — replay).
@@ -294,7 +319,7 @@ mod tests {
             session_id: "sess-abc".to_string(),
             proposal_id: "p-001".to_string(),
             dry_run_lsn: "3A/7F00C8".to_string(),
-            blast_radius_checksum: "sha256:abc123".to_string(),
+            cap: WriteCap::new(8, 4096),
             nonce: "nonce-001".to_string(),
             expiry_unix_millis: 10_000,
         }
@@ -430,6 +455,82 @@ mod tests {
         assert!(nonces.consume("nonce-001"));
     }
 
+    /// T-grant-cap-swap (EPIC #91 PR-B) — present a DIFFERENT (raised) cap at apply
+    /// than was signed → REJECT. The cap is a bound field, so raising the approved
+    /// magnitude after signing is a binding mismatch (an attacker cannot widen the
+    /// magnitude the human approved).
+    #[test]
+    fn t_grant_cap_swap_rejected() {
+        let (sk, vk) = test_keypair();
+        let token = GrantToken::sign(sample_binding(), &sk);
+
+        // The attacker presents a wider cap at apply time.
+        let mut live = sample_binding();
+        live.cap = WriteCap::new(1_000_000, 1_000_000_000);
+
+        let mut nonces = InMemoryNonceStore::new();
+        let clock = MockClock::starting_at(5_000);
+        let err = token
+            .verify_for_apply(&live, &vk, &mut nonces, &clock)
+            .unwrap_err();
+        assert_eq!(err, GrantError::BindingMismatch);
+        // The nonce must NOT be burned by a rejected verify.
+        assert!(nonces.consume("nonce-001"));
+    }
+
+    /// T-grant-v1-token-fails-closed (EPIC #91 PR-B) — a token signed under the OLD
+    /// **v1** domain over the OLD field set (which carried `blast_radius_checksum`,
+    /// not `cap`) must FAIL CLOSED under v2 verification. We reconstruct the exact v1
+    /// pre-image (`…binding.v1` + the old field order incl. the checksum) and sign
+    /// it; verifying it as a v2 token rejects, because the v2 `binding_hash` the
+    /// signature is checked against differs from the v1 message that was signed.
+    #[test]
+    fn t_grant_v1_token_fails_closed_under_v2() {
+        let (sk, vk) = test_keypair();
+        let binding = sample_binding();
+
+        // Reconstruct the v1 binding hash: old domain, old field order, the dropped
+        // `blast_radius_checksum` in the cap's former position.
+        let v1_hash: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"pg_bumpers.grant.binding.v1");
+            absorb_str(&mut h, &binding.statement_text);
+            h.update((binding.normalized_params.len() as u64).to_be_bytes());
+            for p in &binding.normalized_params {
+                absorb_str(&mut h, p);
+            }
+            absorb_str(&mut h, &binding.role);
+            absorb_str(&mut h, &binding.session_id);
+            absorb_str(&mut h, &binding.proposal_id);
+            absorb_str(&mut h, &binding.dry_run_lsn);
+            absorb_str(&mut h, "sha256:abc123"); // the dropped checksum field
+            absorb_str(&mut h, &binding.nonce);
+            h.update(binding.expiry_unix_millis.to_be_bytes());
+            h.finalize().into()
+        };
+        // The v1 token: a real Ed25519 signature over the v1 message, but presented
+        // as a v2 GrantToken (the binding now carries `cap`).
+        let v1_sig: Signature = sk.sign(&v1_hash);
+        let token = GrantToken {
+            binding: binding.clone(),
+            signature_hex: hex::encode(v1_sig.to_bytes()),
+        };
+
+        // Under v2, the signature is checked against the v2 binding_hash → mismatch.
+        assert_eq!(
+            token.verify_signature(&vk).unwrap_err(),
+            GrantError::BadSignature,
+            "a v1-signed token must fail closed under v2 binding verification"
+        );
+        // And the full apply-time verify likewise rejects (no mutation, fail-closed).
+        let mut nonces = InMemoryNonceStore::new();
+        let clock = MockClock::starting_at(5_000);
+        let err = token
+            .verify_for_apply(&binding, &vk, &mut nonces, &clock)
+            .unwrap_err();
+        assert_eq!(err, GrantError::BadSignature);
+    }
+
     /// A named mutation of one binding field, for the coverage test below.
     type FieldMutation = (&'static str, fn(&mut GrantBinding));
 
@@ -449,9 +550,8 @@ mod tests {
             ("session_id", |b| b.session_id.push('!')),
             ("proposal_id", |b| b.proposal_id.push('!')),
             ("dry_run_lsn", |b| b.dry_run_lsn.push('!')),
-            ("blast_radius_checksum", |b| {
-                b.blast_radius_checksum.push('!')
-            }),
+            ("cap.max_rows", |b| b.cap.max_rows += 1),
+            ("cap.max_wal_bytes", |b| b.cap.max_wal_bytes += 1),
             ("nonce", |b| b.nonce.push('!')),
             ("expiry", |b| b.expiry_unix_millis += 1),
         ];

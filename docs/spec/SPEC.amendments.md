@@ -1213,3 +1213,108 @@ guarded writes a low-churn / re-review-on-drift instrument, not a bulk applier).
   (`flipping_the_preimage_seam_trips_the_gate`) proving the gate catches the catastrophic
   un-revertable commit when the seam is fail-OPEN. The catastrophic-FN ledger
   (`golden/known_bypasses.json`) stays **empty** (0 FN, 0 FP).
+
+---
+
+## EPIC #91 — the exact-PK-set checksum is DROPPED; identity → predicate gate, magnitude → absolute cap (PR-A self-determined gate + PR-B WriteCap)
+
+**SPEC sections touched:** §10.1 (`affected.pk_set_checksum`), §10.2 (the affected-PK-set
+checksum as "the guard's basis"), §14.3 (the signed grant binding fields), §4 (bounded +
+reversible apply guards). **Issue:** #91 (EPIC); PR-A (#92, self-determined-predicate gate,
+already merged) + **PR-B (this change, WriteCap + checksum drop, atomic).**
+
+### Deviation (founder decision)
+
+The build-frozen SPEC frames the **exact affected-PK-set checksum** (§10.2) as the guard's
+basis — bound into the §14.3 grant (`blast_radius_checksum`) and re-derived from the live DB
+at apply time to pin a human's approval to the **exact approved row-identity set** (catching
+same-count/different-PK drift a row count misses). The founder **dropped** that checksum. It
+was the **only absolute-magnitude anchor** on an approved write (reconciliation is *relative*
+to the dry-run prediction, `statement_timeout` is wall-clock, and `RoleBudget.max_rows` is
+read-path only), so it is replaced — **atomically, in one change** — by two orthogonal pins:
+
+- **Identity (PR-A, #92):** the **self-determined-predicate gate** — a grant-bound
+  `UPDATE`/`DELETE`'s WHERE may reference **only the immutable single-column primary key +
+  literals + immutable functions on it**. A row's immutable PK cannot be re-pointed at a
+  chosen sensitive row by any other write, so the approved `statement_text` itself pins the
+  row set; the checksum becomes redundant for identity-steerability. PR-B **extends** the
+  gate to refuse **`UPDATE … FROM other`** / **`DELETE … USING other`** (and any JOIN on the
+  target) — a join-correlation (`UPDATE t SET … FROM other WHERE other.id = t.id`) is
+  steerable by the joined table's content and was only *incidentally* fail-closed by the
+  now-removed apply-time PK-set recompute (`NotSelfDetermined::JoinCorrelation`).
+- **Magnitude (PR-B, this change):** the human-approved absolute **`WriteCap { max_rows,
+  max_wal_bytes }`** (`pgb_core::WriteCap`), a **bound field of the §14.3 binding** (replacing
+  `blast_radius_checksum`), enforced **inside the apply txn** from the summed `pg_stat_xact_*`
+  row deltas + a `pg_current_wal_insert_lsn()` WAL-byte measure → `ApplyError::CapExceeded`
+  abort. The CLI pre-fills it from the dry-run footprint + headroom
+  (`BlastRadius::suggested_cap`); the approver may tighten or raise it per §14.2.
+
+### `GrantBinding` v2 (cap replaces `blast_radius_checksum`)
+
+The signed binding now commits to `{ statement_text, normalized_params, role, session_id,
+proposal_id, dry_run_lsn, cap, nonce, expiry }`. **`BINDING_DOMAIN` is bumped to
+`pg_bumpers.grant.binding.v2`**, so any old **v1** token (which signed over
+`blast_radius_checksum`, not `cap`, under the `…v1` domain) **fails closed** under v2
+verification — old grants cannot authorize a write on the new floor (`t_grant_v1_token_
+fails_closed_under_v2`). A swapped/raised cap is a binding mismatch (`t_grant_cap_swap_*`).
+
+### §14.3's "defeats data-drift since approval" — amended
+
+§14.3's claim that re-verifying the binding "defeats data-drift since approval" is **amended**:
+**identity** data-drift steering is now foreclosed by the **predicate gate** (immutable-PK
+predicates — an attacker cannot re-point an immutable PK at a chosen row), and **magnitude**
+drift (e.g. concurrent inserts swelling an `id`-range / `id % 2 = 0` predicate) is bounded by
+the **cap**, **not** by re-deriving an exact-set checksum. The five surviving §14.3 tamper
+cases (sql-swap, param-swap, cross-session, proposal-swap, replay, expiry) still REJECT via
+the binding hash; the old exact-set data-drift tamper case is **re-scoped** to the cap
+(`apply_time_magnitude_drift_rejects_via_cap_no_mutation`).
+
+### What is KEPT (so the change is net tighten-only)
+
+- the `pg_stat_xact_*` **reconciliation** (the *relative* per-op-channel effect check) —
+  with the target's **primary** write channel (`upd` for UPDATE / `del` for DELETE) now
+  governed by the **cap** rather than exact prediction-equality; every other channel on the
+  target and **all** channels on non-target relations stay strict (so out-of-predicate target
+  deletes, op-type substitution, cascade over-deletes, and `UnpredictedRelationWrite` still
+  abort);
+- the **pre-image capture** + `assert_reversible_preimage_coverage` + `assert_written_
+  column_coverage` (reversibility — mandatory; a write that cannot be undone aborts);
+- the **full §14.3 grant verification** (signature, every bound field incl. the cap,
+  single-use nonce, expiry) and the **#87 fail-closed pre-image seam** + REPEATABLE READ apply
+  isolation.
+
+**Net tighten-only argument:** the cap is enforced in the **same** change that removes the
+checksum — at no point is absolute magnitude unpinned. Identity (predicate gate) + magnitude
+(cap) + relative effect (reconciliation) + reversibility (pre-image coverage) together carry
+the floor without the exact-set checksum.
+
+### Residual (disclosed)
+
+A grant authorizes "**this statement, up to N rows / W WAL bytes, reversibly, with a
+self-determined immutable-PK predicate**". Two honest residuals: (1) side-effecting
+**AFTER-triggers** fire on the *approved* rows — a trigger writing a relation OUTSIDE the
+captured inverse (e.g. an audit table) is **not effect-undone** by the typed-inverse; this is
+**surfaced at approval** as a first-class fact (`RequestElevationResult.side_effecting_
+triggers`). (2) The predicate gate is restricted to the **single-`int4`-PK** MVP shape; a
+composite/wider PK is refused upstream, not gated here.
+
+### Evidence (red→green; real PG18 + the deterministic gate)
+
+- **Cap unit + real PG18 (env-gated `PG_BUMPERS_IT=1`, dedicated high port, NEVER :5432):**
+  `apply::tests::cap_exceeded_on_rows_aborts_no_mutation` / `…_on_wal_bytes_aborts` /
+  `within_cap_write_commits` / `cap_below_dry_run_footprint_is_refused_before_txn`; and
+  `crates/clone-orchestrator/tests/apply_grant_it.rs`:
+  `apply_time_magnitude_drift_rejects_via_cap_no_mutation` (concurrent inserts swell
+  `id % 2 = 0` past the cap → `CapExceeded`, no mutation),
+  `within_cap_concurrent_insert_still_commits_reversibly` (headroom commit + revert),
+  `join_correlated_update_from_is_refused_before_txn` (the carried PR-A finding).
+- **Binding v2:** `grant::tests::t_grant_v1_token_fails_closed_under_v2`,
+  `t_grant_cap_swap_rejected`, `binding_hash_covers_every_field` (now covers `cap.*`).
+- **Deterministic gate (`dbsafe-bench`):** the former `no-where-write-drift` golden (which
+  depended on the dropped step-5 checksum) is **re-pointed** to `magnitude-drift-over-cap`
+  (cap=5, live=8 → `CapExceeded` → REVERTED), with a `gate_has_teeth` flip
+  (`flipping_the_absolute_cap_trips_the_gate`) proving the gate catches the over-cap commit
+  when the cap is disabled, plus the positive `magnitude_drift_is_fail_closed_via_cap_
+  exceeded`. The #89 `concurrent-drift-delete-missing-preimage` golden (the pre-image seam) is
+  unaffected. The catastrophic-FN ledger (`golden/known_bypasses.json`) stays **empty**
+  (0 FN, 0 FP).

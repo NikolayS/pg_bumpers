@@ -19,7 +19,7 @@ use pgb_clone_orchestrator::{
 use pgb_core::blast_radius::Affected;
 use pgb_core::{
     BlastRadius, InverseKind, LockMode, MockClock, NoopBarrier, OpCounts, PkChecksum, PkSetBuilder,
-    PkTuple, PkValue,
+    PkTuple, PkValue, WriteCap,
 };
 use pgb_policy::{RoleBudget, WindowBudget};
 use pgb_proxy::{Budget, BudgetOutcome, Enforcement, GateDecision};
@@ -150,8 +150,6 @@ pub fn probe_byte_cutoff(n_rows: u64, row_bytes: u64, max_bytes: u64, max_rows: 
 /// tests + the env-gated PG18 IT use). A scenario describes the apply-time world
 /// (drift, trigger writes, cascade over-deletes) and `guarded_apply` decides.
 struct ScriptedConn {
-    /// Per-relation PK set the apply-time recompute returns (drift injection).
-    recompute_ids: BTreeMap<String, Vec<i64>>,
     /// PK set the forward op writes (target) via RETURNING.
     written_ids: Vec<i64>,
     /// Per-relation in-txn `pg_stat_xact_*` tuple deltas (full-effect recon).
@@ -171,6 +169,9 @@ struct ScriptedConn {
     racing_written_ids: Vec<i64>,
     /// #87: whether the pre-image seam fails CLOSED (production) or OPEN (old bug).
     preimage_seam_closed: bool,
+    /// EPIC #91 PR-B: the WAL bytes the apply txn reports it generated (for the
+    /// WAL-byte cap). 0 unless a scenario exercises the WAL cap.
+    wal_bytes: u64,
     committed: bool,
     rolled_back: bool,
 }
@@ -209,13 +210,8 @@ impl ApplyConn for ScriptedConn {
     fn begin(&mut self, _timeout_ms: u64) -> Result<(), ApplyError> {
         Ok(())
     }
-    fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-        let ids = self
-            .recompute_ids
-            .get(relation)
-            .cloned()
-            .unwrap_or_default();
-        Ok(checksum_of(relation, &ids))
+    fn xact_wal_bytes(&mut self) -> Result<u64, ApplyError> {
+        Ok(self.wal_bytes)
     }
     fn apply_forward(
         &mut self,
@@ -296,8 +292,11 @@ pub struct DataLossCase {
     /// Extra predicted-footprint relations beyond target+cascades (e.g. an audit
     /// table a trigger writes): `(relation, predicted_effect)`.
     pub extra_effect: Vec<(String, OpCounts)>,
-    /// Apply-time PK recompute overrides (drift): `(relation, ids)`. Defaults to
-    /// the grant ids when absent.
+    /// Apply-time PK recompute overrides (drift): `(relation, ids)`. **Inert since
+    /// EPIC #91 PR-B** — the apply-time exact-PK-set recompute it drove was removed
+    /// with the dropped checksum; identity-steerability is now the
+    /// self-determined-predicate gate's job and magnitude is the cap's. Retained as a
+    /// no-op so the corpus literals don't all need editing; left empty in new cases.
     pub recompute_override: Vec<(String, Vec<i64>)>,
     /// The PK set the forward op actually writes for the target (defaults to grant).
     pub written_override: Option<Vec<i64>>,
@@ -328,6 +327,15 @@ pub struct DataLossCase {
     /// corpus pins this `true`; `gate_has_teeth` flips it `false` to prove the gate
     /// catches the catastrophic un-revertable commit.
     pub preimage_seam_closed: bool,
+    /// The **absolute cap** (EPIC #91 PR-B) the human approved for this write — the
+    /// magnitude anchor that replaced the dropped exact-PK-set checksum. The apply
+    /// aborts (`CapExceeded`) if the live magnitude (summed `pg_stat_xact_*` rows, or
+    /// WAL bytes) exceeds it. `WriteCap::new(u64::MAX, u64::MAX)` for scenarios that
+    /// do not exercise the cap; a tight cap for the over-cap-magnitude scenario.
+    pub cap: WriteCap,
+    /// EPIC #91 PR-B: the WAL bytes the apply txn reports it generated (for the
+    /// WAL-byte cap). 0 for scenarios that do not exercise it.
+    pub wal_bytes: u64,
 }
 
 /// Run a [`DataLossCase`] through the real `guarded_apply`. Returns the observed
@@ -389,14 +397,6 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
     };
 
     // Build the scripted apply-time world.
-    let mut recompute_ids = BTreeMap::new();
-    recompute_ids.insert(case.relation.clone(), case.grant_ids.clone());
-    for (rel, ids, _) in &case.cascades {
-        recompute_ids.insert(rel.clone(), ids.clone());
-    }
-    for (rel, ids) in &case.recompute_override {
-        recompute_ids.insert(rel.clone(), ids.clone());
-    }
     // The CAPTURED (pre-imaged) written ids. The racing ids (#87) are written too
     // but have NO captured pre-image, so they are EXCLUDED from the captured set here
     // and re-added id-only inside `apply_forward` — exactly the production conn's
@@ -436,7 +436,6 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
         case.cascade_preimage_ids.iter().cloned().collect();
 
     let mut conn = ScriptedConn {
-        recompute_ids,
         written_ids,
         tuple_deltas,
         cascade_preimage_ids,
@@ -444,6 +443,7 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
         captured_image_cols: case.captured_image_cols.clone(),
         racing_written_ids: case.racing_written_ids.clone(),
         preimage_seam_closed: case.preimage_seam_closed,
+        wal_bytes: case.wal_bytes,
         committed: false,
         rolled_back: false,
     };
@@ -453,6 +453,7 @@ pub fn probe_guarded_apply(case: &DataLossCase) -> Observed {
         case.kind,
         &case.relation,
         &grant,
+        case.cap,
         PitrConfig::disabled(),
         &mut conn,
         &NoopBarrier::new(),
@@ -654,6 +655,8 @@ mod tests {
             captured_image_cols: vec![],
             racing_written_ids: vec![],
             preimage_seam_closed: true,
+            cap: WriteCap::new(u64::MAX, u64::MAX),
+            wal_bytes: 0,
         };
         let o = probe_guarded_apply(&case);
         assert_eq!(o.verdict, crate::verdict::Verdict::Reverted);

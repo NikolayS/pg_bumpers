@@ -34,8 +34,8 @@ use pgb_clone_orchestrator::dry_run::{
 };
 use pgb_core::blast_radius::OpCounts;
 use pgb_core::{
-    ApplyBarrier, Clock, LockHeld, LockMode, MockClock, NoopBarrier, PkChecksum, PkSetBuilder,
-    PkTuple, PkValue, TriggerFired,
+    ApplyBarrier, Clock, LockHeld, LockMode, MockClock, NoopBarrier, PkSetBuilder, PkTuple,
+    PkValue, TriggerFired,
 };
 
 const REL: &str = "public.accounts";
@@ -166,7 +166,6 @@ impl Rehearsal for MockRehearsal {
 /// A scripted in-memory `ApplyConn` (mirrors the apply_grant.rs unit mock).
 #[derive(Default)]
 struct MockConnInner {
-    recompute_ids: BTreeMap<String, Vec<i64>>,
     written_ids: Vec<i64>,
     began: bool,
     committed: bool,
@@ -174,11 +173,8 @@ struct MockConnInner {
 #[derive(Clone)]
 struct MockConn(Arc<Mutex<MockConnInner>>);
 impl MockConn {
-    fn new(rel: &str, ids: &[i64]) -> Self {
-        let mut recompute_ids = BTreeMap::new();
-        recompute_ids.insert(rel.to_string(), ids.to_vec());
+    fn new(_rel: &str, ids: &[i64]) -> Self {
         MockConn(Arc::new(Mutex::new(MockConnInner {
-            recompute_ids,
             written_ids: ids.to_vec(),
             ..Default::default()
         })))
@@ -194,19 +190,6 @@ impl ApplyConn for MockConn {
     fn begin(&mut self, _timeout_ms: u64) -> Result<(), ApplyError> {
         self.inner().began = true;
         Ok(())
-    }
-    fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-        let ids = self
-            .inner()
-            .recompute_ids
-            .get(relation)
-            .cloned()
-            .unwrap_or_default();
-        let mut b = PkSetBuilder::for_relation(relation);
-        for id in ids {
-            b.push(PkTuple::single(PkValue::Int(id))).unwrap();
-        }
-        b.finalize().map_err(|e| ApplyError::Backend(e.to_string()))
     }
     fn apply_forward(
         &mut self,
@@ -491,22 +474,26 @@ fn apply_rederives_from_stored_record_a_grant_for_a_different_session_cannot_app
 }
 
 // ===========================================================================
-//  (5) TAMPER — apply-time DATA DRIFT → GRANT_REJECTED (binding mismatch)
+//  (5) APPLY-TIME MAGNITUDE DRIFT over the approved CAP → BLAST_DRIFT
+//      (EPIC #91 PR-B — replaces the dropped data-drift-via-checksum tamper).
 // ===========================================================================
 
 #[test]
-fn apply_time_data_drift_is_grant_rejected_no_mutation() {
-    // The grant is bound to {2,4,6,8}; at apply the recompute sees {2,4,6,8,10}
-    // (a row drifted into the predicate). The §4 floor re-derives the binding
-    // from the apply-time checksum, which no longer matches the signed one →
-    // BindingMismatch → GRANT_REJECTED, no mutation.
+fn apply_time_magnitude_drift_over_cap_is_blast_drift_no_mutation() {
+    // The dry-run measured 4 rows ({2,4,6,8}); applyd pre-fills the cap from that
+    // footprint + 10% headroom → max_rows = 5. By apply time concurrent inserts have
+    // swelled the predicate so the live write touches 6 rows. The §4 floor enforces
+    // the approved cap INSIDE the apply txn: live 6 > cap 5 → CapExceeded → BLAST_DRIFT
+    // (a recoverable magnitude-drift code; re-propose / re-approve with a larger cap),
+    // no mutation. This is the absolute-magnitude anchor that replaced the dropped
+    // exact-PK-set checksum.
     let (sk, vk) = keypair();
     let clock = MockClock::starting_at(5_000);
     let mut svc = service(vk);
     let a = approve_through(&mut svc, &sk, &clock, FORWARD, "sess-a", "nonce-d");
 
-    // Apply with a conn whose recompute sees a DRIFTED set.
-    let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
+    // Apply with a conn whose live write touches 6 rows (over the cap of 5).
+    let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10, 12]);
     let err = run_apply(
         &mut svc,
         &a.proposal_id,
@@ -517,8 +504,16 @@ fn apply_time_data_drift_is_grant_rejected_no_mutation() {
         &clock,
     )
     .unwrap_err();
-    assert_eq!(err.data.code, ErrorCode::GrantRejected.as_str());
-    assert!(!conn.inner().committed, "no mutation on data drift");
+    assert_eq!(
+        err.data.code,
+        ErrorCode::BlastDrift.as_str(),
+        "an over-cap live write must be BLAST_DRIFT (CapExceeded), got {:?}",
+        err.data
+    );
+    assert!(
+        !conn.inner().committed,
+        "no mutation on over-cap magnitude drift"
+    );
 }
 
 // ===========================================================================

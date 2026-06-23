@@ -8,16 +8,18 @@
 //! the human later runs `approve <id>` to sign a grant bound to *exactly* this
 //! request's proposal.
 //!
-//! The request captures the full proposal binding — the nine §14.3 fields
-//! `{statement, params, role, session, proposal_id, dry_run_lsn,
-//! blast_radius_checksum, nonce, expiry}` — so the grant the approver signs binds
-//! to the request's recorded proposal, not to whatever SQL the agent later
-//! presents at apply time. That is what makes the flow TOCTOU-safe end to end.
+//! The request captures the full proposal binding — the §14.3 fields
+//! `{statement, params, role, session, proposal_id, dry_run_lsn, cap, nonce,
+//! expiry}` — so the grant the approver signs binds to the request's recorded
+//! proposal, not to whatever SQL the agent later presents at apply time. That is
+//! what makes the flow TOCTOU-safe end to end. (EPIC #91 PR-B: the absolute
+//! [`WriteCap`] `cap` the human approves replaced the dropped exact-PK-set
+//! `blast_radius_checksum`.)
 //!
 //! Time is read only through `core::Clock` (no wall clock), so request creation,
 //! TTL expiry, and grant expiry are all deterministic in tests.
 
-use pgb_core::Clock;
+use pgb_core::{Clock, WriteCap};
 use pgb_policy::GrantBinding;
 use serde::{Deserialize, Serialize};
 
@@ -61,8 +63,12 @@ pub struct Proposal {
     pub session_id: String,
     /// The clone LSN the dry-run ran against (SPEC §10.1).
     pub dry_run_lsn: String,
-    /// The dry-run affected-PK-set checksum (`"sha256:…"`, SPEC §10.2).
-    pub blast_radius_checksum: String,
+    /// The **absolute apply-time cap** (EPIC #91 PR-B) the approver authorizes — the
+    /// magnitude anchor that replaced the dropped exact-PK-set `blast_radius_checksum`.
+    /// Pre-filled from the dry-run's measured footprint plus headroom
+    /// ([`pgb_core::BlastRadius::suggested_cap`]); the approver may tighten or raise it
+    /// per §14.2 before signing.
+    pub cap: WriteCap,
 }
 
 impl Proposal {
@@ -77,10 +83,17 @@ impl Proposal {
             session_id: self.session_id.clone(),
             proposal_id: self.proposal_id.clone(),
             dry_run_lsn: self.dry_run_lsn.clone(),
-            blast_radius_checksum: self.blast_radius_checksum.clone(),
+            cap: self.cap,
             nonce: nonce.into(),
             expiry_unix_millis,
         }
+    }
+
+    /// Override the approved cap (the approver tightening or raising it per §14.2)
+    /// before signing. Returns `self` for chaining.
+    pub fn with_cap(mut self, cap: WriteCap) -> Self {
+        self.cap = cap;
+        self
     }
 }
 

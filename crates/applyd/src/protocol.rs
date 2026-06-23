@@ -306,13 +306,31 @@ pub struct RequestElevationParams {
     pub reason: String,
 }
 
-/// `request_elevation` result: the ticket id + TTL.
+/// `request_elevation` result: the ticket id + TTL + the §14.2 disclosures the
+/// human reviews before approving (EPIC #91 PR-B).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestElevationResult {
     /// The approval-request id to poll / pass to `approve`.
     pub request_id: String,
     /// The request TTL in milliseconds.
     pub ttl_millis: u64,
+    /// The **suggested absolute cap** (EPIC #91 PR-B) the approval is pre-filled
+    /// with — `max_rows`, from the dry-run's measured footprint + headroom. The
+    /// human may tighten or raise it per §14.2. This is the magnitude anchor that
+    /// replaced the dropped exact-PK-set checksum.
+    #[serde(default)]
+    pub cap_max_rows: u64,
+    /// The suggested cap's `max_wal_bytes`.
+    #[serde(default)]
+    pub cap_max_wal_bytes: u64,
+    /// **Side-effecting triggers the write fires** (EPIC #91 PR-B §4 disclosure):
+    /// the names of row-level triggers that would fire on the approved rows. A
+    /// trigger may write a relation OUTSIDE the captured inverse (e.g. an audit
+    /// table), whose effect the typed-inverse does NOT undo — so the human is told,
+    /// as a first-class fact at approval, that approving runs these on the approved
+    /// rows. Empty ⇒ no triggers fire.
+    #[serde(default)]
+    pub side_effecting_triggers: Vec<String>,
 }
 
 /// `approve` params: the OPERATOR hop. The signing-key material is presented

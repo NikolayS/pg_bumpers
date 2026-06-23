@@ -16,17 +16,26 @@
 //!    and `pitr.enabled` → the apply's [`ApplyPitrConfig`] (via the
 //!    `From<PitrConfig>` bridge added here);
 //! 2. **consumes the §14.3 grant at apply time** — it re-derives the *live*
-//!    [`pgb_policy::GrantBinding`] from the current request **plus the apply-time
-//!    recomputed target PK-set checksum** and re-verifies the signed grant
+//!    [`pgb_policy::GrantBinding`] from the current request **plus the approved
+//!    [`WriteCap`]** and re-verifies the signed grant
 //!    ([`pgb_policy::GrantToken::verify_for_apply`], reused — no crypto is
 //!    reimplemented here): signature, exact binding match, single-use nonce, and
-//!    expiry. The signed `blast_radius_checksum` is thereby **bound to the exact
-//!    proposal** the approver authorized: a swapped statement / param / session /
-//!    proposal, a reused nonce, an expired TTL, **or a drifted data set** (the
-//!    apply-time PK-set no longer equals the signed one) all REJECT;
+//!    expiry. A swapped statement / param / session / proposal, a reused nonce, an
+//!    expired TTL, **or a swapped cap** all REJECT;
 //! 3. only on a valid, single-use, unexpired, proposal-bound grant does it reach
-//!    [`guarded_apply`], whose own §10.1 apply-time PK-set re-check then re-pins
-//!    the same checksum **inside** the apply txn (defense in depth).
+//!    [`guarded_apply`], which enforces the **approved cap** (rows + WAL bytes)
+//!    **inside** the apply txn — the absolute-magnitude anchor that replaced the
+//!    dropped exact-PK-set checksum (EPIC #91 PR-B).
+//!
+//! ## EPIC #91 PR-B — checksum dropped, cap added, atomically
+//!
+//! The signed `blast_radius_checksum` and the apply-time PK-set recompute it was
+//! re-derived from are **removed**. Identity-steerability is foreclosed by the
+//! **self-determined-predicate gate** (re-asserted structurally here at step (a0)
+//! before the txn opens), and absolute magnitude by the **cap** the human approved
+//! (a bound field in the binding; enforced inside `guarded_apply`). The change is
+//! net **tighten-only**: the cap is added in the same change that drops the
+//! checksum, so magnitude is never unpinned.
 //!
 //! **Fail-closed / tighten-only.** The grant gate can only ADD an abort condition;
 //! it never loosens a `guarded_apply` guard. No valid grant ⇒ **abort, no
@@ -35,10 +44,10 @@
 //! shared/durable store and the policy-resolved approver key gate every apply.
 //!
 //! Single source of truth: the binding hash, the Ed25519 verify, the nonce store,
-//! and the PK-set checksum all come from `pgb_core` / `pgb_policy` — this module
-//! only orchestrates them at the apply seam.
+//! and the cap all come from `pgb_core` / `pgb_policy` — this module only
+//! orchestrates them at the apply seam.
 
-use pgb_core::{ApplyBarrier, BlastRadius, Clock};
+use pgb_core::{ApplyBarrier, BlastRadius, Clock, WriteCap};
 use pgb_policy::{GrantBinding, GrantError, GrantToken, NonceStore, PolicyConfig};
 
 use crate::apply::{
@@ -69,11 +78,12 @@ impl From<pgb_policy::PitrConfig> for ApplyPitrConfig {
 /// statement text, the normalized params, the role, the session/principal id, and
 /// the proposal id.
 ///
-/// The two remaining bound fields — `dry_run_lsn` and `blast_radius_checksum` —
-/// come from the [`BlastRadius`] grant (`clone_lsn`) and the **apply-time
-/// recomputed** target PK-set checksum respectively, so they cannot be forged
-/// from the live request alone: the checksum is read from the live DB at apply
-/// time, pinning the grant to the exact data set.
+/// The remaining bound fields come from elsewhere at apply time: `dry_run_lsn` from
+/// the [`BlastRadius`] grant (`clone_lsn`), and the approved [`WriteCap`] `cap` from
+/// the **grant binding itself** (EPIC #91 PR-B — it is the human's approved
+/// magnitude, carried in the signed grant, then enforced *inside* the apply txn).
+/// The former `blast_radius_checksum` (re-derived from the live DB) is **dropped**;
+/// identity-steerability is now foreclosed by the self-determined-predicate gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveRequest {
     /// The exact statement text being applied right now.
@@ -111,9 +121,11 @@ pub enum GrantedApplyError {
 
     /// The grant, the blast radius, and the live request are internally
     /// inconsistent in a way that is not a tamper case but still cannot authorize
-    /// an apply (e.g. the grant's signed `blast_radius_checksum` is not the
-    /// blast-radius's target checksum, or the blast radius has no target
-    /// checksum). Fail-closed: refuse rather than guess. **No apply txn opened.**
+    /// an apply (e.g. the blast radius is for a different proposal than the live
+    /// request, the blast radius has no target PK-set checksum recorded so the write
+    /// is un-keyable, or the grant's approved cap cannot even admit the dry-run's own
+    /// measured footprint). Fail-closed: refuse rather than guess. **No apply txn
+    /// opened.**
     #[error("INVALID GRANT BINDING: {0}")]
     Inconsistent(String),
 
@@ -162,22 +174,22 @@ impl BridgedApplyConfig {
 ///
 /// 1. bridges `policy` → provider + PITR fence ([`BridgedApplyConfig`]);
 /// 2. cross-checks the grant is internally consistent with `blast_radius` (the
-///    signed `blast_radius_checksum` MUST be the blast radius's target PK-set
-///    checksum, and the bound `proposal_id` must match) — else
-///    [`GrantedApplyError::Inconsistent`];
-/// 3. **recomputes the apply-time target PK-set checksum** via the same
-///    [`ApplyConn::recompute_pk_checksum`] seam `guarded_apply` uses, and builds
-///    the *live* [`GrantBinding`] from `live` + `blast_radius.clone_lsn` + that
-///    apply-time checksum;
+///    bound `proposal_id` matches, the blast radius records a target PK-set
+///    checksum so the write is keyable, and the approved cap can admit the dry-run's
+///    measured footprint) — else [`GrantedApplyError::Inconsistent`];
+/// 3. builds the *live* [`GrantBinding`] from `live` + `blast_radius.clone_lsn` +
+///    the **grant's approved cap** (EPIC #91 PR-B — no live-DB recompute);
 /// 4. **re-verifies the grant** ([`GrantToken::verify_for_apply`]) — signature,
-///    exact binding match, single-use nonce (consumed in `nonces`), expiry —
-///    against the injected approver `verifying_key` and `clock`. Any divergence
-///    REJECTS **before the apply txn is opened** (fail-closed, no mutation);
-/// 5. on success, calls [`guarded_apply`], whose §10.1 apply-time PK-set re-check
-///    re-pins the same checksum inside the apply txn (defense in depth).
+///    exact binding match (incl. the cap), single-use nonce (consumed in `nonces`),
+///    expiry — against the injected approver `verifying_key` and `clock`. Any
+///    divergence REJECTS **before the apply txn is opened** (fail-closed, no
+///    mutation);
+/// 5. on success, calls [`guarded_apply`], which enforces the approved cap (rows +
+///    WAL bytes) inside the apply txn — the absolute-magnitude anchor.
 ///
 /// The grant gate is **tighten-only**: it can only refuse; it never loosens a
-/// `guarded_apply` guard.
+/// `guarded_apply` guard. The cap is added in the same change that drops the
+/// exact-PK-set checksum, so absolute magnitude is never unpinned.
 #[allow(clippy::too_many_arguments)]
 pub fn guarded_apply_with_grant(
     policy: &PolicyConfig,
@@ -215,50 +227,47 @@ pub fn guarded_apply_with_grant(
         return Err(GrantedApplyError::NotSelfDetermined(reason));
     }
 
-    // (a) The blast radius must be the one this apply is for, and carry the target
-    //     PK-set checksum. (guarded_apply re-checks proposal_id too, but we need
-    //     the target checksum HERE to build the live binding.)
+    // (a) The blast radius must be the one this apply is for, and carry a target
+    //     PK-set checksum (so the write is keyable). (guarded_apply re-checks
+    //     proposal_id too; we re-check here so the inconsistency is reported before
+    //     the grant verify.)
     if blast_radius.proposal_id != live.proposal_id {
         return Err(GrantedApplyError::Inconsistent(format!(
             "blast-radius proposal_id `{}` != live proposal_id `{}`",
             blast_radius.proposal_id, live.proposal_id
         )));
     }
-    let target_checksum = blast_radius
-        .affected
-        .pk_set_checksum
-        .get(relation)
-        .cloned()
-        .ok_or_else(|| {
-            GrantedApplyError::Inconsistent(format!(
-                "blast-radius has no pk_set_checksum for target `{relation}`"
-            ))
-        })?;
-
-    // (b) The grant's SIGNED blast_radius_checksum MUST be the blast radius's
-    //     target checksum. If they differ, the grant authorizes a DIFFERENT data
-    //     set than the blast radius this apply will re-check against — refuse
-    //     (fail-closed) rather than let the two diverge.
-    if grant.binding.blast_radius_checksum != target_checksum {
+    if !blast_radius.affected.pk_set_checksum.contains_key(relation) {
         return Err(GrantedApplyError::Inconsistent(format!(
-            "grant blast_radius_checksum `{}` != blast-radius target checksum `{}` \
-             (the grant does not authorize this blast radius)",
-            grant.binding.blast_radius_checksum, target_checksum
+            "blast-radius has no pk_set_checksum for target `{relation}` (un-keyable write)"
         )));
     }
 
-    // (c) Recompute the apply-time target PK-set checksum on the SAME predicate,
-    //     via the SAME seam guarded_apply uses. This is the live data fact that
-    //     pins the grant to the exact proposal: if a row drifted in/out of the
-    //     predicate since the dry-run, this differs from the signed checksum and
-    //     the binding-hash match below FAILS (REJECT, no mutation). We do NOT
-    //     compare it ourselves — verify_for_apply compares the whole binding hash,
-    //     so this drift is just one more bound field that must match.
-    let apply_time_checksum = conn.recompute_pk_checksum(relation)?.as_prefixed();
+    // (b) Cap/footprint consistency (EPIC #91 PR-B). The grant's approved cap must be
+    //     able to admit the dry-run's OWN measured footprint — a cap smaller than the
+    //     write it authorizes is internally inconsistent (the approved write could
+    //     never commit), so refuse fail-closed rather than open a doomed txn.
+    let cap: WriteCap = grant.binding.cap;
+    let predicted_rows = blast_radius.predicted_total_tuples();
+    if cap.max_rows < predicted_rows {
+        return Err(GrantedApplyError::Inconsistent(format!(
+            "grant cap max_rows={} cannot admit the dry-run's measured footprint of {} rows \
+             (the approved cap is smaller than the write it authorizes)",
+            cap.max_rows, predicted_rows
+        )));
+    }
+    if cap.max_wal_bytes < blast_radius.wal_bytes {
+        return Err(GrantedApplyError::Inconsistent(format!(
+            "grant cap max_wal_bytes={} cannot admit the dry-run's measured {} WAL bytes",
+            cap.max_wal_bytes, blast_radius.wal_bytes
+        )));
+    }
 
-    // (d) Build the LIVE binding from the live request + the grant's dry_run_lsn
-    //     + the APPLY-TIME checksum, and re-verify the grant against it. This is
-    //     the single §14.3 re-verify-at-apply (reused crypto, no reimpl).
+    // (c) Build the LIVE binding from the live request + the grant's dry_run_lsn +
+    //     the grant's approved cap, and re-verify the grant against it. The cap is the
+    //     human-approved magnitude carried IN the grant (not a live-DB recompute), so
+    //     it is one more bound field verify_for_apply checks via the binding hash: a
+    //     swapped cap (or a stale v1 token, which signed no cap) REJECTS here.
     let live_binding = GrantBinding {
         statement_text: live.statement_text.clone(),
         normalized_params: live.normalized_params.clone(),
@@ -266,21 +275,22 @@ pub fn guarded_apply_with_grant(
         session_id: live.session_id.clone(),
         proposal_id: live.proposal_id.clone(),
         dry_run_lsn: blast_radius.clone_lsn.clone(),
-        blast_radius_checksum: apply_time_checksum,
+        cap,
         nonce: grant.binding.nonce.clone(),
         expiry_unix_millis: grant.binding.expiry_unix_millis,
     };
     grant.verify_for_apply(&live_binding, verifying_key, nonces, clock)?;
 
-    // (e) Grant verified + nonce consumed → reach the §4 guarded apply. Its own
-    //     §10.1 apply-time PK-set re-check re-pins the same checksum inside the
-    //     apply txn (defense in depth). The grant gate is tighten-only: we only
-    //     reach here on a fully-valid grant; otherwise we already returned above.
+    // (d) Grant verified + nonce consumed → reach the §4 guarded apply, which
+    //     enforces the approved cap (rows + WAL bytes) INSIDE the apply txn — the
+    //     absolute-magnitude anchor. The grant gate is tighten-only: we only reach
+    //     here on a fully-valid grant; otherwise we already returned above.
     let applied = guarded_apply(
         &live.proposal_id,
         kind,
         relation,
         blast_radius,
+        cap,
         bridged.pitr,
         conn,
         barrier,
@@ -361,15 +371,35 @@ mod tests {
         }
     }
 
-    /// Sign a grant whose binding matches `live` + the blast radius (the honest
-    /// happy-path grant the approver would sign over the dry-run checksum).
+    /// A generous cap that admits the test footprints (the tamper tests exercise the
+    /// binding, not the cap; the cap is signed AS a bound field so a swap would
+    /// REJECT — that has its own test).
+    fn test_cap() -> WriteCap {
+        WriteCap::new(1000, 1_000_000)
+    }
+
+    /// Sign a grant whose binding matches `live` + the blast radius + the approved
+    /// `cap` (the honest happy-path grant the approver would mint, EPIC #91 PR-B —
+    /// signing over the cap, not the dropped checksum).
     fn sign_grant(
         sk: &SigningKey,
         live: &LiveRequest,
         br: &BlastRadius,
-        rel: &str,
         nonce: &str,
         expiry: u64,
+    ) -> GrantToken {
+        sign_grant_cap(sk, live, br, nonce, expiry, test_cap())
+    }
+
+    /// Like [`sign_grant`] but with an explicit cap (for the cap-swap / cap-bound
+    /// tests).
+    fn sign_grant_cap(
+        sk: &SigningKey,
+        live: &LiveRequest,
+        br: &BlastRadius,
+        nonce: &str,
+        expiry: u64,
+        cap: WriteCap,
     ) -> GrantToken {
         let binding = GrantBinding {
             statement_text: live.statement_text.clone(),
@@ -378,7 +408,7 @@ mod tests {
             session_id: live.session_id.clone(),
             proposal_id: live.proposal_id.clone(),
             dry_run_lsn: br.clone_lsn.clone(),
-            blast_radius_checksum: br.affected.pk_set_checksum[rel].clone(),
+            cap,
             nonce: nonce.to_string(),
             expiry_unix_millis: expiry,
         };
@@ -423,7 +453,6 @@ mod tests {
 
     #[derive(Default)]
     struct MockConnInner {
-        recompute_ids: BTreeMap<String, Vec<i64>>,
         written_ids: Vec<i64>,
         began: bool,
         committed: bool,
@@ -434,11 +463,8 @@ mod tests {
     struct MockConn(Arc<Mutex<MockConnInner>>);
 
     impl MockConn {
-        fn new(rel: &str, ids: &[i64]) -> Self {
-            let mut recompute_ids = BTreeMap::new();
-            recompute_ids.insert(rel.to_string(), ids.to_vec());
+        fn new(_rel: &str, ids: &[i64]) -> Self {
             MockConn(Arc::new(Mutex::new(MockConnInner {
-                recompute_ids,
                 written_ids: ids.to_vec(),
                 ..Default::default()
             })))
@@ -461,15 +487,6 @@ mod tests {
         fn begin(&mut self, _timeout_ms: u64) -> Result<(), ApplyError> {
             self.inner().began = true;
             Ok(())
-        }
-        fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-            let ids = self
-                .inner()
-                .recompute_ids
-                .get(relation)
-                .cloned()
-                .unwrap_or_default();
-            Ok(checksum_of(relation, &ids))
         }
         fn apply_forward(
             &mut self,
@@ -542,7 +559,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-1", REL, &[2, 4, 6, 8]);
         let live = live_for("p-1");
-        let grant = sign_grant(&sk, &live, &br, REL, "nonce-1", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "nonce-1", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -577,7 +594,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-br", REL, &[2, 4]);
         let live = live_for("p-br");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-br", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-br", 10_000);
         // dblab provider + pitr enabled → bridged to ProviderKind::Dblab + PITR on.
         let policy = policy_with(CloneProvider::Dblab, true);
         let mut nonces = InMemoryNonceStore::new();
@@ -623,7 +640,7 @@ mod tests {
         let (_approver_sk, approver_vk) = keypair();
         let br = blast_radius_for("p-nok", REL, &[2, 4, 6, 8]);
         let live = live_for("p-nok");
-        let grant = sign_grant(&attacker_sk, &live, &br, REL, "n-nok", 10_000);
+        let grant = sign_grant(&attacker_sk, &live, &br, "n-nok", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -652,7 +669,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-sql", REL, &[2, 4, 6, 8]);
         let live = live_for("p-sql");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-sql", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-sql", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -691,7 +708,7 @@ mod tests {
         let br = blast_radius_for("p-par", REL, &[2, 4, 6, 8]);
         let mut live = live_for("p-par");
         live.normalized_params = vec!["42".to_string()];
-        let grant = sign_grant(&sk, &live, &br, REL, "n-par", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-par", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -722,7 +739,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-ses", REL, &[2, 4, 6, 8]);
         let live = live_for("p-ses");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-ses", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-ses", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -759,7 +776,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br_a = blast_radius_for("p-A", REL, &[2, 4, 6, 8]);
         let live_a = live_for("p-A");
-        let grant = sign_grant(&sk, &live_a, &br_a, REL, "n-prop", 10_000);
+        let grant = sign_grant(&sk, &live_a, &br_a, "n-prop", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -787,21 +804,26 @@ mod tests {
     }
 
     #[test]
-    fn t_grant_data_drift_apply_time_checksum_mismatch_aborts() {
-        // THE MOAT POINT: the grant is signed for the data set {2,4,6,8}, but at
-        // apply time a row drifted into the predicate so the recompute sees
-        // {2,4,6,8,10}. The apply-time PK-set checksum differs from the signed
-        // blast_radius_checksum → the live binding hash mismatches → REJECT, no
-        // mutation. A grant only authorizes the EXACT proposal it was signed for.
+    fn t_grant_cap_swap_aborts_via_binding_mismatch() {
+        // EPIC #91 PR-B replaces the dropped data-drift checksum tamper case. The
+        // grant is signed for an approved cap; an attacker presents a WIDER cap at
+        // apply (to admit a bigger write than the human approved). Because the cap is
+        // a bound field, the live binding (built from grant.binding.cap) still equals
+        // the signed cap — so to actually swap the cap the attacker must re-sign,
+        // which fails the SIGNATURE. We model the swap by presenting a token whose
+        // binding carries a raised cap WITHOUT re-signing: verify_for_apply checks the
+        // signature over the (tampered) binding → BadSignature. Either way the magnitude
+        // the human approved cannot be silently widened.
         let (sk, vk) = keypair();
-        let br = blast_radius_for("p-drift", REL, &[2, 4, 6, 8]);
-        let live = live_for("p-drift");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-drift", 10_000);
+        let br = blast_radius_for("p-cap", REL, &[2, 4, 6, 8]);
+        let live = live_for("p-cap");
+        let mut grant = sign_grant_cap(&sk, &live, &br, "n-cap", 10_000, WriteCap::new(8, 4096));
+        // Tamper: raise the cap AFTER signing (no re-sign).
+        grant.binding.cap = WriteCap::new(1_000_000, 1_000_000_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
-        // The apply-time recompute sees a DRIFTED set (extra row 10).
-        let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
 
         let err = run(
             &policy,
@@ -815,8 +837,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, GrantedApplyError::Grant(GrantError::BindingMismatch)),
-            "apply-time data drift must REJECT via binding mismatch, got {err:?}"
+            matches!(err, GrantedApplyError::Grant(GrantError::BadSignature)),
+            "a post-sign cap raise must REJECT (signature over the tampered binding), got {err:?}"
         );
         assert_no_mutation(&conn);
     }
@@ -826,7 +848,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-rep", REL, &[2, 4, 6, 8]);
         let live = live_for("p-rep");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-rep", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-rep", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -871,7 +893,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-exp", REL, &[2, 4, 6, 8]);
         let live = live_for("p-exp");
-        let grant = sign_grant(&sk, &live, &br, REL, "n-exp", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-exp", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -915,7 +937,7 @@ mod tests {
         let mut live = live_for("p-sd");
         live.statement_text =
             "UPDATE public.orders SET status='x' WHERE status = 'cancelled'".into();
-        let grant = sign_grant(&sk, &live, &br, REL, "n-sd", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-sd", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -953,7 +975,7 @@ mod tests {
         let mut live = live_for("p-sq");
         live.statement_text =
             "DELETE FROM public.orders WHERE id IN (SELECT order_id FROM public.flags)".into();
-        let grant = sign_grant(&sk, &live, &br, REL, "n-sq", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-sq", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -987,7 +1009,7 @@ mod tests {
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-ok", REL, &[2, 4, 6, 8]);
         let live = live_for("p-ok"); // statement is `… WHERE id % 2 = 0`
-        let grant = sign_grant(&sk, &live, &br, REL, "n-ok", 10_000);
+        let grant = sign_grant(&sk, &live, &br, "n-ok", 10_000);
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);
@@ -1014,26 +1036,19 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn grant_for_different_blast_radius_checksum_is_refused() {
-        // The grant's signed blast_radius_checksum does not match the blast
-        // radius's target checksum → Inconsistent (the grant authorizes a
-        // different data set). No mutation.
+    fn grant_cap_below_dry_run_footprint_is_refused() {
+        // EPIC #91 PR-B internal-consistency replacement: the grant's approved cap is
+        // SMALLER than the dry-run's own measured footprint (the blast radius records
+        // a 4-row footprint, but the cap admits only 2). The approved write could
+        // never commit under that cap → Inconsistent, BEFORE the apply txn opens. No
+        // mutation. (A correctly-signed cap that simply mismatches a different value
+        // is a tamper case caught by the binding hash; THIS is the not-a-tamper
+        // internally-inconsistent case.)
         let (sk, vk) = keypair();
         let br = blast_radius_for("p-inc", REL, &[2, 4, 6, 8]);
         let live = live_for("p-inc");
-        // Sign over a DIFFERENT checksum than the blast radius carries.
-        let binding = GrantBinding {
-            statement_text: live.statement_text.clone(),
-            normalized_params: live.normalized_params.clone(),
-            role: live.role.clone(),
-            session_id: live.session_id.clone(),
-            proposal_id: live.proposal_id.clone(),
-            dry_run_lsn: br.clone_lsn.clone(),
-            blast_radius_checksum: checksum_of(REL, &[1, 3, 5]).as_prefixed(),
-            nonce: "n-inc".into(),
-            expiry_unix_millis: 10_000,
-        };
-        let grant = GrantToken::sign(binding, &sk);
+        // Honestly sign a cap of 2 rows — but the dry-run footprint is 4.
+        let grant = sign_grant_cap(&sk, &live, &br, "n-inc", 10_000, WriteCap::new(2, u64::MAX));
         let policy = policy_with(CloneProvider::None, false);
         let mut nonces = InMemoryNonceStore::new();
         let clock = MockClock::starting_at(5_000);

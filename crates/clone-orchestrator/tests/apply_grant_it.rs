@@ -17,12 +17,14 @@
 //!   sql-swap / param-swap / cross-session / proposal-swap → BindingMismatch;
 //!   nonce reuse → ReplayedNonce; past-expiry → Expired;
 //! - **no grant** (attacker-minted / wrong key) ⇒ **fail-closed abort**;
-//! - the **apply-time data-drift** case (a row drifts into the predicate after the
-//!   grant is signed) ⇒ the grant's bound checksum no longer matches the live
-//!   recompute ⇒ BindingMismatch abort (the moat: a grant only authorizes the
-//!   exact proposal it was signed for);
-//! - the S3 guards still hold under the grant path (the apply-time PK-set re-check
-//!   fires on data drift; the reversible apply commits + reverts).
+//! - the **apply-time MAGNITUDE-drift** case (EPIC #91 PR-B): concurrent inserts
+//!   swell `id % 2 = 0` past the approved cap ⇒ **`CapExceeded` abort** (the cap is
+//!   the absolute-magnitude anchor that replaced the dropped exact-PK-set checksum);
+//!   a within-cap headroom write still commits + reverts;
+//! - a join-correlated `UPDATE … FROM` is **REFUSED before the txn opens** by the
+//!   self-determined-predicate gate (the carried PR-A finding);
+//! - the surviving §4 guards still hold under the grant path (RR isolation +
+//!   pre-image seam fire on barrier-injected drift; the reversible apply reverts).
 //!
 //! On every abort path we re-read the primary and assert it is byte-for-byte
 //! unchanged.
@@ -42,7 +44,7 @@ use pgb_clone_orchestrator::{
 };
 use pgb_core::{
     BlastRadius, Clock, InverseKind, InversePlan, MockClock, NoopBarrier, OpCounts, PkChecksum,
-    PkSetBuilder, PkTuple, PkValue, SystemClock,
+    PkSetBuilder, PkTuple, PkValue, SystemClock, WriteCap,
 };
 use pgb_policy::{
     AutonomyLevel, CloneConfig, CloneProvider, GrantBinding, GrantError, GrantToken,
@@ -218,14 +220,32 @@ fn live_for(proposal_id: &str) -> LiveRequest {
     }
 }
 
-/// Sign the §14.3 grant over the live request + blast radius (the honest grant the
-/// approver would mint via the CLI), with `nonce` + `expiry`.
+/// A generous default cap (EPIC #91 PR-B) for the tamper tests (they exercise the
+/// binding, not the cap; the cap-bound tests pass an explicit cap).
+fn test_cap() -> WriteCap {
+    WriteCap::new(1000, 50_000_000)
+}
+
+/// Sign the §14.3 grant over the live request + blast radius + the approved cap (the
+/// honest grant the approver would mint via the CLI), with `nonce` + `expiry`.
 fn sign_grant(
     sk: &SigningKey,
     live: &LiveRequest,
     br: &BlastRadius,
     nonce: &str,
     expiry: u64,
+) -> GrantToken {
+    sign_grant_cap(sk, live, br, nonce, expiry, test_cap())
+}
+
+/// Like [`sign_grant`] but with an explicit cap (the cap-bound / cap-fires tests).
+fn sign_grant_cap(
+    sk: &SigningKey,
+    live: &LiveRequest,
+    br: &BlastRadius,
+    nonce: &str,
+    expiry: u64,
+    cap: WriteCap,
 ) -> GrantToken {
     let binding = GrantBinding {
         statement_text: live.statement_text.clone(),
@@ -234,7 +254,7 @@ fn sign_grant(
         session_id: live.session_id.clone(),
         proposal_id: live.proposal_id.clone(),
         dry_run_lsn: br.clone_lsn.clone(),
-        blast_radius_checksum: br.affected.pk_set_checksum["public.accounts"].clone(),
+        cap,
         nonce: nonce.to_string(),
         expiry_unix_millis: expiry,
     };
@@ -666,31 +686,50 @@ fn five_tamper_cases_plus_no_grant_all_abort_with_no_mutation() {
 }
 
 // ===========================================================================
-//  (3) THE MOAT — apply-time DATA DRIFT: a row drifts into the predicate AFTER
-//      the grant is signed. The grant's bound checksum no longer matches the live
-//      recompute → BindingMismatch abort. This also proves the S3 PK-set guard is
-//      reached (the grant cannot authorize a drifted data set).
+//  (3) THE NEW MOAT ANCHOR — apply-time MAGNITUDE drift caught by the CAP
+//      (EPIC #91 PR-B, replacing the dropped exact-PK-set checksum). The grant +
+//      cap are for the 4-row even set; concurrent INSERTs swell `id % 2 = 0` to 5
+//      matching rows by apply time. The live write's magnitude (5 rows) exceeds the
+//      approved cap (4) → CapExceeded abort, no mutation. The self-determined
+//      predicate gate pins identity; the cap pins magnitude.
 // ===========================================================================
 
 #[test]
-fn apply_time_data_drift_rejects_via_binding_mismatch_no_mutation() {
-    let Some((admin, dbname, _c)) = setup("grant_data_drift") else {
+fn apply_time_magnitude_drift_rejects_via_cap_no_mutation() {
+    let Some((admin, dbname, _c)) = setup("grant_cap_drift") else {
         return;
     };
     let url = url_for(&admin, &dbname);
-    let before = read_accounts(&url);
+    // Isolate the CAP as the sole magnitude anchor on the TARGET's primary channel:
+    // drop the seed's AFTER-UPDATE audit trigger so the only footprint is
+    // `accounts.upd` (which the per-channel reconciliation EXEMPTS for the target —
+    // the cap governs it). With the trigger present, a magnitude over-write would
+    // also trip the audit table's `ins` channel (also fail-closed), but here we prove
+    // the cap itself catches target-primary magnitude drift.
+    Client::connect(&url, NoTls)
+        .unwrap()
+        .batch_execute("DROP TRIGGER accounts_audit_aud ON public.accounts")
+        .unwrap();
 
     let (sk, vk) = keypair();
-    // Grant signed for the CURRENT even set {2,4,6,8}.
-    let br = blast_radius_for("p-drift", &url, EVEN_WHERE, FORWARD);
-    let live = live_for("p-drift");
-    let grant = sign_grant(&sk, &live, &br, "n-drift", 10_000);
+    // Grant signed for the CURRENT even set {2,4,6,8} (4 rows). The human approves a
+    // cap of exactly the 4 rows they saw at dry-run.
+    let br = blast_radius_for("p-cap-drift", &url, EVEN_WHERE, FORWARD);
+    let live = live_for("p-cap-drift");
+    let grant = sign_grant_cap(
+        &sk,
+        &live,
+        &br,
+        "n-cap-drift",
+        10_000,
+        WriteCap::new(4, 50_000_000),
+    );
     let pol = policy();
     let mut nonces = InMemoryNonceStore::new();
 
-    // DRIFT: a NEW even-id row appears AFTER the grant was signed, so the
-    // apply-time recompute sees {2,4,6,8,10} — a different PK set/checksum than the
-    // grant was bound to.
+    // MAGNITUDE DRIFT: a NEW even-id row appears AFTER the grant was signed, so the
+    // live `UPDATE … WHERE id % 2 = 0` now updates 5 accounts (the target's primary
+    // channel), over the approved cap of 4.
     Client::connect(&url, NoTls)
         .unwrap()
         .batch_execute("INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'drift', 5)")
@@ -715,39 +754,115 @@ fn apply_time_data_drift_rejects_via_binding_mismatch_no_mutation() {
         )
         .map(|_| ())
     };
-    // The grant was bound to the {2,4,6,8} checksum; the live recompute sees
-    // {2,4,6,8,10} → the live binding hash mismatches → BindingMismatch, BEFORE
-    // any apply txn opens. A grant only authorizes the exact proposal it signed.
-    assert!(
-        matches!(
-            result,
-            Err(GrantedApplyError::Grant(GrantError::BindingMismatch))
-        ),
-        "apply-time data drift must REJECT at the grant gate, got {result:?}"
-    );
-    // No mutation: the drift row is still present (we never deleted it) but NO
-    // balance was zeroed — the whole apply was refused before the txn opened.
+    // The grant verified (statement + cap + nonce all match), the apply txn opened,
+    // the forward op ran, but the live magnitude (5 target updates) exceeded the
+    // approved cap (4) → CapExceeded ROLLBACK, no mutation. The target's primary
+    // channel is exempt from the relative reconciliation, so the CAP is the sole catch.
+    match &result {
+        Err(GrantedApplyError::Apply(ApplyError::CapExceeded {
+            kind, cap, actual, ..
+        })) => {
+            assert_eq!(*kind, "rows");
+            assert_eq!(*cap, 4);
+            assert_eq!(
+                *actual, 5,
+                "the live write updated 5 target rows, over the cap of 4"
+            );
+        }
+        other => {
+            panic!("apply-time magnitude drift must REJECT via CapExceeded(rows), got {other:?}")
+        }
+    }
+    // No mutation: the drift row is still present, but NO balance was zeroed.
     let after = read_accounts(&url);
     assert_eq!(
         before_drift, after,
-        "data-drift: no mutation (apply refused pre-txn)"
+        "cap-drift: no mutation (apply rolled back on CapExceeded)"
     );
     for (id, (_o, bal)) in &after {
         if *id % 2 == 0 {
-            assert_ne!(*bal, 0, "no even account was zeroed (apply refused)");
+            assert_ne!(
+                *bal, 0,
+                "no even account was zeroed (apply aborted on the cap)"
+            );
         }
     }
-    // The nonce was NOT consumed by the rejected verify.
-    assert!(
-        nonces.consume("n-drift"),
-        "data-drift: nonce not burned by reject"
-    );
     eprintln!(
-        "T-grant-data-drift PASS: a row drifted into the predicate after signing → \
-         the grant's bound checksum no longer matched the live recompute → \
-         BindingMismatch abort, no mutation. The grant did NOT authorize the drifted set."
+        "T-grant-cap-drift PASS: concurrent inserts swelled `id % 2 = 0`'s target updates from \
+         4 (approved) to 5 → CapExceeded(rows) abort, no mutation. The cap is the \
+         absolute-magnitude anchor that replaced the dropped exact-PK-set checksum."
     );
-    let _ = before;
+    drop_db(&admin, &dbname);
+}
+
+#[test]
+fn within_cap_concurrent_insert_still_commits_reversibly() {
+    // The companion: the SAME concurrent-insert drift, but the human approved a cap
+    // with headroom (5). The live 5-target-update write now FITS the cap → commits
+    // (the cap does not over-fire), and reverts. Proves the cap admits an
+    // approved-headroom write the OLD exact-PK-set checksum would have rejected as
+    // drift. (Trigger dropped so the cap is exercised on the target's primary channel.)
+    let Some((admin, dbname, _c)) = setup("grant_cap_headroom") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    Client::connect(&url, NoTls)
+        .unwrap()
+        .batch_execute("DROP TRIGGER accounts_audit_aud ON public.accounts")
+        .unwrap();
+
+    let (sk, vk) = keypair();
+    let br = blast_radius_for("p-cap-ok", &url, EVEN_WHERE, FORWARD);
+    let live = live_for("p-cap-ok");
+    let clock = SystemClock::new();
+    let expiry = clock.now_unix_millis() + 60_000;
+    // Cap of 5: +1 headroom over the 4 target rows the human saw at dry-run.
+    let grant = sign_grant_cap(
+        &sk,
+        &live,
+        &br,
+        "n-cap-ok",
+        expiry,
+        WriteCap::new(5, 50_000_000),
+    );
+    let pol = policy();
+    let mut nonces = InMemoryNonceStore::new();
+
+    Client::connect(&url, NoTls)
+        .unwrap()
+        .batch_execute("INSERT INTO public.accounts(id, owner, balance) VALUES (10, 'drift', 5)")
+        .unwrap();
+    let before = read_accounts(&url);
+
+    let inverse: InversePlan = {
+        let mut client = Client::connect(&url, NoTls).expect("apply connect");
+        let mut conn = PgApplyConn::new(&mut client, FORWARD, EVEN_WHERE);
+        let (applied, _bridged) = guarded_apply_with_grant(
+            &pol,
+            &grant,
+            &live,
+            &vk,
+            &mut nonces,
+            WriteKind::Update,
+            REL,
+            &br,
+            &mut conn,
+            &NoopBarrier::new(),
+            &clock,
+        )
+        .expect("a within-cap write (5 rows, cap 5) must commit");
+        assert_eq!(applied.rows_written, 5, "all 5 even rows zeroed within cap");
+        applied.inverse
+    };
+    // Revert restores the pre-apply state (reversibility intact under the cap path).
+    {
+        let mut client = Client::connect(&url, NoTls).expect("revert connect");
+        let mut rconn = PgRevertConn::new(&mut client);
+        let report: RevertReport = revert(&inverse, &mut rconn).expect("revert");
+        assert_eq!(report.total_restored, 5);
+    }
+    assert_eq!(before, read_accounts(&url), "revert restored the pre-state");
+    eprintln!("[cap-headroom] PASS: a within-cap (5-row) write committed + reverted reversibly");
     drop_db(&admin, &dbname);
 }
 
@@ -816,35 +931,23 @@ fn s3_pk_set_guard_still_fires_under_the_grant_path() {
         .map(|_| ())
     };
     // The grant VERIFIED (nonce consumed), but a §4 apply-time guard inside
-    // guarded_apply caught the barrier-injected drift → fail-closed abort. Under RR
-    // the post-snapshot barrier drift surfaces as a serialization failure (the apply's
-    // FOR UPDATE cannot serialize against the concurrent DELETE); a pre-snapshot drift
-    // would surface as the PK-set re-check mismatch. Accept BOTH — each is fail-closed
-    // and proves the grant gate did NOT weaken the S3 guards.
+    // guarded_apply caught the barrier-injected drift → fail-closed abort. EPIC #91
+    // PR-B dropped the apply-time PK-set re-check; under REPEATABLE READ the
+    // post-snapshot barrier `DELETE id=8` makes the apply's `FOR UPDATE id=8` unable
+    // to serialize → SerializationFailure (40001). This proves the grant gate did NOT
+    // weaken the surviving §4 guards (RR isolation + the fail-closed pre-image seam).
     match result {
-        Err(GrantedApplyError::Apply(ApplyError::PkSetDrift {
-            dry_run,
-            apply_time,
-            ..
-        })) => {
-            assert_ne!(dry_run, apply_time);
-            eprintln!(
-                "S3-guard-intact PASS: grant verified, then the §4 apply-time PK-set re-check \
-                 still fired on barrier-injected drift (dry_run={dry_run} apply_time={apply_time}) \
-                 → ABORT. The grant gate is tighten-only; it did NOT weaken the S3 guards."
-            );
-        }
         Err(GrantedApplyError::Apply(ApplyError::SerializationFailure)) => {
             eprintln!(
                 "S3-guard-intact PASS: grant verified, then under REPEATABLE READ the §10.4 \
                  barrier-injected concurrent DELETE made the apply's FOR UPDATE unable to \
                  serialize → SerializationFailure (40001) ABORT. Still fail-closed, no mutation; \
-                 the grant gate is tighten-only and did NOT weaken the S3 guards."
+                 the grant gate is tighten-only and did NOT weaken the surviving §4 guards."
             );
         }
         other => panic!(
-            "expected a fail-closed S3 abort (PkSetDrift or SerializationFailure) under the \
-             grant path, got {other:?}"
+            "expected a fail-closed S3 abort (SerializationFailure under RR) on the barrier-injected \
+             concurrent DELETE under the grant path, got {other:?}"
         ),
     }
     assert_eq!(barrier.crossings(), 1, "barrier crossed once");
@@ -861,5 +964,70 @@ fn s3_pk_set_guard_still_fires_under_the_grant_path() {
         "the barrier's own DELETE persisted"
     );
     assert!(before.contains_key(&8));
+    drop_db(&admin, &dbname);
+}
+
+// ===========================================================================
+//  (5) THE CARRIED PR-A FINDING — a join-correlated `UPDATE … FROM other` is
+//      REFUSED by the self-determined-predicate gate BEFORE the apply txn opens.
+//      Its row set is steerable by the joined table (only incidentally fail-closed
+//      by the now-removed apply-time PK-set recompute). EPIC #91 PR-B.
+// ===========================================================================
+
+#[test]
+fn join_correlated_update_from_is_refused_before_txn() {
+    let Some((admin, dbname, _c)) = setup("grant_update_from") else {
+        return;
+    };
+    let url = url_for(&admin, &dbname);
+    let before = read_accounts(&url);
+
+    let (sk, vk) = keypair();
+    // A grant whose statement is a join-correlated `UPDATE accounts … FROM entries`.
+    // (We build the blast radius / live request over this steerable statement; the
+    // gate refuses it at the apply path regardless of any grant presented.)
+    let steerable = "UPDATE public.accounts SET balance = 0 FROM public.entries \
+                     WHERE public.entries.account_id = public.accounts.id";
+    let br = blast_radius_for("p-from", &url, EVEN_WHERE, FORWARD);
+    let mut live = live_for("p-from");
+    live.statement_text = steerable.to_string();
+    let grant = sign_grant(&sk, &live, &br, "n-from", 10_000);
+    let pol = policy();
+    let mut nonces = InMemoryNonceStore::new();
+
+    let mut client = Client::connect(&url, NoTls).expect("apply connect");
+    let result = {
+        let mut conn = PgApplyConn::new(&mut client, steerable, EVEN_WHERE);
+        guarded_apply_with_grant(
+            &pol,
+            &grant,
+            &live,
+            &vk,
+            &mut nonces,
+            WriteKind::Update,
+            REL,
+            &br,
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::starting_at(5_000),
+        )
+        .map(|_| ())
+    };
+    assert!(
+        matches!(
+            result,
+            Err(GrantedApplyError::NotSelfDetermined(
+                pgb_clone_orchestrator::NotSelfDetermined::JoinCorrelation
+            ))
+        ),
+        "a join-correlated UPDATE … FROM must be REFUSED at the apply path, got {result:?}"
+    );
+    // No mutation: the apply txn never opened (the gate precedes verify + begin).
+    assert_eq!(before, read_accounts(&url), "UPDATE … FROM: no mutation");
+    eprintln!(
+        "T-update-from PASS: a join-correlated UPDATE … FROM (steerable by the joined \
+         table) was REFUSED by the self-determined-predicate gate before the apply txn \
+         opened — the carried PR-A finding, now explicitly foreclosed."
+    );
     drop_db(&admin, &dbname);
 }

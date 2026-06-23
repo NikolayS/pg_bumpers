@@ -340,6 +340,16 @@ pub enum NotSelfDetermined {
     /// `IN (SELECT …)` / `= ANY/ALL (SELECT …)`**. Its truth depends on other
     /// rows/tables an attacker can write, so it is not pinned by the PK.
     Subquery,
+    /// The statement is an **`UPDATE … FROM other`** / **`DELETE … USING other`**
+    /// (or otherwise JOINs a second relation into the target) — a join-correlation
+    /// like `UPDATE t SET … FROM other WHERE other.id = t.id`. The set of target rows
+    /// the write touches is then determined by the **content of `other`**, which an
+    /// attacker can write between approval and apply — so the row set is *steerable*
+    /// and NOT pinned by the immutable PK. EPIC #91 PR-B: this was only incidentally
+    /// fail-closed by the now-removed apply-time PK-set recompute; the predicate gate
+    /// refuses it explicitly. The `id`-pinned single-table form (`WHERE id IN (…)`) is
+    /// the supported shape; correlate-by-join is refused.
+    JoinCorrelation,
     /// The predicate references a **volatile / non-immutable function or special
     /// value** (`now()`, `random()`, `current_user`, …). Carries the underlying
     /// [`VolatileReason`] — a non-immutable predicate is steerable across the
@@ -363,6 +373,13 @@ impl std::fmt::Display for NotSelfDetermined {
                 f,
                 "predicate contains a subquery / correlated reference / EXISTS / IN (SELECT …) \
                  (its row set is not pinned by the immutable primary key)"
+            ),
+            NotSelfDetermined::JoinCorrelation => write!(
+                f,
+                "statement joins a second relation into the target (UPDATE … FROM / DELETE … USING \
+                 / a JOIN on the target) — the affected row set is determined by the joined \
+                 table's content, which is steerable, so it is not pinned by the immutable \
+                 primary key"
             ),
             NotSelfDetermined::NonImmutable(reason) => {
                 write!(f, "predicate is not immutable: {reason}")
@@ -409,6 +426,14 @@ pub fn self_determined_predicate_reason(
         Ok(p) if p.len() == 1 => p,
         _ => return Some(NotSelfDetermined::Unclassifiable),
     };
+
+    // A join-correlated write (UPDATE … FROM / DELETE … USING / a JOIN on the target)
+    // is steerable by the joined table's content → refuse BEFORE inspecting the WHERE
+    // (the WHERE may itself reference only the PK, e.g. `… FROM other WHERE other.id =
+    // t.id`, yet the row set is still determined by `other`). EPIC #91 PR-B.
+    if let Some(reason) = join_correlation_reason(&parsed[0]) {
+        return Some(reason);
+    }
 
     let predicate = match predicate_of(&parsed[0]) {
         // No WHERE clause → not a self-determined *predicate* (fail-closed: the
@@ -472,6 +497,11 @@ pub fn self_determined_predicate_structural_reason(
         Ok(p) if p.len() == 1 => p,
         _ => return Some(NotSelfDetermined::Unclassifiable),
     };
+    // Join-correlation (UPDATE … FROM / DELETE … USING / a JOIN on the target) is
+    // refused structurally too — the apply-path defense-in-depth gate (EPIC #91 PR-B).
+    if let Some(reason) = join_correlation_reason(&parsed[0]) {
+        return Some(reason);
+    }
     let predicate = match predicate_of(&parsed[0]) {
         Some(None) | None => return Some(NotSelfDetermined::Unclassifiable),
         Some(Some(p)) => p,
@@ -686,6 +716,45 @@ fn predicate_of(stmt: &Statement) -> Option<Option<&Expr>> {
     match stmt {
         Statement::Update(update) => Some(update.selection.as_ref()),
         Statement::Delete(delete) => Some(delete.selection.as_ref()),
+        _ => None,
+    }
+}
+
+/// `Some(JoinCorrelation)` if `stmt` joins a **second relation** into the target
+/// (EPIC #91 PR-B): an `UPDATE … FROM other`, a `DELETE … USING other`, or an
+/// explicit JOIN on the target's `TableWithJoins`. Such a statement's affected
+/// row set is a function of the joined table's content — steerable by another
+/// write — so its row set is NOT pinned by the immutable PK, even when the WHERE
+/// clause itself references only the PK (e.g. `UPDATE t SET … FROM other WHERE
+/// other.id = t.id`). Returns `None` for the supported single-table form.
+fn join_correlation_reason(stmt: &Statement) -> Option<NotSelfDetermined> {
+    match stmt {
+        Statement::Update(update) => {
+            // `UPDATE … FROM other` (the additional value source) is a join.
+            if update.from.is_some() {
+                return Some(NotSelfDetermined::JoinCorrelation);
+            }
+            // An explicit JOIN attached to the UPDATE target relation is a join too.
+            if !update.table.joins.is_empty() {
+                return Some(NotSelfDetermined::JoinCorrelation);
+            }
+            None
+        }
+        Statement::Delete(delete) => {
+            // `DELETE … USING other` is a join-correlated delete.
+            if delete.using.is_some() {
+                return Some(NotSelfDetermined::JoinCorrelation);
+            }
+            // A target table-factor that itself carries JOINs is a join.
+            use sqlparser::ast::FromTable;
+            let from_tables = match &delete.from {
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+            };
+            if from_tables.iter().any(|twj| !twj.joins.is_empty()) {
+                return Some(NotSelfDetermined::JoinCorrelation);
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -1260,6 +1329,62 @@ mod tests {
         assert_eq!(
             sd("UPDATE t SET x=0 WHERE id = ANY (SELECT id FROM s)"),
             Some(NotSelfDetermined::Subquery)
+        );
+    }
+
+    // --- REFUSE: join-correlation (UPDATE … FROM / DELETE … USING) — EPIC #91 PR-B -
+
+    #[test]
+    fn update_from_join_correlation_is_refused() {
+        // THE CARRIED FINDING: `UPDATE t SET … FROM other WHERE other.id = t.id` —
+        // the WHERE looks PK-pinned, but the affected row set is determined by the
+        // joined `other`, which an attacker can write → steerable → REFUSED. (Was only
+        // incidentally fail-closed by the now-removed apply-time PK-set recompute.)
+        assert_eq!(
+            sd("UPDATE accounts SET balance = 0 FROM evil WHERE evil.id = accounts.id"),
+            Some(NotSelfDetermined::JoinCorrelation)
+        );
+        // Even with the WHERE referencing only the target PK + the joined table:
+        assert_eq!(
+            sd("UPDATE accounts SET balance = 0 FROM other WHERE accounts.id = other.account_id"),
+            Some(NotSelfDetermined::JoinCorrelation)
+        );
+    }
+
+    #[test]
+    fn delete_using_join_correlation_is_refused() {
+        // `DELETE FROM t USING other WHERE other.id = t.id` — same steerability.
+        assert_eq!(
+            sd("DELETE FROM accounts USING evil WHERE evil.id = accounts.id"),
+            Some(NotSelfDetermined::JoinCorrelation)
+        );
+    }
+
+    #[test]
+    fn structural_gate_also_refuses_join_correlation() {
+        // The apply-path structural-only gate (no volatility seam) must ALSO refuse
+        // join-correlation (defense in depth, EPIC #91 PR-B).
+        assert_eq!(
+            self_determined_predicate_structural_reason(
+                "UPDATE accounts SET balance = 0 FROM evil WHERE evil.id = accounts.id",
+                "id",
+            ),
+            Some(NotSelfDetermined::JoinCorrelation)
+        );
+        assert_eq!(
+            self_determined_predicate_structural_reason(
+                "DELETE FROM accounts USING evil WHERE evil.id = accounts.id",
+                "id",
+            ),
+            Some(NotSelfDetermined::JoinCorrelation)
+        );
+        // The supported single-table PK form still passes the structural gate.
+        assert_eq!(
+            self_determined_predicate_structural_reason(
+                "UPDATE accounts SET balance = 0 WHERE id IN (1,2,3)",
+                "id",
+            ),
+            None
         );
     }
 

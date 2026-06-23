@@ -19,16 +19,18 @@
 //!    dry-run still leaves a usable budget.
 //! 3. **[`ApplyBarrier::pause_point`]** between prepare and apply — production is a
 //!    no-op; the drift tests inject through this seam (SPEC §10.4).
-//! 4. **Apply with `RETURNING`** — capture both the **pre-image** (for the
-//!    typed-inverse, §10.3 `{pk, before_image}`) and the **actual affected-PK
-//!    set** the forward op wrote.
-//! 5. **Full-blast-radius apply-time PK-set re-check (0-tolerance destructive)** —
-//!    recompute the affected-PK-set checksum *inside the apply txn* on the same
-//!    predicate, for the **target AND every `cascade_by_table` relation the
-//!    dry-run recorded**, and compare each to the dry-run/grant checksum. Any
-//!    mismatch → **ABORT (ROLLBACK)**. The guard is the PK-set checksum, **not**
-//!    the row count, so it catches row-identity drift (same count, different PKs)
-//!    — on the target *and* on cascade children (post-snapshot child rows).
+//! 4. **Apply with `RETURNING`** — capture the **pre-image** (for the
+//!    typed-inverse, §10.3 `{pk, before_image}`); the forward op writes the rows the
+//!    grant-bound, self-determined predicate selects.
+//! 5. **Absolute cap enforcement (EPIC #91 PR-B — the new magnitude anchor)** —
+//!    measure the live write's absolute magnitude **inside the apply txn**: the
+//!    summed `pg_stat_xact_n_tup_{ins,upd,del}` deltas across the FULL footprint
+//!    (rows) **and** the apply txn's WAL-byte generation. If either exceeds the
+//!    human-approved [`pgb_core::WriteCap`] → **ABORT (`CapExceeded`, ROLLBACK)**.
+//!    This is the absolute-magnitude pin that replaced the dropped exact-PK-set
+//!    checksum: the self-determined-predicate gate fixes row *identity*, the cap
+//!    bounds row *magnitude*, and a write that grew past what the human approved (a
+//!    concurrent-insert-swollen `id`-range, etc.) can no longer commit.
 //! 6. **Symmetric full-effect reconciliation (`pg_stat_xact_*` tuple deltas)** —
 //!    the dry-run measures the FULL blast radius (cascades + trigger effects) via
 //!    per-relation `pg_stat_xact_n_tup_{ins,upd,del}` deltas; the apply measures
@@ -36,13 +38,13 @@
 //!    prediction. **ABORT** if ANY relation **not** in the predicted blast radius
 //!    shows a change (the AFTER-trigger `DELETE id=7` out of predicate, or a
 //!    trigger wiping a separate `mirror` table — both invisible to the target's
-//!    `RETURNING`), OR any predicted relation changed **more** than predicted (an
-//!    unguarded cascade that destroyed post-snapshot child rows). This is the
-//!    "0 catastrophic data-loss FN by construction" mechanism: a drifted write can
-//!    no longer commit.
-//! 7. **`RETURNING` written-set check (gate carry-forward)** — verify the rows the
-//!    forward op *actually wrote* in the target (`RETURNING`) match the predicted
-//!    set (defense in depth, kept for same-relation drift).
+//!    `RETURNING`), OR any predicted relation changed **more** than predicted on a
+//!    destructive channel (an unguarded cascade that destroyed post-snapshot child
+//!    rows, an op-type substitution). This is the **relative** effect check; with
+//!    the pre-image coverage it carries the "0 catastrophic data-loss FN" property.
+//! 7. *(removed in PR-B)* the `RETURNING` exact-written-set checksum check — it
+//!    pinned the exact row *identity* set, which the self-determined-predicate gate
+//!    now fixes structurally; the cap (step 5) pins magnitude.
 //! 8. **Full reversible pre-image capture** — the typed-inverse must cover **every
 //!    changed row across ALL affected tables** (target + cascades), FK-ordered, so
 //!    the revert (#37) fully restores. If any committed change cannot be captured
@@ -52,6 +54,18 @@
 //! 9. **`COMMIT`** only if every check passes; else **`ROLLBACK`**.
 //! 10. **Refused-op default-deny** — anything outside the closed certified action
 //!     set ([`pgb_core::certify`]) is refused and **never applied**.
+//!
+//! # EPIC #91 PR-B — checksum dropped, cap added (atomically)
+//!
+//! The apply-time exact-PK-set re-check (former step 5) + the `RETURNING`
+//! written-set check (former step 7) are **removed** together with the dropped
+//! `blast_radius_checksum`. In their place the absolute **cap** (step 5 above) pins
+//! magnitude and the **self-determined-predicate gate** (in
+//! `pgb_clone_orchestrator::predicate`, enforced at dry-run + the grant-apply path)
+//! pins identity. The `pg_stat_xact_*` reconciliation (step 6), the pre-image
+//! capture + coverage guards (step 8/8b), and the full §14.3 grant verification are
+//! all **kept** — so the change is net **tighten-only**: at no point is magnitude
+//! unpinned (the cap is enforced in the same change that drops the checksum).
 //!
 //! # The seam
 //!
@@ -69,7 +83,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pgb_core::inverse::{InversePlanBuilder, Operation, certify};
 use pgb_core::{
     ApplyBarrier, BlastRadius, Clock, InverseKind, InversePlan, InverseRow, OpCounts, PkChecksum,
-    PkSetBuilder, PkTuple, RefusedOp,
+    PkSetBuilder, PkTuple, RefusedOp, WriteCap,
 };
 
 use crate::dry_run::WriteKind;
@@ -108,37 +122,31 @@ pub enum ApplyError {
     #[error("REFUSED: {0}")]
     Refused(#[from] RefusedOp),
 
-    /// **Apply-time PK-set drift** (step 5): the affected-PK-set checksum
-    /// recomputed inside the apply txn differs from the dry-run/grant checksum.
-    /// 0-tolerance → ROLLBACK. This is the guard *firing* — the expected outcome
-    /// of every drift test (insert / delete-shrink / predicate-flip /
-    /// trigger-amplification).
+    /// **The live write's absolute magnitude EXCEEDED the approved cap** (EPIC #91
+    /// PR-B) — the new absolute-magnitude anchor that replaced the dropped exact-PK-set
+    /// checksum. Measured **inside the apply txn**, before commit, from the
+    /// `pg_stat_xact_*` row deltas (`kind = "rows"`) summed across the full footprint
+    /// **and** the apply txn's WAL-byte generation (`kind = "wal_bytes"`). The human
+    /// approved a [`pgb_core::WriteCap`]; if the live magnitude is larger (e.g.
+    /// concurrent inserts swelled an `id`-range / `id % 2 = 0` predicate's row set, or
+    /// a wider-than-expected write), the apply ABORTs → ROLLBACK, no mutation. This is
+    /// the floor's pin on absolute magnitude — reconciliation is *relative* to the
+    /// dry-run prediction, `statement_timeout` is wall-clock, and the `RoleBudget` is
+    /// read-path only, so the cap is what bounds how big an approved write may grow.
     #[error(
-        "GUARD ABORT (apply-time PK-set drift on `{relation}`): dry_run={dry_run} apply_time={apply_time}"
+        "GUARD ABORT (cap exceeded on `{relation}` [{kind}]): the live write's {kind} ({actual}) exceeds the approved cap ({cap})"
     )]
-    PkSetDrift {
-        /// The relation whose affected-PK set drifted.
+    CapExceeded {
+        /// The relation that pushed the footprint past the cap (the target, for the
+        /// aggregate row cap; the target, for the WAL-byte cap).
         relation: String,
-        /// The dry-run/grant checksum.
-        dry_run: String,
-        /// The checksum recomputed inside the apply txn (before the forward op).
-        apply_time: String,
-    },
-
-    /// **`RETURNING` written-set mismatch** (step 7, the gate carry-forward): the
-    /// rows the forward op actually wrote (its `RETURNING` PK set) differ from the
-    /// predicted set. Catches a post-snapshot trigger writing rows OUTSIDE the
-    /// predicate that the pre-op recompute (step 5) cannot see. → ROLLBACK.
-    #[error(
-        "GUARD ABORT (RETURNING written-set mismatch on `{relation}`): predicted={predicted} written={written}"
-    )]
-    WrittenSetMismatch {
-        /// The relation whose written set diverged from the prediction.
-        relation: String,
-        /// The predicted (dry-run) affected-PK-set checksum.
-        predicted: String,
-        /// The checksum of the rows the forward op actually wrote (`RETURNING`).
-        written: String,
+        /// Which ceiling was exceeded: `"rows"` (summed tuple deltas across the full
+        /// footprint) or `"wal_bytes"` (the apply txn's WAL generation).
+        kind: &'static str,
+        /// The approved ceiling for that channel.
+        cap: u64,
+        /// The live measured magnitude that exceeded it.
+        actual: u64,
     },
 
     /// **Write to an UNPREDICTED relation** (step 6, the symmetric `pg_stat_xact_*`
@@ -419,12 +427,20 @@ pub trait ApplyConn {
     /// or [`rollback`](ApplyConn::rollback).
     fn begin(&mut self, timeout_ms: u64) -> Result<(), ApplyError>;
 
-    /// **Step 5 — recompute the affected-PK-set checksum** for `relation` on the
-    /// same predicate, *inside the apply txn, before the forward op*. This is the
-    /// 0-tolerance drift check's apply-time side. Called for the target **and for
-    /// every cascade relation** the dry-run recorded, so cascade-child drift
-    /// (post-snapshot rows) is caught symmetrically with the target.
-    fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError>;
+    /// **Step 5 (cap) — the apply txn's WAL-byte generation so far** (EPIC #91 PR-B),
+    /// measured as the `pg_current_wal_insert_lsn()` delta from the txn's start to
+    /// now, the SAME measure the dry-run's `wal_bytes` records. Read AFTER the forward
+    /// op so the cap is enforced against the actual WAL the write produced. The engine
+    /// compares it to the approved [`pgb_core::WriteCap::max_wal_bytes`] and aborts
+    /// (`CapExceeded`) if it is larger.
+    ///
+    /// Default `0` — the scripted in-memory `ApplyConn`s in the unit tests that don't
+    /// model WAL volume report none (so the WAL cap is vacuously satisfied unless the
+    /// cap is 0); the real [`crate::conn::PgApplyConn`] overrides it with the live LSN
+    /// delta.
+    fn xact_wal_bytes(&mut self) -> Result<u64, ApplyError> {
+        Ok(0)
+    }
 
     /// The **single primary-key column name** of `relation`, for the apply-path
     /// self-determined-predicate gate (EPIC #91 PR-A) — a `pg_index`/`pg_attribute`
@@ -563,20 +579,22 @@ fn operation_from_dry_run(kind: WriteKind, dry_run: &BlastRadius) -> Operation {
 /// Apply a dry-run-validated proposal on the primary under the §4 guards.
 ///
 /// `proposal_id` ties the apply to its proposal; `kind` + `relation` name the
-/// certified write; `dry_run` is the §10.1 grant the apply re-checks against;
-/// `pitr` decides the §1 fence; `conn` is the DB seam; `barrier` is the §10.4
+/// certified write; `dry_run` is the §10.1 grant the apply re-checks against; `cap`
+/// is the human-approved [`WriteCap`] (EPIC #91 PR-B) the live magnitude is bounded
+/// to; `pitr` decides the §1 fence; `conn` is the DB seam; `barrier` is the §10.4
 /// drift-injection seam; `clock` stamps the restore-point label.
 ///
 /// On success returns an [`AppliedWrite`] carrying the captured **typed-inverse**
-/// (for the revert, #37). On any guard failure / refusal / timeout returns an
-/// [`ApplyError`] and **nothing is committed** (the txn is rolled back, or never
-/// opened for a refusal).
+/// (for the revert, #37). On any guard failure / refusal / timeout / cap-exceeded
+/// returns an [`ApplyError`] and **nothing is committed** (the txn is rolled back,
+/// or never opened for a refusal).
 #[allow(clippy::too_many_arguments)]
 pub fn guarded_apply(
     proposal_id: &str,
     kind: WriteKind,
     relation: &str,
     dry_run: &BlastRadius,
+    cap: WriteCap,
     pitr: PitrConfig,
     conn: &mut dyn ApplyConn,
     barrier: &dyn ApplyBarrier,
@@ -591,6 +609,31 @@ pub fn guarded_apply(
         )));
     }
     let predicted = PredictedBlastRadius::from_grant(dry_run, relation)?;
+
+    // (0b) Cap/dry-run consistency pre-check (EPIC #91 PR-B). The dry-run measured a
+    //      footprint; the approved cap must be able to admit at least that predicted
+    //      magnitude, else the grant is internally inconsistent — a cap smaller than
+    //      the write it authorizes could never commit the approved write, so refuse
+    //      up front (fail-closed, before any DB work) rather than open a txn that is
+    //      guaranteed to abort. (A cap LARGER than the prediction is fine: that is the
+    //      approver's allowed headroom.)
+    let predicted_rows = dry_run.predicted_total_tuples();
+    if cap.max_rows < predicted_rows {
+        return Err(ApplyError::CapExceeded {
+            relation: relation.to_string(),
+            kind: "rows",
+            cap: cap.max_rows,
+            actual: predicted_rows,
+        });
+    }
+    if cap.max_wal_bytes < dry_run.wal_bytes {
+        return Err(ApplyError::CapExceeded {
+            relation: relation.to_string(),
+            kind: "wal_bytes",
+            cap: cap.max_wal_bytes,
+            actual: dry_run.wal_bytes,
+        });
+    }
 
     // (10) Refused-op default-deny — BEFORE touching the DB. Anything outside the
     //      closed certified action set is refused and never applied (§10.3).
@@ -612,7 +655,7 @@ pub fn guarded_apply(
 
     // From here on, every early return MUST roll back. We funnel the guarded body
     // through a helper so a single match handles rollback-on-error.
-    let outcome = guarded_body(kind, relation, &predicted, conn, barrier);
+    let outcome = guarded_body(kind, relation, &predicted, cap, conn, barrier);
 
     match outcome {
         Ok(forward) => {
@@ -645,11 +688,11 @@ pub fn guarded_apply(
 /// fired trigger wrote to (e.g. an audit table). This is what makes the apply-time
 /// re-check **symmetric** with the dry-run's full-blast-radius measurement.
 struct PredictedBlastRadius {
-    /// The target's dry-run affected-PK-set checksum (prefixed `sha256:…`).
-    target_checksum: String,
     /// Cascade relations (`cascade_by_table`), each with its dry-run checksum. The
-    /// apply re-checks the PK-set of each AND captures their pre-images for the
-    /// full inverse.
+    /// apply captures each one's pre-images for the full inverse. (The checksum is
+    /// retained for the structural "every cascade has a computable PK set" validation
+    /// in [`from_grant`](Self::from_grant) — a PK-less cascade is rejected — but is no
+    /// longer re-checked at apply time: PR-B dropped the apply-time PK-set re-check.)
     cascades: Vec<(String, String)>,
     /// The FULL per-relation, **per-op-type** predicted change footprint
     /// (`effect_by_table`): every relation the dry-run's `pg_stat_xact_*` measured,
@@ -671,15 +714,15 @@ impl PredictedBlastRadius {
     /// any write would be "unpredicted").
     fn from_grant(dry_run: &BlastRadius, target: &str) -> Result<Self, ApplyError> {
         let affected = &dry_run.affected;
-        let target_checksum = affected
-            .pk_set_checksum
-            .get(target)
-            .cloned()
-            .ok_or_else(|| {
-                ApplyError::InvalidGrant(format!(
-                    "blast-radius has no pk_set_checksum for target `{target}`"
-                ))
-            })?;
+        // The target must still have a computable PK set recorded (the dry-run refuses
+        // a PK-less target). We no longer re-check it at apply time (PR-B dropped the
+        // exact-set re-check), but its ABSENCE means a PK-less/un-keyable write reached
+        // here — reject fail-closed.
+        if !affected.pk_set_checksum.contains_key(target) {
+            return Err(ApplyError::InvalidGrant(format!(
+                "blast-radius has no pk_set_checksum for target `{target}`"
+            )));
+        }
 
         if affected.effect_by_table.is_empty() {
             return Err(ApplyError::InvalidGrant(format!(
@@ -708,7 +751,6 @@ impl PredictedBlastRadius {
         }
 
         Ok(PredictedBlastRadius {
-            target_checksum,
             cascades,
             effect_by_table: affected.effect_by_table.clone(),
         })
@@ -727,6 +769,7 @@ fn guarded_body(
     kind: WriteKind,
     relation: &str,
     predicted: &PredictedBlastRadius,
+    cap: WriteCap,
     conn: &mut dyn ApplyConn,
     barrier: &dyn ApplyBarrier,
 ) -> Result<ForwardResult, ApplyError> {
@@ -734,41 +777,17 @@ fn guarded_body(
     //     is a no-op; the drift tests mutate world state here.
     barrier.pause_point("between dry_run and apply");
 
-    // (5) FULL-blast-radius apply-time PK-set re-check — a freshness/authorization
-    //     re-check (NOT the bound/undo guard). Recompute the affected-PK-set
-    //     checksum INSIDE the txn (before the forward op) for the TARGET *and every
-    //     cascade relation* and compare each to its dry-run/grant checksum. This
-    //     binds the §14.3 human grant to the EXACT approved row-identity set: it is
-    //     an anti-TOCTOU authorization-freshness gate (0-tolerance, catches a
-    //     predicate-flip — same count, different PKs — on the target AND cascade-child
-    //     drift), NOT the mechanism that makes the write bounded-&-reversible.
-    //     Bounded-ness comes from the `pg_stat_xact_*` reconciliation (step 6) +
-    //     `statement_timeout` budget (step 2); reversibility from the pre-image
-    //     capture (step 4) + the coverage guards (steps 8/8b). A drifted identity set
-    //     fails this check CLOSED (re-approve required) — it does not loosen any
-    //     bound/undo guard.
-    let apply_time = conn.recompute_pk_checksum(relation)?;
-    if apply_time.as_prefixed() != predicted.target_checksum {
-        return Err(ApplyError::PkSetDrift {
-            relation: relation.to_string(),
-            dry_run: predicted.target_checksum.clone(),
-            apply_time: apply_time.as_prefixed(),
-        });
-    }
-    for (cascade_rel, cascade_checksum) in &predicted.cascades {
-        let cs = conn.recompute_pk_checksum(cascade_rel)?;
-        if cs.as_prefixed() != *cascade_checksum {
-            return Err(ApplyError::PkSetDrift {
-                relation: cascade_rel.clone(),
-                dry_run: cascade_checksum.clone(),
-                apply_time: cs.as_prefixed(),
-            });
-        }
-    }
+    // NOTE (EPIC #91 PR-B): the former step-5 apply-time PK-set re-check (and the
+    // step-7 RETURNING written-set check) are REMOVED with the dropped exact-PK-set
+    // checksum. Identity-steerability is foreclosed structurally by the
+    // self-determined-predicate gate (grant-bound WHERE references only the immutable
+    // PK), and absolute magnitude is pinned by the cap (below). The relative
+    // `pg_stat_xact_*` reconciliation + the reversible pre-image coverage (kept) carry
+    // the rest of the floor.
 
     // (4) Forward op with RETURNING — capture the target's pre-image + actual
-    //     written-PK set, AND the cascade children's pre-images (captured before
-    //     the forward op deletes them) so the inverse can fully restore them. A
+    //     written rows, AND the cascade children's pre-images (captured before the
+    //     forward op deletes them) so the inverse can fully restore them. A
     //     statement_timeout overrun surfaces as ApplyError::Timeout here.
     let cascade_relations: Vec<String> =
         predicted.cascades.iter().map(|(r, _)| r.clone()).collect();
@@ -780,16 +799,41 @@ fn guarded_body(
     //     mechanism: it sees rows a trigger wrote in another statement / table that
     //     `RETURNING` can NEVER report.
     let deltas = conn.xact_tuple_deltas()?;
-    reconcile_full_effect(predicted, &deltas)?;
+    reconcile_full_effect(predicted, relation, kind, &deltas)?;
 
-    // (7) RETURNING written-set check (gate carry-forward, defense in depth). The
-    //     target rows the forward op ACTUALLY wrote must match the prediction.
-    let written = forward.written_checksum(relation)?;
-    if written.as_prefixed() != predicted.target_checksum {
-        return Err(ApplyError::WrittenSetMismatch {
+    // (5) ABSOLUTE CAP enforcement (EPIC #91 PR-B — the new magnitude anchor). The
+    //     dropped exact-PK-set checksum was the only absolute pin on an approved
+    //     write; this is its replacement. We bound the live write's absolute
+    //     magnitude against the human-approved cap, computed from the SAME measures
+    //     the reconciliation/dry-run use so the cap is enforced on the real footprint:
+    //       - ROWS: the summed `pg_stat_xact_*` tuple deltas across the FULL footprint
+    //         (target + cascades + trigger-written tables) — the same `deltas` the
+    //         reconciliation just read, so a concurrent-insert-swollen predicate, an
+    //         amplifying trigger, or a runaway cascade that pushes the live row count
+    //         past the cap ABORTS even if it is in-radius and reconciles per channel;
+    //       - WAL BYTES: the apply txn's WAL generation (the same `pg_current_wal_*`
+    //         delta the dry-run records), so an unexpectedly heavy write aborts.
+    //     Either overage → CapExceeded ROLLBACK, no mutation. Enforced AFTER the
+    //     forward op (so the live magnitude is real) but BEFORE commit.
+    let live_rows: u64 = deltas
+        .iter()
+        .map(|d| d.total())
+        .fold(0u64, |a, b| a.saturating_add(b));
+    if live_rows > cap.max_rows {
+        return Err(ApplyError::CapExceeded {
             relation: relation.to_string(),
-            predicted: predicted.target_checksum.clone(),
-            written: written.as_prefixed(),
+            kind: "rows",
+            cap: cap.max_rows,
+            actual: live_rows,
+        });
+    }
+    let live_wal = conn.xact_wal_bytes()?;
+    if live_wal > cap.max_wal_bytes {
+        return Err(ApplyError::CapExceeded {
+            relation: relation.to_string(),
+            kind: "wal_bytes",
+            cap: cap.max_wal_bytes,
+            actual: live_wal,
         });
     }
 
@@ -990,21 +1034,38 @@ fn assert_reversible_preimage_coverage(
 ///   invisible to `RETURNING`).
 /// - ANY predicted relation whose actual change **on any op channel exceeds** the
 ///   prediction for that channel → [`ApplyError::RelationOverWrite`]. This catches
-///   an out-of-predicate write to the target table, cascade drift on a child, AND
-///   the **op-type substitution** the collapsed-total guard missed: a relation
-///   predicted to only `ins` (e.g. an audit table) that the apply `del`s/`upd`s
-///   instead trips the `del`/`upd` channel even though the *total* is unchanged —
-///   the silent irreversible destructive write is now refused.
+///   an out-of-predicate write to the target table on a NON-primary channel (an
+///   AFTER trigger `DELETE`-ing a target row outside the predicate), cascade drift
+///   on a child, AND the **op-type substitution** (a relation predicted to only
+///   `ins` that the apply `del`s/`upd`s instead trips the `del`/`upd` channel even
+///   though the *total* is unchanged — a silent irreversible destructive write).
 ///
-/// (A predicted relation changing *less* than predicted on a channel cannot
-/// under-destroy data, and the PK-set re-check + RETURNING check already pin the
-/// exact target set; the per-channel over-write is the data-loss direction this
-/// guards. Checking each channel — rather than the sum — is what makes a
-/// destructive op substituted for a predicted-only-insert op impossible to commit.)
+/// # EPIC #91 PR-B relaxation: the target's PRIMARY channel is governed by the cap
+///
+/// The former exact-PK-set checksum pinned the target's row *set* (and so its exact
+/// row count) — which let this guard demand strict per-channel **equality** on the
+/// target's own primary write channel (`upd` for an UPDATE, `del` for a DELETE).
+/// With the checksum dropped, the target's **primary channel** is now governed by
+/// the **absolute cap** instead: a self-determined predicate (e.g. `id % 2 = 0`)
+/// can legitimately match more rows at apply than at dry-run (concurrent inserts),
+/// and the cap — not exact prediction-equality — bounds how far it may grow. So we
+/// **exempt the target's primary channel** from the over-write check here (the cap
+/// catches an overage); every OTHER channel on the target, and ALL channels on
+/// every non-target relation, stay strict. This keeps the destructive directions
+/// (out-of-predicate target deletes, op-substitution, cascade over-deletes) caught
+/// while letting the cap own the target's primary magnitude.
 fn reconcile_full_effect(
     predicted: &PredictedBlastRadius,
+    target: &str,
+    kind: WriteKind,
     deltas: &[RelationChange],
 ) -> Result<(), ApplyError> {
+    // The target's PRIMARY write channel — the one the cap governs, exempt from the
+    // strict per-channel over-write check below.
+    let primary_channel = match kind {
+        WriteKind::Update => "upd",
+        WriteKind::Delete => "del",
+    };
     let in_radius = predicted.relations();
     for change in deltas {
         if change.total() == 0 {
@@ -1025,14 +1086,18 @@ fn reconcile_full_effect(
             .copied()
             .unwrap_or_default();
         let a = change.as_op_counts();
+        let is_target = change.relation == target;
         // Compare each op channel INDEPENDENTLY. The first channel that exceeds its
-        // prediction aborts — including the data-loss direction where the predicted
-        // channel was 0 (e.g. an `ins`-only relation showing any `del`).
-        let channel = if a.ins > p.ins {
+        // prediction aborts — EXCEPT the target's own primary channel, which the cap
+        // (not exact prediction-equality) bounds (EPIC #91 PR-B). Every other channel
+        // stays strict so an out-of-predicate target write on a NON-primary channel,
+        // an op-substitution, or a cascade over-delete still aborts.
+        let exempt = |ch: &str| is_target && ch == primary_channel;
+        let channel = if a.ins > p.ins && !exempt("ins") {
             Some("ins")
-        } else if a.upd > p.upd {
+        } else if a.upd > p.upd && !exempt("upd") {
             Some("upd")
-        } else if a.del > p.del {
+        } else if a.del > p.del && !exempt("del") {
             Some("del")
         } else {
             None
@@ -1211,6 +1276,9 @@ mod tests {
         /// `[("status", "open")]` — so a test can model a pre-image that does NOT
         /// cover a declared written column (the column-coverage abort).
         written_image_cols: Option<Vec<String>>,
+        /// EPIC #91 PR-B: the WAL bytes the apply txn reports it generated (for the
+        /// WAL-byte cap). Defaults to 0 (the row cap is what most tests exercise).
+        wal_bytes: u64,
         // observability
         restore_points: Vec<String>,
         began_with_timeout: Option<u64>,
@@ -1246,14 +1314,8 @@ mod tests {
             self.inner().began_with_timeout = Some(timeout_ms);
             Ok(())
         }
-        fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-            let ids = self
-                .inner()
-                .recompute_ids
-                .get(relation)
-                .cloned()
-                .unwrap_or_default();
-            Ok(checksum_of(relation, &ids))
+        fn xact_wal_bytes(&mut self) -> Result<u64, ApplyError> {
+            Ok(self.inner().wal_bytes)
         }
         fn apply_forward(
             &mut self,
@@ -1317,6 +1379,11 @@ mod tests {
 
     const REL: &str = "public.orders";
 
+    /// A generous cap that never trips for the non-cap tests (they exercise the
+    /// reconciliation / reversibility / refusal guards, not the cap). The cap tests
+    /// pass a tight cap explicitly.
+    const BIG_CAP: WriteCap = WriteCap::new(u64::MAX, u64::MAX);
+
     // ---- statement_timeout sizing -----------------------------------------
 
     #[test]
@@ -1345,6 +1412,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1379,6 +1447,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::enabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1402,129 +1471,141 @@ mod tests {
         assert!(p.committed);
     }
 
-    // ---- drift: apply-time PK-set re-check (0-tolerance) -------------------
+    // ---- EPIC #91 PR-B: the ABSOLUTE CAP (the new magnitude anchor) ---------
+    //
+    // The former apply-time PK-set re-check (step 5) + RETURNING written-set check
+    // (step 7) are REMOVED with the exact-PK-set checksum. Identity-steerability is
+    // now the predicate gate's job (tested in `predicate`); MAGNITUDE is the cap's.
 
     #[test]
-    fn drift_insert_over_count_aborts() {
-        // Apply-time recompute sees an extra matching row (101) → drift → ABORT.
+    fn cap_exceeded_on_rows_aborts_no_mutation() {
+        // THE CAP FIRES: the human approved a cap of 5 rows matching the dry-run's
+        // 5-row prediction, but by apply time concurrent inserts swelled the
+        // predicate's row set so the LIVE write changed 7. The in-txn
+        // `pg_stat_xact_*` row total (7) > cap (5) → CapExceeded ABORT, no mutation.
+        // This is the absolute-magnitude pin the dropped checksum left behind: the
+        // dry-run footprint fits the cap (so the pre-check passes), but the live write
+        // grew past it.
         let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
+        // The forward op + reconciliation see 7 changed rows (more than approved).
+        conn.inner().written_ids = vec![2, 4, 6, 8, 10, 12, 14];
+        conn.inner().tuple_deltas = Some(vec![RelationChange {
+            relation: REL.to_string(),
+            ins: 0,
+            upd: 7,
+            del: 0,
+        }]);
         let probe = conn.clone();
-        // Inject the drift through the barrier (as production tests do).
-        let conn_for_barrier = conn.clone();
-        let barrier = ClosureBarrier::new(move |_| {
-            conn_for_barrier
-                .inner()
-                .recompute_ids
-                .insert(REL.to_string(), vec![2, 4, 6, 8, 10, 101]);
-        });
-        let grant = grant_for("p-2", REL, &[2, 4, 6, 8, 10], 5);
+        // The dry-run grant predicted 5 rows (effect_by_table upd=5, matching the cap)
+        // so the cap/footprint pre-check passes; the live magnitude is what overflows.
+        let grant = grant_for("p-cap", REL, &[2, 4, 6, 8, 10], 5);
+        let cap = WriteCap::new(5, u64::MAX);
         let err = guarded_apply(
-            "p-2",
+            "p-cap",
             WriteKind::Update,
             REL,
             &grant,
+            cap,
             PitrConfig::disabled(),
             &mut conn,
-            &barrier,
-            &MockClock::new(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ApplyError::PkSetDrift { .. }), "{err:?}");
-        let p = probe.inner();
-        assert!(p.rolled_back, "drift must ROLLBACK");
-        assert!(!p.committed);
-        assert!(
-            !p.forward_ran,
-            "the forward op must NOT run after pre-op drift is caught"
-        );
-    }
-
-    #[test]
-    fn drift_delete_shrink_under_count_aborts() {
-        let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
-        let probe = conn.clone();
-        let conn_for_barrier = conn.clone();
-        let barrier = ClosureBarrier::new(move |_| {
-            // one matching row vanished post-snapshot.
-            conn_for_barrier
-                .inner()
-                .recompute_ids
-                .insert(REL.to_string(), vec![2, 4, 6, 8]);
-        });
-        let grant = grant_for("p-3", REL, &[2, 4, 6, 8, 10], 5);
-        let err = guarded_apply(
-            "p-3",
-            WriteKind::Update,
-            REL,
-            &grant,
-            PitrConfig::disabled(),
-            &mut conn,
-            &barrier,
-            &MockClock::new(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ApplyError::PkSetDrift { .. }), "{err:?}");
-        assert!(probe.inner().rolled_back);
-    }
-
-    #[test]
-    fn drift_predicate_flip_same_count_different_pks_aborts() {
-        // HEADLINE: same cardinality, different PKs. A row-count guard PASSES
-        // here; only the PK-set checksum catches it.
-        let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
-        let probe = conn.clone();
-        let conn_for_barrier = conn.clone();
-        let barrier = ClosureBarrier::new(move |_| {
-            // 10 flipped OUT, 1 flipped IN — count is still 5.
-            conn_for_barrier
-                .inner()
-                .recompute_ids
-                .insert(REL.to_string(), vec![1, 2, 4, 6, 8]);
-        });
-        let grant = grant_for("p-4", REL, &[2, 4, 6, 8, 10], 5);
-        let err = guarded_apply(
-            "p-4",
-            WriteKind::Update,
-            REL,
-            &grant,
-            PitrConfig::disabled(),
-            &mut conn,
-            &barrier,
+            &NoopBarrier::new(),
             &MockClock::new(),
         )
         .unwrap_err();
         match err {
-            ApplyError::PkSetDrift {
-                dry_run,
-                apply_time,
-                ..
-            } => assert_ne!(dry_run, apply_time),
-            other => panic!("expected PkSetDrift, got {other:?}"),
+            ApplyError::CapExceeded {
+                kind, cap, actual, ..
+            } => {
+                assert_eq!(kind, "rows");
+                assert_eq!(cap, 5);
+                assert_eq!(actual, 7, "the live write changed 7 rows, over the cap");
+            }
+            other => panic!("expected CapExceeded(rows), got {other:?}"),
         }
-        assert!(probe.inner().rolled_back);
+        let p = probe.inner();
+        assert!(p.rolled_back, "an over-cap write must ROLLBACK");
+        assert!(!p.committed, "nothing committed");
     }
 
-    // ---- RETURNING written-set check (the carry-forward) -------------------
-
     #[test]
-    fn returning_written_set_mismatch_aborts() {
-        // The pre-op recompute MATCHES the grant (so step 5 passes) and the txn
-        // changed exactly the predicted COUNT of target rows (so the stat-delta
-        // reconciliation passes), but the forward op WROTE a different *set* of the
-        // same cardinality (id=999 in place of id=10). Only the RETURNING
-        // written-set checksum (step 7) catches this same-relation, same-count
-        // identity drift.
-        let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
-        // recompute matches grant; written set swaps id=10 for an out-of-set 999
-        // (same cardinality 5 → stat-delta count matches predicted 5).
-        conn.inner().written_ids = vec![2, 4, 6, 8, 999];
+    fn cap_exceeded_on_wal_bytes_aborts() {
+        // The row count is within cap, but the write generated more WAL than the
+        // approved `max_wal_bytes` → CapExceeded(wal_bytes) ABORT.
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        conn.inner().wal_bytes = 9000; // the live WAL the apply txn generated
         let probe = conn.clone();
-        let grant = grant_for("p-5", REL, &[2, 4, 6, 8, 10], 5);
+        let grant = grant_for("p-wal", REL, &[2, 4, 6, 8], 5);
+        // The dry-run measured 0 WAL (the mock grant's wal_bytes default), and the
+        // human approved up to 8000 — but the live write produced 9000.
+        let cap = WriteCap::new(u64::MAX, 8000);
         let err = guarded_apply(
-            "p-5",
+            "p-wal",
             WriteKind::Update,
             REL,
             &grant,
+            cap,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .unwrap_err();
+        match err {
+            ApplyError::CapExceeded {
+                kind, cap, actual, ..
+            } => {
+                assert_eq!(kind, "wal_bytes");
+                assert_eq!(cap, 8000);
+                assert_eq!(actual, 9000);
+            }
+            other => panic!("expected CapExceeded(wal_bytes), got {other:?}"),
+        }
+        assert!(probe.inner().rolled_back);
+        assert!(!probe.inner().committed);
+    }
+
+    #[test]
+    fn within_cap_write_commits() {
+        // The companion: a write whose live magnitude is AT the cap commits (the cap
+        // does not over-fire). 4 rows changed, cap of 4 → OK.
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8]);
+        conn.inner().wal_bytes = 4096;
+        let probe = conn.clone();
+        let grant = grant_for("p-ok-cap", REL, &[2, 4, 6, 8], 5);
+        let cap = WriteCap::new(4, 8192);
+        let applied = guarded_apply(
+            "p-ok-cap",
+            WriteKind::Update,
+            REL,
+            &grant,
+            cap,
+            PitrConfig::disabled(),
+            &mut conn,
+            &NoopBarrier::new(),
+            &MockClock::new(),
+        )
+        .expect("a within-cap write must COMMIT");
+        assert_eq!(applied.rows_written, 4);
+        assert!(probe.inner().committed);
+        assert!(!probe.inner().rolled_back);
+    }
+
+    #[test]
+    fn cap_below_dry_run_footprint_is_refused_before_txn() {
+        // The cap/footprint consistency pre-check (step 0b): a cap SMALLER than the
+        // dry-run's own measured footprint is internally inconsistent (the approved
+        // write could never commit) → CapExceeded, BEFORE the apply txn opens.
+        let mut conn = MockConn::new(REL, &[2, 4, 6, 8, 10]);
+        let probe = conn.clone();
+        // dry-run measured 5 rows (the grant's effect_by_table upd=5).
+        let grant = grant_for("p-tiny-cap", REL, &[2, 4, 6, 8, 10], 5);
+        let cap = WriteCap::new(3, u64::MAX); // smaller than the 5-row footprint
+        let err = guarded_apply(
+            "p-tiny-cap",
+            WriteKind::Update,
+            REL,
+            &grant,
+            cap,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1532,16 +1613,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ApplyError::WrittenSetMismatch { .. }),
+            matches!(err, ApplyError::CapExceeded { kind: "rows", .. }),
             "{err:?}"
         );
         let p = probe.inner();
         assert!(
-            p.forward_ran,
-            "the forward op ran (then we caught the drift)"
+            p.began_with_timeout.is_none(),
+            "an inconsistent cap must be refused before the apply txn opens"
         );
-        assert!(p.rolled_back, "written-set mismatch must ROLLBACK");
-        assert!(!p.committed);
+        assert!(!p.forward_ran && !p.committed);
     }
 
     // ---- FULL-effect reconciliation (the data-loss mechanism) --------------
@@ -1609,6 +1689,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1648,6 +1729,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1724,6 +1806,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1790,6 +1873,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1860,6 +1944,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1910,6 +1995,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1936,6 +2022,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -1985,6 +2072,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2047,6 +2135,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2170,6 +2259,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2273,6 +2363,7 @@ mod tests {
             WriteKind::Delete,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2318,6 +2409,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2356,6 +2448,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2399,6 +2492,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2424,6 +2518,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2451,6 +2546,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2478,6 +2574,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2503,6 +2600,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &NoopBarrier::new(),
@@ -2525,6 +2623,7 @@ mod tests {
             WriteKind::Update,
             REL,
             &grant,
+            BIG_CAP,
             PitrConfig::disabled(),
             &mut conn,
             &barrier,
