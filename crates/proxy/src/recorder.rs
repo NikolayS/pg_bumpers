@@ -118,7 +118,7 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgb_audit::{verify_chain, InMemorySink};
+    use pgb_audit::{InMemorySink, verify_chain};
     use pgb_core::MockClock;
 
     fn shared_inmem() -> (Recorder, Arc<Mutex<InMemorySink>>) {

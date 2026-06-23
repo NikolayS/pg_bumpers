@@ -16,7 +16,7 @@
 use fidelity_spike::differ;
 use fidelity_spike::harness::{self, SpikeError};
 use fidelity_spike::{base_pgurl, it_enabled};
-use pgb_core::inverse::{certify, Operation};
+use pgb_core::inverse::{Operation, certify};
 use pgb_core::{Clock, ClosureBarrier, MockClock, NoopBarrier, RefusedOp};
 use postgres::Client;
 

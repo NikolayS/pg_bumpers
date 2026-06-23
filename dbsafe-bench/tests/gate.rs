@@ -25,7 +25,7 @@ use dbsafe_bench::golden::{
     diff_golden, golden_path, known_bypasses_path, load_golden, load_known_bypasses,
     serialize_golden,
 };
-use dbsafe_bench::runner::{assert_coverage_floor, GateReport};
+use dbsafe_bench::runner::{GateReport, assert_coverage_floor};
 use dbsafe_bench::verdict::KnownBypassLedger;
 
 /// Re-bless the golden + ledger from the live corpus when `DBSAFE_BENCH_BLESS=1`.

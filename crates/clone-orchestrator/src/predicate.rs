@@ -51,7 +51,7 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{visit_expressions, Expr, FunctionArguments, ObjectName, Statement};
+use sqlparser::ast::{Expr, FunctionArguments, ObjectName, Statement, visit_expressions};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -708,8 +708,10 @@ mod tests {
             "predicate references non-deterministic special value `now` \
              (value differs between dry-run and apply)"
         );
-        assert!(VolatileReason::VolatileFunction("random".into())
-            .to_string()
-            .contains("provolatile = 'v'"));
+        assert!(
+            VolatileReason::VolatileFunction("random".into())
+                .to_string()
+                .contains("provolatile = 'v'")
+        );
     }
 }

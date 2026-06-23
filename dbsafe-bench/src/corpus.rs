@@ -17,8 +17,8 @@
 //! [`crate::runner::assert_coverage_floor`] enforces it.
 
 use pgb_clone_orchestrator::WriteKind;
-use pgb_core::inverse::Operation;
 use pgb_core::OpCounts;
+use pgb_core::inverse::Operation;
 
 use crate::floor::DataLossCase;
 use crate::verdict::{Class, DefenseLayer, GoldenRecord, Vector, Verdict};

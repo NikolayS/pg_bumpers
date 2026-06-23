@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 use pgb_core::blast_radius::{Affected, ConstraintViolation, OpCounts};
 use pgb_core::{BlastRadius, Clock, InverseKind, LockHeld, LockMode, PkChecksum, TriggerFired};
 
-use crate::predicate::{predicate_volatile_reason, FunctionVolatility, VolatileReason, Volatility};
+use crate::predicate::{FunctionVolatility, VolatileReason, Volatility, predicate_volatile_reason};
 use crate::proposal::Proposal;
 
 /// The statement class the dry-run engine recognizes (advisory parse, SPEC §4).
@@ -790,10 +790,11 @@ mod tests {
         assert_eq!(br.affected.by_table["public.orders"], 2);
         assert_eq!(br.affected.cascade_by_table["public.order_items"], 4);
         assert_eq!(br.affected.total_rows, 6);
-        assert!(br
-            .affected
-            .pk_set_checksum
-            .contains_key("public.order_items"));
+        assert!(
+            br.affected
+                .pk_set_checksum
+                .contains_key("public.order_items")
+        );
         // With no measured full_effect, the footprint is synthesized from
         // target+cascades so the guarded apply always has something to reconcile —
         // keyed by the write's op type (a DELETE writes `del`, NOT a collapsed

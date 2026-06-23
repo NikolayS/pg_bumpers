@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use pgb_core::inverse::{certify, Operation};
+use pgb_core::inverse::{Operation, certify};
 use pgb_core::{
     ApplyBarrier, CertifiedAction, InverseKind, InversePlan, InverseRow, PkChecksum, PkSetBuilder,
     PkTuple, PkValue, RefusedOp,
@@ -32,7 +32,9 @@ pub enum SpikeError {
     /// The apply-time checksum differed from the dry-run checksum → ABORTed.
     /// This is the **guard firing**; it is the *expected* outcome of every drift
     /// test.
-    #[error("GUARD ABORT: affected-PK-set drift between dry_run and apply for `{relation}` (dry_run={dry_run}, apply={apply_time})")]
+    #[error(
+        "GUARD ABORT: affected-PK-set drift between dry_run and apply for `{relation}` (dry_run={dry_run}, apply={apply_time})"
+    )]
     DriftAbort {
         /// The relation whose affected-PK set drifted.
         relation: String,

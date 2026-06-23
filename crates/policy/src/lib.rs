@@ -42,8 +42,8 @@ pub use config::{
 };
 pub use grant::{GrantBinding, GrantError, GrantToken, InMemoryNonceStore, NonceStore};
 pub use intent::{
-    parse_intent_annotation, statement_class, IntentAnnotation, IntentTiers, ObservedStep, TierT0,
-    TierT1, TierT2,
+    IntentAnnotation, IntentTiers, ObservedStep, TierT0, TierT1, TierT2, parse_intent_annotation,
+    statement_class,
 };
 pub use risk::{AllowStub, MeasuredStats, RiskEngine, RiskInput, RiskVerdict, StubRiskEngine};
 pub use verdict::Verdict;

@@ -238,7 +238,7 @@ impl std::fmt::Debug for LocalKms {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::{LocalSecretStore, SecretStore, AUDIT_SIGNING_KEY_ID};
+    use crate::secret::{AUDIT_SIGNING_KEY_ID, LocalSecretStore, SecretStore};
 
     fn store_with_key() -> LocalSecretStore {
         let mut s = LocalSecretStore::new();

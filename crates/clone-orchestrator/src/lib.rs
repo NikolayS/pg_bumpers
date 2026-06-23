@@ -70,32 +70,32 @@ pub mod provider;
 pub mod revert;
 
 pub use apply::{
-    guarded_apply, statement_timeout_ms, AppliedWrite, ApplyConn, ApplyError, CapturedRow,
-    ForwardResult, PitrConfig, RecoveryFence, RelationChange, MIN_STATEMENT_TIMEOUT_MS,
-    STATEMENT_TIMEOUT_MULTIPLIER,
+    AppliedWrite, ApplyConn, ApplyError, CapturedRow, ForwardResult, MIN_STATEMENT_TIMEOUT_MS,
+    PitrConfig, RecoveryFence, RelationChange, STATEMENT_TIMEOUT_MULTIPLIER, guarded_apply,
+    statement_timeout_ms,
 };
 pub use apply_grant::{
-    guarded_apply_with_grant, BridgedApplyConfig, GrantedApplyError, LiveRequest,
+    BridgedApplyConfig, GrantedApplyError, LiveRequest, guarded_apply_with_grant,
 };
 #[cfg(feature = "pg")]
 pub use conn::{PgApplyConn, PgRehearsal, PgRevertConn};
 pub use dry_run::{
-    classify, dry_run, AffectedTable, DryRunError, Measurement, Rehearsal, RelationEffect,
-    WriteKind,
+    AffectedTable, DryRunError, Measurement, Rehearsal, RelationEffect, WriteKind, classify,
+    dry_run,
 };
 pub use predicate::{
-    predicate_volatile_reason, FunctionVolatility, NoFunctionVolatility, VolatileReason,
-    Volatility, NONDETERMINISTIC_KEYWORDS,
+    FunctionVolatility, NONDETERMINISTIC_KEYWORDS, NoFunctionVolatility, VolatileReason,
+    Volatility, predicate_volatile_reason,
 };
-pub use proposal::{propose, propose_with_ttl, Proposal, DEFAULT_TTL_MILLIS};
+pub use proposal::{DEFAULT_TTL_MILLIS, Proposal, propose, propose_with_ttl};
 pub use provider::{
-    check_parity, reap_orphans, reap_orphans_with_sweep, with_clone, write_owner_marker,
     CloneError, CloneGovernance, CloneHandle, CloneLedger, CloneProvider, ColumnGrant,
     DataClassification, DblabProvider, LedgerEntry, LocalCloneConfig, LocalCloneProvider,
-    NoneProvider, OrphanAlarm, OwnerIdentity, ParityReport, PrimaryRef, ProviderKind, ReapOutcome,
-    RlsPolicy, OWNER_MARKER,
+    NoneProvider, OWNER_MARKER, OrphanAlarm, OwnerIdentity, ParityReport, PrimaryRef, ProviderKind,
+    ReapOutcome, RlsPolicy, check_parity, reap_orphans, reap_orphans_with_sweep, with_clone,
+    write_owner_marker,
 };
-pub use revert::{revert, RevertConn, RevertError, RevertReport, RevertRow};
+pub use revert::{RevertConn, RevertError, RevertReport, RevertRow, revert};
 
 /// The outcome of comparing the dry-run affected-PK set against the apply-time set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

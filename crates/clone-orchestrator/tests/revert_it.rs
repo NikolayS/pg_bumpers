@@ -34,9 +34,9 @@ use common::{base_pgurl, create_seeded_db, drop_db, it_enabled};
 use pgb_clone_orchestrator::apply::{
     ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationChange,
 };
-use pgb_clone_orchestrator::revert::{revert, RevertConn, RevertError, RevertRow};
-use pgb_clone_orchestrator::{guarded_apply, PitrConfig, WriteKind};
-use pgb_core::inverse::{certify, ImageValue, Operation};
+use pgb_clone_orchestrator::revert::{RevertConn, RevertError, RevertRow, revert};
+use pgb_clone_orchestrator::{PitrConfig, WriteKind, guarded_apply};
+use pgb_core::inverse::{ImageValue, Operation, certify};
 use pgb_core::{
     BlastRadius, InverseKind, NoopBarrier, NotRestored, OpCounts, PkChecksum, PkSetBuilder,
     PkTuple, PkValue, RefusedOp, SystemClock,
@@ -336,29 +336,27 @@ impl ApplyConn for PgApplyConn<'_> {
         Ok(())
     }
     fn recompute_pk_checksum(&mut self, relation: &str) -> Result<PkChecksum, ApplyError> {
-        if let Some(c) = self.cascade.clone() {
-            if c.relation == relation {
-                let rows = self
-                    .client
-                    .query(
-                        &format!(
-                            "SELECT account_id, line_no FROM {} WHERE {} ORDER BY account_id, line_no",
-                            c.relation, c.where_sql
-                        ),
-                        &[],
-                    )
+        if let Some(c) = self.cascade.clone()
+            && c.relation == relation
+        {
+            let rows = self
+                .client
+                .query(
+                    &format!(
+                        "SELECT account_id, line_no FROM {} WHERE {} ORDER BY account_id, line_no",
+                        c.relation, c.where_sql
+                    ),
+                    &[],
+                )
+                .map_err(|e| ApplyError::Backend(e.to_string()))?;
+            let mut b = PkSetBuilder::for_relation(relation);
+            for row in &rows {
+                let a: i32 = row.get(0);
+                let l: i32 = row.get(1);
+                b.push(PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap())
                     .map_err(|e| ApplyError::Backend(e.to_string()))?;
-                let mut b = PkSetBuilder::for_relation(relation);
-                for row in &rows {
-                    let a: i32 = row.get(0);
-                    let l: i32 = row.get(1);
-                    b.push(
-                        PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)]).unwrap(),
-                    )
-                    .map_err(|e| ApplyError::Backend(e.to_string()))?;
-                }
-                return b.finalize().map_err(|e| ApplyError::Backend(e.to_string()));
             }
+            return b.finalize().map_err(|e| ApplyError::Backend(e.to_string()));
         }
         let rows = self
             .client
@@ -386,38 +384,38 @@ impl ApplyConn for PgApplyConn<'_> {
     ) -> Result<ForwardResult, ApplyError> {
         let mut cascade_preimages: BTreeMap<String, Vec<CapturedRow>> = BTreeMap::new();
         for rel in cascade_relations {
-            if let Some(c) = self.cascade.clone() {
-                if &c.relation == rel {
-                    let rows = self
-                        .client
-                        .query(
-                            &format!(
-                                "SELECT account_id, line_no, memo, amount FROM {} WHERE {} \
-                                 ORDER BY account_id, line_no FOR UPDATE",
-                                c.relation, c.where_sql
-                            ),
-                            &[],
-                        )
-                        .map_err(|e| ApplyError::Backend(e.to_string()))?;
-                    let mut captured = Vec::with_capacity(rows.len());
-                    for row in &rows {
-                        let a: i32 = row.get(0);
-                        let l: i32 = row.get(1);
-                        let memo: String = row.get(2);
-                        let amount: i64 = row.get(3);
-                        captured.push(CapturedRow {
-                            pk: PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)])
-                                .unwrap(),
-                            before_image: vec![
-                                ("account_id".into(), PkValue::Int(a as i64)),
-                                ("line_no".into(), PkValue::Int(l as i64)),
-                                ("memo".into(), PkValue::Text(memo)),
-                                ("amount".into(), PkValue::Int(amount)),
-                            ],
-                        });
-                    }
-                    cascade_preimages.insert(rel.clone(), captured);
+            if let Some(c) = self.cascade.clone()
+                && &c.relation == rel
+            {
+                let rows = self
+                    .client
+                    .query(
+                        &format!(
+                            "SELECT account_id, line_no, memo, amount FROM {} WHERE {} \
+                             ORDER BY account_id, line_no FOR UPDATE",
+                            c.relation, c.where_sql
+                        ),
+                        &[],
+                    )
+                    .map_err(|e| ApplyError::Backend(e.to_string()))?;
+                let mut captured = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let a: i32 = row.get(0);
+                    let l: i32 = row.get(1);
+                    let memo: String = row.get(2);
+                    let amount: i64 = row.get(3);
+                    captured.push(CapturedRow {
+                        pk: PkTuple::new(vec![PkValue::Int(a as i64), PkValue::Int(l as i64)])
+                            .unwrap(),
+                        before_image: vec![
+                            ("account_id".into(), PkValue::Int(a as i64)),
+                            ("line_no".into(), PkValue::Int(l as i64)),
+                            ("memo".into(), PkValue::Text(memo)),
+                            ("amount".into(), PkValue::Int(amount)),
+                        ],
+                    });
                 }
+                cascade_preimages.insert(rel.clone(), captured);
             }
         }
         let preimage_rows = self
@@ -566,8 +564,8 @@ fn grant_for_forward(
     kind: WriteKind,
     duration_ms: u64,
 ) -> BlastRadius {
-    use pgb_core::blast_radius::Affected;
     use pgb_core::LockMode;
+    use pgb_core::blast_radius::Affected;
 
     let target_cs = grant_checksum(url, where_sql);
     let mut c = Client::connect(url, NoTls).unwrap();

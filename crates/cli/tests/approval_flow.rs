@@ -34,8 +34,8 @@ use pgb_cli::{
     HttpWebhookSender, InMemoryNonceStore, Principal, Proposal, RecordingWebhookSender, RequestId,
     WebhookSender,
 };
-use pgb_core::inverse::Operation;
 use pgb_core::MockClock;
+use pgb_core::inverse::Operation;
 
 // ----------------------------------------------------------------------------
 // Fixtures
@@ -537,9 +537,10 @@ fn a_request_can_only_be_approved_once() {
     .unwrap();
 
     let human = Principal::approver("human-alice");
-    assert!(flow
-        .approve(&id, &human, &sk, "nonce-a", 30_000, &clock)
-        .is_ok());
+    assert!(
+        flow.approve(&id, &human, &sk, "nonce-a", 30_000, &clock)
+            .is_ok()
+    );
     // A second approval of the same request is refused (single-use ticket).
     let err = flow
         .approve(&id, &human, &sk, "nonce-b", 30_000, &clock)

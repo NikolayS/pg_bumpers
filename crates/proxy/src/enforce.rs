@@ -19,8 +19,8 @@
 //!    the un-foolable backstop — but the proxy still gates on it and audits.
 
 use pgb_pgwire::{
-    classify_frontend_tag, classify_with_reason, Classification, FrontendMessage, NotReadReason,
-    RejectReason,
+    Classification, FrontendMessage, NotReadReason, RejectReason, classify_frontend_tag,
+    classify_with_reason,
 };
 
 /// The gate's verdict for one frontend frame.

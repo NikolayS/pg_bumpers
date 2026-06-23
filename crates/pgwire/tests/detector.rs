@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use pgb_pgwire::codec::RawFrame;
 use pgb_pgwire::detector::{
-    backend_starts_copy, classify_frontend_frame, classify_frontend_tag, RejectReason,
+    RejectReason, backend_starts_copy, classify_frontend_frame, classify_frontend_tag,
 };
 use pgb_pgwire::frontend::{FrontendMessage, TargetKind};
 

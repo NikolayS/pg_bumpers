@@ -36,14 +36,15 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::VerifyingKey;
 use postgres::{Client, NoTls};
 
+use pgb_applyd::Service;
 use pgb_applyd::protocol::{
     ApplyParams, ApproveParams, AuditRecordWire, DryRunParams, ErrorCode, GetAuditParams,
-    GetAuditResult, Method, ProposeParams, Request, RequestElevationParams, Response, RpcError,
-    INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION, METHOD_NOT_FOUND_CODE,
+    GetAuditResult, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, JSONRPC_VERSION,
+    METHOD_NOT_FOUND_CODE, Method, ProposeParams, Request, RequestElevationParams, Response,
+    RpcError,
 };
-use pgb_applyd::Service;
 use pgb_audit::{
-    AnchorRole, AuditBoot, LocalSecretStore, SecretStore, SharedSink, AUDIT_SIGNING_KEY_ID,
+    AUDIT_SIGNING_KEY_ID, AnchorRole, AuditBoot, LocalSecretStore, SecretStore, SharedSink,
 };
 use pgb_cli::{ApprovalFlow, InMemoryNonceStore, RecordingWebhookSender};
 use pgb_clone_orchestrator::{PgApplyConn, PgRehearsal};
@@ -143,7 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bind the Unix socket (dir 0700, socket 0600 — owner-only, NOT agent-reachable).
     let listener = bind_socket(&socket_path)?;
-    eprintln!("pgb-applyd: listening on unix:{socket_path} (write-path daemon; reads go through the proxy)");
+    eprintln!(
+        "pgb-applyd: listening on unix:{socket_path} (write-path daemon; reads go through the proxy)"
+    );
 
     // The shared state behind ONE mutex: the service (proposals/grants/nonces/
     // audit) + the two resident PG18 connections. A thread per connection serves
@@ -255,7 +258,7 @@ fn dispatch_line(line: &str, service: &mut Svc, backends: &mut Backends) -> Resp
                         retryable: false,
                     },
                 },
-            )
+            );
         }
     };
     let id = req.id.clone();
@@ -324,7 +327,7 @@ fn dispatch_line(line: &str, service: &mut Svc, backends: &mut Backends) -> Resp
                     return Response::err(
                         id,
                         ErrorCode::GrantRejected.error(format!("bad signing key: {e}")),
-                    )
+                    );
                 }
             };
             to_response(

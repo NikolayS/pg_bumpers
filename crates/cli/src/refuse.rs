@@ -21,7 +21,7 @@
 //! Reusing `core::certify` (rather than re-encoding the list here) means the CLI
 //! can never drift from the rest of the system about what is irreversible.
 
-use pgb_core::inverse::{certify, Operation};
+use pgb_core::inverse::{Operation, certify};
 use pgb_core::{CertifiedAction, RefusedOp};
 
 /// Whether a blocked op may be routed to the approval flow at all (SPEC §14.2 /

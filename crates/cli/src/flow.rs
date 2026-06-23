@@ -29,7 +29,7 @@ use pgb_core::Clock;
 use pgb_policy::{GrantBinding, GrantError, GrantToken, NonceStore};
 
 use crate::principal::{ApprovalAuthority, AuthorityError, Principal};
-use crate::refuse::{gate_for_elevation, ElevationEligibility};
+use crate::refuse::{ElevationEligibility, gate_for_elevation};
 use crate::request::{ApprovalRequired, Proposal, RequestError, RequestId, RequestStatus};
 use crate::webhook::{WebhookError, WebhookPayload, WebhookSender};
 

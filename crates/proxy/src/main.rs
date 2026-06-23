@@ -54,11 +54,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pgb_audit::{AnchorRole, AuditBoot, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID};
+use pgb_audit::{AUDIT_SIGNING_KEY_ID, AnchorRole, AuditBoot, LocalSecretStore, SecretStore, Sink};
 use pgb_core::{Clock, SystemClock};
 use pgb_policy::PolicyConfig;
 use pgb_proxy::config::{BackendTarget, TlsConfig};
-use pgb_proxy::{serve_connection, ProxyConfig, Recorder};
+use pgb_proxy::{ProxyConfig, Recorder, serve_connection};
 use tokio::net::TcpListener;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -227,10 +227,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 let now = clock.monotonic_millis();
-                if let Ok(mut b) = boot.lock() {
-                    if let Err(e) = b.maybe_anchor(now) {
-                        eprintln!("pgb-proxy: audit anchor tick failed: {e}");
-                    }
+                if let Ok(mut b) = boot.lock()
+                    && let Err(e) = b.maybe_anchor(now)
+                {
+                    eprintln!("pgb-proxy: audit anchor tick failed: {e}");
                 }
             }
         });

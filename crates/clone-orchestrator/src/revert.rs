@@ -264,7 +264,7 @@ fn route_rows(inverse: &InversePlan) -> Result<BTreeMap<String, Vec<RevertRow>>,
                         return Err(RevertError::MalformedRow {
                             relation: inverse.relation.clone(),
                             detail: format!("__relation stamp is not text: {other:?}"),
-                        })
+                        });
                     }
                 }
             } else {

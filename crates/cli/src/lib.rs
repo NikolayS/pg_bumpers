@@ -38,15 +38,15 @@ pub mod webhook;
 
 pub use flow::{ApprovalFlow, ApprovalOutcome, ApproveError, ElevationError, ElevationOutcome};
 pub use principal::{ApprovalAuthority, AuthorityError, Principal, PrincipalKind};
-pub use refuse::{gate_for_elevation, ElevationEligibility, REFUSED_CODE};
+pub use refuse::{ElevationEligibility, REFUSED_CODE, gate_for_elevation};
 pub use request::{
-    ApprovalRequest, ApprovalRequired, ApprovalStore, Proposal, RequestError, RequestId,
-    RequestStatus, APPROVAL_REQUIRED_CODE,
+    APPROVAL_REQUIRED_CODE, ApprovalRequest, ApprovalRequired, ApprovalStore, Proposal,
+    RequestError, RequestId, RequestStatus,
 };
-pub use verify::{verify_meta_chain, ChainSummary};
+pub use verify::{ChainSummary, verify_meta_chain};
 pub use webhook::{
-    HttpWebhookSender, RecordingWebhookSender, WebhookError, WebhookPayload, WebhookSender,
-    WEBHOOK_EVENT,
+    HttpWebhookSender, RecordingWebhookSender, WEBHOOK_EVENT, WebhookError, WebhookPayload,
+    WebhookSender,
 };
 
 // Re-export the reused grant primitives so callers (and the binary) get them

@@ -42,7 +42,7 @@ use pgb_core::{ApplyBarrier, BlastRadius, Clock};
 use pgb_policy::{GrantBinding, GrantError, GrantToken, NonceStore, PolicyConfig};
 
 use crate::apply::{
-    guarded_apply, AppliedWrite, ApplyConn, ApplyError, PitrConfig as ApplyPitrConfig,
+    AppliedWrite, ApplyConn, ApplyError, PitrConfig as ApplyPitrConfig, guarded_apply,
 };
 use crate::dry_run::WriteKind;
 use crate::provider::ProviderKind;

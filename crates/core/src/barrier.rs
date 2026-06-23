@@ -111,8 +111,8 @@ impl ApplyBarrier for ClosureBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn noop_barrier_does_nothing_and_is_a_zst() {

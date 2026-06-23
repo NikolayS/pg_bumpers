@@ -160,9 +160,10 @@ impl ErrorCode {
     /// The default remedy line + retryability for this code.
     fn remedy(self) -> (&'static str, bool) {
         match self {
-            ErrorCode::ProposalNotFound => {
-                ("call propose again to mint a fresh proposal, then dry_run", false)
-            }
+            ErrorCode::ProposalNotFound => (
+                "call propose again to mint a fresh proposal, then dry_run",
+                false,
+            ),
             ErrorCode::Volatile => (
                 "rewrite the predicate without volatile/non-deterministic functions",
                 false,

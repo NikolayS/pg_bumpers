@@ -38,13 +38,12 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::cluster::{pg_bin, scratch_root, Primary, GOV_SEED_SQL};
 use common::PgRehearsal;
+use common::cluster::{GOV_SEED_SQL, Primary, pg_bin, scratch_root};
 use pgb_clone_orchestrator::provider::local::{LocalCloneConfig, LocalCloneProvider, PrimaryRef};
 use pgb_clone_orchestrator::{
-    check_parity, dry_run, propose, reap_orphans, reap_orphans_with_sweep, with_clone,
-    write_owner_marker, CloneError, CloneLedger, ColumnGrant, OwnerIdentity, ProviderKind,
-    RlsPolicy,
+    CloneError, CloneLedger, ColumnGrant, OwnerIdentity, ProviderKind, RlsPolicy, check_parity,
+    dry_run, propose, reap_orphans, reap_orphans_with_sweep, with_clone, write_owner_marker,
 };
 use pgb_core::SystemClock;
 use postgres::{Client, NoTls};
@@ -150,10 +149,11 @@ fn marquee_rehearses_on_clone_with_zero_primary_impact() {
     assert_eq!(br.affected.total_rows, 8);
     let checksum = &br.affected.pk_set_checksum["public.accounts"];
     assert!(checksum.starts_with("sha256:"));
-    assert!(br
-        .triggers_fired
-        .iter()
-        .any(|t| t.name == "accounts_audit_aud"));
+    assert!(
+        br.triggers_fired
+            .iter()
+            .any(|t| t.name == "accounts_audit_aud")
+    );
     assert!(br.reversible);
 
     // (2) THE MOAT — the PRIMARY is byte-identical before/after, AND the same

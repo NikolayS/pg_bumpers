@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use pgb_audit::{verify_chain, AuditRecord, ChainBreak};
+use pgb_audit::{AuditRecord, ChainBreak, verify_chain};
 
 /// A read-only summary of a verified `_meta` chain (the `verify` command output).
 #[derive(Debug, Clone, PartialEq, Eq)]

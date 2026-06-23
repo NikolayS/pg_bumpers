@@ -22,8 +22,8 @@
 #![cfg(feature = "pg")]
 
 use pgb_audit::{
-    AnchorRole, AuditBoot, Decision, LocalSecretStore, NewEntry, Principal, SecretStore,
-    SharedSink, Sink, AUDIT_SIGNING_KEY_ID,
+    AUDIT_SIGNING_KEY_ID, AnchorRole, AuditBoot, Decision, LocalSecretStore, NewEntry, Principal,
+    SecretStore, SharedSink, Sink,
 };
 use pgb_core::{Clock, SystemClock};
 use pgb_policy::IntentTiers;

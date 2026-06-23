@@ -41,8 +41,8 @@ use pgb_cli::webhook::WebhookSender;
 use pgb_cli::{ApprovalFlow, NonceStore, Principal, RequestId};
 use pgb_clone_orchestrator::apply::ApplyConn;
 use pgb_clone_orchestrator::{
-    classify, dry_run, guarded_apply_with_grant, propose, ApplyError, DryRunError,
-    GrantedApplyError, LiveRequest, Proposal, Rehearsal, WriteKind,
+    ApplyError, DryRunError, GrantedApplyError, LiveRequest, Proposal, Rehearsal, WriteKind,
+    classify, dry_run, guarded_apply_with_grant, propose,
 };
 use pgb_core::{ApplyBarrier, BlastRadius, Clock};
 use pgb_policy::{GrantError, GrantToken, PolicyConfig};
@@ -423,11 +423,12 @@ impl<W: WebhookSender, NA: NonceStore, NF: NonceStore> Service<W, NA, NF> {
                 dry.total_rows
             )));
         }
-        if let Some(token) = confirm_token {
-            if token != dry.confirm_token {
-                return Err(ErrorCode::ConfirmMismatch
-                    .error("confirm_token does not match the dry-run token"));
-            }
+        if let Some(token) = confirm_token
+            && token != dry.confirm_token
+        {
+            return Err(
+                ErrorCode::ConfirmMismatch.error("confirm_token does not match the dry-run token")
+            );
         }
 
         // (3) a grant must exist (else the apply is blocked pending approval).

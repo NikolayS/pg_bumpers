@@ -54,7 +54,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::ledger::{write_owner_marker, CloneLedger, LedgerEntry, OwnerIdentity};
+use super::ledger::{CloneLedger, LedgerEntry, OwnerIdentity, write_owner_marker};
 use super::{
     CloneError, CloneGovernance, CloneHandle, CloneProvider, DataClassification, ProviderKind,
 };

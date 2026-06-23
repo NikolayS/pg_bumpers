@@ -54,14 +54,14 @@ use std::sync::{Arc, Mutex};
 
 use postgres::{Client, NoTls};
 
+use crate::WormAnchor;
 use crate::anchor::{
-    verify_records_against_anchor_with, AnchorError, AnchorVerification, Anchorer,
+    AnchorError, AnchorVerification, Anchorer, verify_records_against_anchor_with,
 };
 use crate::kms::LocalKms;
 use crate::pg::PgSink;
-use crate::secret::{SecretStore, AUDIT_SIGNING_KEY_ID};
+use crate::secret::{AUDIT_SIGNING_KEY_ID, SecretStore};
 use crate::sink::{SharedSink, Sink, SinkError};
-use crate::WormAnchor;
 
 /// Why the audit boot wiring failed. Every variant is **fail-closed** — a boot
 /// error means the consumer must refuse to start (the audit chain is the
@@ -661,22 +661,25 @@ mod tests {
             .unwrap();
 
         // t=0 first tick anchors.
-        assert!(boot
-            .maybe_anchor(clock.monotonic_millis())
-            .unwrap()
-            .is_some());
+        assert!(
+            boot.maybe_anchor(clock.monotonic_millis())
+                .unwrap()
+                .is_some()
+        );
         // t=500 not due.
         clock.advance(500);
-        assert!(boot
-            .maybe_anchor(clock.monotonic_millis())
-            .unwrap()
-            .is_none());
+        assert!(
+            boot.maybe_anchor(clock.monotonic_millis())
+                .unwrap()
+                .is_none()
+        );
         // t=1000 due again.
         clock.advance(500);
-        assert!(boot
-            .maybe_anchor(clock.monotonic_millis())
-            .unwrap()
-            .is_some());
+        assert!(
+            boot.maybe_anchor(clock.monotonic_millis())
+                .unwrap()
+                .is_some()
+        );
     }
 
     // -----------------------------------------------------------------------

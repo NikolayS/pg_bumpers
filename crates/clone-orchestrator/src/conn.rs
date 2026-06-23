@@ -37,10 +37,10 @@ use pgb_core::blast_radius::{ConstraintViolation, OpCounts};
 use pgb_core::inverse::ImageValue;
 use pgb_core::{Clock, LockHeld, LockMode, PkSetBuilder, PkTuple, PkValue, TriggerFired};
 
+use crate::Volatility;
 use crate::apply::{ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationChange};
 use crate::dry_run::{AffectedTable, Measurement, Rehearsal, RelationEffect, WriteKind};
 use crate::revert::{RevertConn, RevertError, RevertRow};
-use crate::Volatility;
 
 /// The primary-key shape of a target relation, for the S5 #75 apply-shape gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +224,7 @@ impl<C: Clock> Rehearsal for PgRehearsal<'_, C> {
             Err(e) => {
                 return Some(format!(
                     "could not resolve PK shape of `{target_relation}`: {e}"
-                ))
+                ));
             }
         }
 

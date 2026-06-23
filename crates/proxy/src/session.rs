@@ -28,8 +28,8 @@ use pgb_pgwire::scram::{
     SaslResponse,
 };
 use pgb_pgwire::{
-    read_startup_body, read_tagged_frame, write_frame, FrontendMessage, RawFrame, SslRequest,
-    StartupMessage,
+    FrontendMessage, RawFrame, SslRequest, StartupMessage, read_startup_body, read_tagged_frame,
+    write_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,7 +39,7 @@ use crate::budget::{Budget, BudgetOutcome};
 use crate::config::{BackendTarget, ProxyConfig};
 use crate::enforce::{Enforcement, GateDecision};
 use crate::explain::{
-    explain_wrap, EstimateDecision, ExplainCeiling, ExplainGate, EXPLAIN_FAIL_CLOSED_CODE,
+    EXPLAIN_FAIL_CLOSED_CODE, EstimateDecision, ExplainCeiling, ExplainGate, explain_wrap,
 };
 use crate::recorder::Recorder;
 use crate::window::{WindowMeter, WindowOutcome};
@@ -536,10 +536,9 @@ async fn run_explain_on_backend(
             b'D' if first_line.is_none() && explain_error.is_none() => {
                 if let Ok(BackendMessage::DataRow { columns }) =
                     BackendMessage::decode(b'D', frame.body.clone())
+                    && let Some(Some(bytes)) = columns.into_iter().next()
                 {
-                    if let Some(Some(bytes)) = columns.into_iter().next() {
-                        first_line = Some(String::from_utf8_lossy(&bytes).into_owned());
-                    }
+                    first_line = Some(String::from_utf8_lossy(&bytes).into_owned());
                 }
             }
             // An ErrorResponse means EXPLAIN failed → fail-closed for the caller.

@@ -18,12 +18,12 @@ use std::process::ExitCode;
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 
-use pgb_audit::{AuditBoot, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID};
+use pgb_audit::{AUDIT_SIGNING_KEY_ID, AuditBoot, LocalSecretStore, SecretStore, Sink};
 use pgb_cli::{
-    verify_meta_chain, ApprovalFlow, InMemoryNonceStore, Principal, Proposal,
-    RecordingWebhookSender, RequestId,
+    ApprovalFlow, InMemoryNonceStore, Principal, Proposal, RecordingWebhookSender, RequestId,
+    verify_meta_chain,
 };
-use pgb_core::{inverse::Operation, Clock, SystemClock};
+use pgb_core::{Clock, SystemClock, inverse::Operation};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();

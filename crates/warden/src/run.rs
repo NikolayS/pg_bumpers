@@ -462,7 +462,7 @@ mod pg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgb_audit::{verify_chain, InMemorySink};
+    use pgb_audit::{InMemorySink, verify_chain};
     use pgb_core::MockClock;
 
     fn outcome(
@@ -618,7 +618,7 @@ mod tests {
         // Drive a real WardenLoop over scripted seams into an InMemorySink and
         // assert the actions land on a verifiable chain (the DB-free analogue of
         // the env-gated _meta IT: same Sink API, same records).
-        use crate::model::{Backend, Observation, ReplicationSlot, AGENT_ROLE, PROXY_APP_NAME};
+        use crate::model::{AGENT_ROLE, Backend, Observation, PROXY_APP_NAME, ReplicationSlot};
 
         struct OneShot(Option<Observation>);
         impl ActivitySource for OneShot {

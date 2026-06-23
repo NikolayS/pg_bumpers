@@ -49,11 +49,11 @@ pub mod local;
 pub mod parity;
 
 pub use ledger::{
-    reap_orphans, reap_orphans_with_sweep, write_owner_marker, CloneLedger, LedgerEntry,
-    OrphanAlarm, OwnerIdentity, ReapOutcome, OWNER_MARKER,
+    CloneLedger, LedgerEntry, OWNER_MARKER, OrphanAlarm, OwnerIdentity, ReapOutcome, reap_orphans,
+    reap_orphans_with_sweep, write_owner_marker,
 };
 pub use local::{LocalCloneConfig, LocalCloneProvider, PrimaryRef};
-pub use parity::{check_parity, ColumnGrant, ParityReport, RlsPolicy};
+pub use parity::{ColumnGrant, ParityReport, RlsPolicy, check_parity};
 
 /// Which clone provider backs the rehearsal (SPEC §12.2 `clone.provider`, plus
 /// the founder-approved `local` pivot used for the MVP moat demo).

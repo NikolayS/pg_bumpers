@@ -32,6 +32,6 @@ pub mod protocol;
 pub mod service;
 
 pub use protocol::{
-    AuditRecordWire, BlockData, ErrorCode, Method, Request, Response, RpcError, JSONRPC_VERSION,
+    AuditRecordWire, BlockData, ErrorCode, JSONRPC_VERSION, Method, Request, Response, RpcError,
 };
-pub use service::{Service, DEFAULT_REQUEST_TTL_MILLIS};
+pub use service::{DEFAULT_REQUEST_TTL_MILLIS, Service};

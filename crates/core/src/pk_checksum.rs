@@ -161,7 +161,9 @@ pub enum ChecksumError {
     /// rows cannot be safely identified across the dry-run/apply boundary.
     /// **Refuse the write** — do not fall back to `ctid` (unsafe: `ctid`
     /// changes on `VACUUM`/`UPDATE`).
-    #[error("refused: relation `{relation}` has no usable primary key / replica identity; writes to PK-less tables are refused (no ctid fallback)")]
+    #[error(
+        "refused: relation `{relation}` has no usable primary key / replica identity; writes to PK-less tables are refused (no ctid fallback)"
+    )]
     Refused {
         /// `schema.table` that was refused.
         relation: String,

@@ -72,7 +72,7 @@ Architecture is **four layers plus one blocking network boundary** (SPEC §3). T
 
 ## 2. The crate map (as built)
 
-A Cargo workspace (root [`Cargo.toml`](../Cargo.toml), resolver 2, edition 2021, rust 1.90, Apache-2.0). All crates are `publish = false`. The MCP server is a separate pnpm/TS package under [`mcp/server`](../mcp/server); `proto/` is a placeholder.
+A Cargo workspace (root [`Cargo.toml`](../Cargo.toml), resolver 2, edition 2024, rust 1.90, Apache-2.0). All crates are `publish = false`. The MCP server is a separate pnpm/TS package under [`mcp/server`](../mcp/server); `proto/` is a placeholder.
 
 ```
 crates/

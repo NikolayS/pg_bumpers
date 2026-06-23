@@ -19,11 +19,11 @@
 //! clock). The env-gated PG18 path lives in `tests/pg_meta_it.rs`.
 
 use pgb_audit::anchor::{
-    verify_against_anchor, verify_against_anchor_with, AnchorError, AnchorVerification, Anchorer,
-    WormAnchor, WormAnchorError,
+    AnchorError, AnchorVerification, Anchorer, WormAnchor, WormAnchorError, verify_against_anchor,
+    verify_against_anchor_with,
 };
 use pgb_audit::kms::{Kms, KmsError, LocalKms, OPERATOR_PRINCIPAL};
-use pgb_audit::secret::{LocalSecretStore, SecretError, SecretStore, AUDIT_SIGNING_KEY_ID};
+use pgb_audit::secret::{AUDIT_SIGNING_KEY_ID, LocalSecretStore, SecretError, SecretStore};
 use pgb_audit::{AuditChain, Decision, NewEntry, Principal};
 use pgb_core::{Clock, MockClock};
 use pgb_policy::IntentTiers;

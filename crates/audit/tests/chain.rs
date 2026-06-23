@@ -8,8 +8,8 @@
 //!   * rejects (blocked/rejected statements) are recorded as rows.
 
 use pgb_audit::{
-    verify_chain, AuditChain, ChainBreak, Decision, InMemorySink, NewEntry, Principal, Sink,
-    GENESIS_PREV_HASH,
+    AuditChain, ChainBreak, Decision, GENESIS_PREV_HASH, InMemorySink, NewEntry, Principal, Sink,
+    verify_chain,
 };
 use pgb_core::{Clock, MockClock};
 use pgb_policy::IntentTiers;

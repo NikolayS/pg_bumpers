@@ -17,7 +17,7 @@
 use postgres::Client;
 
 use crate::chain::NewEntry;
-use crate::record::{AuditPayload, AuditRecord, Hash, GENESIS_PREV_HASH};
+use crate::record::{AuditPayload, AuditRecord, GENESIS_PREV_HASH, Hash};
 use crate::sink::{Sink, SinkError};
 
 /// The fully-qualified audit table name.

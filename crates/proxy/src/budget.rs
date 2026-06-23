@@ -191,7 +191,7 @@ mod tests {
         let mut b = Budget::new(100, 1_000_000);
         assert!(matches!(b.charge_row(60), BudgetOutcome::Within { .. }));
         assert!(matches!(b.charge_row(40), BudgetOutcome::Within { .. })); // exactly at cap
-                                                                           // One more byte over the cap → refused.
+        // One more byte over the cap → refused.
         assert_eq!(
             b.charge_row(1),
             BudgetOutcome::Exceeded {

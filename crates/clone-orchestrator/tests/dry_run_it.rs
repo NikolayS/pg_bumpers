@@ -28,10 +28,10 @@
 mod common;
 
 use common::{
-    account_balances, base_pgurl, create_seeded_db, current_wal_lsn, drop_db, it_enabled,
-    row_count, staleness_lsn_bytes, PgRehearsal,
+    PgRehearsal, account_balances, base_pgurl, create_seeded_db, current_wal_lsn, drop_db,
+    it_enabled, row_count, staleness_lsn_bytes,
 };
-use pgb_clone_orchestrator::{dry_run, propose, DryRunError};
+use pgb_clone_orchestrator::{DryRunError, dry_run, propose};
 use pgb_core::{BlastRadius, LockMode, SystemClock};
 
 /// Skip-guard: returns `None` (printing why) when the IT gate is unset so the

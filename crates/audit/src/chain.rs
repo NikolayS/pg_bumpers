@@ -15,7 +15,7 @@
 //! [`verify_chain`] returns the **first** broken link as a [`ChainBreak`], so a
 //! caller (and a test) learns exactly where the chain was attacked.
 
-use crate::record::{AuditPayload, AuditRecord, Decision, Hash, GENESIS_PREV_HASH};
+use crate::record::{AuditPayload, AuditRecord, Decision, GENESIS_PREV_HASH, Hash};
 
 /// The first place a chain fails verification, with enough context to point at
 /// the attacked record. `index` is the position in the verified slice; `seq` is

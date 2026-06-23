@@ -32,11 +32,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use pgb_audit::{verify_chain, Decision, InMemorySink, Sink};
+use pgb_audit::{Decision, InMemorySink, Sink, verify_chain};
 use pgb_core::{Clock, MockClock};
 use pgb_policy::{RoleBudget, WindowBudget};
 use pgb_proxy::config::{BackendTarget, ProxyConfig, TlsConfig};
-use pgb_proxy::{serve_connection, Recorder};
+use pgb_proxy::{Recorder, serve_connection};
 use tokio::net::TcpListener;
 
 const AGENT_USER: &str = "pgb_agent";

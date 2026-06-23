@@ -437,10 +437,10 @@ pub fn verify_records_against_anchor_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NewEntry;
     use crate::kms::LocalKms;
     use crate::record::{Decision, Principal};
-    use crate::secret::{LocalSecretStore, SecretStore, AUDIT_SIGNING_KEY_ID};
-    use crate::NewEntry;
+    use crate::secret::{AUDIT_SIGNING_KEY_ID, LocalSecretStore, SecretStore};
     use pgb_policy::IntentTiers;
 
     fn signer() -> LocalKms {

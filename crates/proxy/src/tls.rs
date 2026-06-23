@@ -19,9 +19,9 @@
 use std::io;
 use std::sync::Arc;
 
+use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
 
 use crate::config::TlsConfig;
 

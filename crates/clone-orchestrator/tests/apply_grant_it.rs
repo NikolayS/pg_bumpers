@@ -37,8 +37,8 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 // shared with pgb-applyd) — not a test-local copy.
 use pgb_clone_orchestrator::apply::ApplyError;
 use pgb_clone_orchestrator::{
-    guarded_apply_with_grant, revert, GrantedApplyError, LiveRequest, PgApplyConn, PgRevertConn,
-    RevertReport, WriteKind,
+    GrantedApplyError, LiveRequest, PgApplyConn, PgRevertConn, RevertReport, WriteKind,
+    guarded_apply_with_grant, revert,
 };
 use pgb_core::{
     BlastRadius, Clock, InverseKind, InversePlan, MockClock, NoopBarrier, OpCounts, PkChecksum,
@@ -160,8 +160,8 @@ fn blast_radius_for(
     where_sql: &str,
     forward_sql: &str,
 ) -> BlastRadius {
-    use pgb_core::blast_radius::Affected;
     use pgb_core::LockMode;
+    use pgb_core::blast_radius::Affected;
     let cs = target_checksum(url, where_sql);
     let mut c = Client::connect(url, NoTls).expect("count connect");
     let n: i64 = c

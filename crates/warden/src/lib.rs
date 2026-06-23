@@ -58,14 +58,14 @@ pub use breaker::{
     BreakerState, CircuitBreaker, ForgeryRejected, Principal, TripReason, WardenCredential,
 };
 pub use model::{
-    tag_is_strippable_for, Backend, Observation, ReplicationSlot, AGENT_ROLE, PROXY_APP_NAME,
+    AGENT_ROLE, Backend, Observation, PROXY_APP_NAME, ReplicationSlot, tag_is_strippable_for,
 };
-pub use poller::{assess, ActivitySource, Assessment, Killer, TickOutcome, WardenLoop};
-pub use run::{
-    action_count, audit_entries_for, format_tick_log, kv_dsn, load_thresholds_fail_closed,
-    run_loop, tick_and_audit, WardenSettings, REASON_BREAKER_TRIP, REASON_SLOT_ALARM,
-    REASON_WARDEN_TERMINATE, WARDEN_AUDIT_ROLE,
-};
+pub use poller::{ActivitySource, Assessment, Killer, TickOutcome, WardenLoop, assess};
 #[cfg(feature = "pg")]
 pub use run::{PgActivitySource, PgKiller};
+pub use run::{
+    REASON_BREAKER_TRIP, REASON_SLOT_ALARM, REASON_WARDEN_TERMINATE, WARDEN_AUDIT_ROLE,
+    WardenSettings, action_count, audit_entries_for, format_tick_log, kv_dsn,
+    load_thresholds_fail_closed, run_loop, tick_and_audit,
+};
 pub use thresholds::{ThresholdError, WardenThresholds};

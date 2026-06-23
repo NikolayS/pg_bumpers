@@ -52,8 +52,8 @@ pub use budget::{Budget, BudgetOutcome};
 pub use config::ProxyConfig;
 pub use enforce::{Enforcement, GateDecision, RejectKind};
 pub use explain::{
-    explain_wrap, EstimateDecision, EstimateDim, ExplainCeiling, ExplainGate, PlanEstimate,
+    EstimateDecision, EstimateDim, ExplainCeiling, ExplainGate, PlanEstimate, explain_wrap,
 };
 pub use recorder::Recorder;
-pub use session::{serve_connection, SessionError};
+pub use session::{SessionError, serve_connection};
 pub use window::{WindowCap, WindowMeter, WindowOutcome};

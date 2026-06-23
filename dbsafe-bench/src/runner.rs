@@ -13,7 +13,7 @@
 
 use crate::corpus::{Probe, Scenario};
 use crate::floor::{
-    probe_byte_cutoff, probe_certify, probe_guarded_apply, probe_proxy_read_gate, Observed,
+    Observed, probe_byte_cutoff, probe_certify, probe_guarded_apply, probe_proxy_read_gate,
 };
 use crate::verdict::{Class, GoldenRecord, Vector, Verdict};
 

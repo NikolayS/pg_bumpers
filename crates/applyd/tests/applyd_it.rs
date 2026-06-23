@@ -33,7 +33,7 @@ use rand_core::OsRng;
 use pgb_applyd::{ErrorCode, Service};
 use pgb_audit::{InMemorySink, SharedSink};
 use pgb_cli::{ApprovalFlow, InMemoryNonceStore, RecordingWebhookSender};
-use pgb_clone_orchestrator::{revert, PgApplyConn, PgRehearsal, PgRevertConn};
+use pgb_clone_orchestrator::{PgApplyConn, PgRehearsal, PgRevertConn, revert};
 use pgb_core::{Clock, NoopBarrier, SystemClock};
 
 const FORWARD: &str = "UPDATE public.accounts SET balance = 0 WHERE id % 2 = 0";
@@ -476,11 +476,11 @@ fn socket_jsonrpc_propose_round_trip_against_the_binary() {
     // Wait for the socket to appear (the binary binds it after the audit boot).
     let mut connected = None;
     for _ in 0..100 {
-        if sock.exists() {
-            if let Ok(s) = UnixStream::connect(&sock) {
-                connected = Some(s);
-                break;
-            }
+        if sock.exists()
+            && let Ok(s) = UnixStream::connect(&sock)
+        {
+            connected = Some(s);
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

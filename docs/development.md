@@ -103,7 +103,7 @@ the same ref are auto-cancelled (concurrency group), so only push when you mean 
 
 ### Job `rust` — fmt · clippy · build · test · deny
 
-Toolchain is pinned to **Rust 1.90.0** (`rust-toolchain.toml`, edition 2021) via
+Toolchain is pinned to **Rust 1.90.0** (`rust-toolchain.toml`, edition 2024) via
 `dtolnay/rust-toolchain@1.90.0` with `rustfmt` + `clippy`. The steps, in order:
 
 | Step | Command | Gate |

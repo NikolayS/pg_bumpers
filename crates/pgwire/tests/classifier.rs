@@ -5,7 +5,7 @@
 //! (`SELECT 1; DROP SCHEMA public`) → not a single read; a parse error →
 //! not-read.
 
-use pgb_pgwire::classifier::{classify, classify_with_reason, Classification, NotReadReason};
+use pgb_pgwire::classifier::{Classification, NotReadReason, classify, classify_with_reason};
 
 fn assert_read(sql: &str) {
     assert_eq!(

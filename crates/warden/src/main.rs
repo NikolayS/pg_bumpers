@@ -43,14 +43,14 @@
 use std::sync::Arc;
 
 #[cfg(feature = "pg")]
-use pgb_audit::pg::PgSink;
-#[cfg(feature = "pg")]
 use pgb_audit::Sink;
+#[cfg(feature = "pg")]
+use pgb_audit::pg::PgSink;
 #[cfg(feature = "pg")]
 use pgb_core::{Clock, SystemClock};
 #[cfg(feature = "pg")]
 use pgb_warden::{
-    load_thresholds_fail_closed, run_loop, PgActivitySource, PgKiller, WardenLoop, WardenSettings,
+    PgActivitySource, PgKiller, WardenLoop, WardenSettings, load_thresholds_fail_closed, run_loop,
 };
 
 #[cfg(feature = "pg")]

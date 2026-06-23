@@ -181,7 +181,7 @@ docs/spec/            # SPEC.md (source of truth) + decisions.md + SPEC.amendmen
 
 ## Build & test
 
-Toolchain is pinned: **Rust 1.90.0** (edition 2021, `rust-toolchain.toml`),
+Toolchain is pinned: **Rust 1.90.0** (edition 2024, `rust-toolchain.toml`),
 **Node 22 + pnpm 11.8**. CI (`.github/workflows/ci.yml`) mirrors these on every
 push + PR.
 

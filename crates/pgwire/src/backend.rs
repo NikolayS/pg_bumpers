@@ -8,7 +8,7 @@
 use crate::buf::{BufReader, BufWriter};
 use crate::error::ProtocolError;
 use crate::scram::{
-    auth_type, AuthenticationSasl, AuthenticationSaslContinue, AuthenticationSaslFinal,
+    AuthenticationSasl, AuthenticationSaslContinue, AuthenticationSaslFinal, auth_type,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 

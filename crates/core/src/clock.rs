@@ -10,8 +10,8 @@
 //! The production [`SystemClock`] is the only place a real clock is read, and
 //! it lives behind the same trait so it can be swapped at the seam.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A logical instant, expressed as whole milliseconds.

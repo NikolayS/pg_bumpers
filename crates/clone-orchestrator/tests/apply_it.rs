@@ -33,7 +33,7 @@ use common::{base_pgurl, create_seeded_db, drop_db, it_enabled};
 use pgb_clone_orchestrator::apply::{
     ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationChange,
 };
-use pgb_clone_orchestrator::{guarded_apply, PitrConfig, RecoveryFence, WriteKind};
+use pgb_clone_orchestrator::{PitrConfig, RecoveryFence, WriteKind, guarded_apply};
 use pgb_core::inverse::ImageValue;
 use pgb_core::{
     BlastRadius, ClosureBarrier, InverseKind, NoopBarrier, OpCounts, PkChecksum, PkSetBuilder,
@@ -449,8 +449,8 @@ fn grant_for_forward(
     kind: WriteKind,
     duration_ms: u64,
 ) -> BlastRadius {
-    use pgb_core::blast_radius::Affected;
     use pgb_core::LockMode;
+    use pgb_core::blast_radius::Affected;
 
     let target_cs = grant_checksum(url, where_sql);
     let mut c = Client::connect(url, NoTls).expect("grant connect");
@@ -768,7 +768,9 @@ fn dry_run_validated_delete_commits_and_captures_insert_inverse() {
         assert_eq!(col_text(&row.before_image, "owner"), before[&id].0);
         assert_eq!(col_int(&row.before_image, "balance"), before[&id].1);
     }
-    eprintln!("[delete-commit] PASS: deleted + FULL FK-ordered INSERT inverse (parents + cascade children) captured");
+    eprintln!(
+        "[delete-commit] PASS: deleted + FULL FK-ordered INSERT inverse (parents + cascade children) captured"
+    );
 
     drop_db(&admin, &dbname);
 }
@@ -863,7 +865,9 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
                 dry_run, apply_time,
                 "{tag}: abort must be a checksum mismatch"
             );
-            eprintln!("{tag}: GUARD ABORT (apply-time PK-set drift) dry_run={dry_run} apply_time={apply_time}");
+            eprintln!(
+                "{tag}: GUARD ABORT (apply-time PK-set drift) dry_run={dry_run} apply_time={apply_time}"
+            );
         }
         other => panic!("{tag}: expected PkSetDrift ABORT, got {other:?}"),
     }
@@ -877,13 +881,13 @@ fn run_drift_case(tag: &str, inject_sql: &str) -> Option<(String, String)> {
     // balance-zeroing: every id still present whose pre-balance was non-zero is
     // still non-zero (the drift injections here never set balance=0).
     for (id, (_owner, bal)) in &after {
-        if let Some((_, pre_bal)) = before.get(id) {
-            if *pre_bal != 0 {
-                assert_ne!(
-                    *bal, 0,
-                    "{tag}: account {id} was zeroed — the aborted apply leaked a partial commit"
-                );
-            }
+        if let Some((_, pre_bal)) = before.get(id)
+            && *pre_bal != 0
+        {
+            assert_ne!(
+                *bal, 0,
+                "{tag}: account {id} was zeroed — the aborted apply leaked a partial commit"
+            );
         }
     }
     Some((admin, dbname))
@@ -1154,10 +1158,16 @@ fn t_op_type_substitution_predicted_insert_actual_delete_on_audit_aborts() {
             ..
         }) => {
             assert_eq!(relation, "public.account_audit");
-            assert_eq!(channel, "del", "the op substitution tripped the del channel");
+            assert_eq!(
+                channel, "del",
+                "the op substitution tripped the del channel"
+            );
             assert_eq!(p_ins, 4, "the prediction was 4 audit INSERTs");
             assert_eq!(p_del, 0, "the prediction had ZERO audit deletes");
-            assert!(a_del > 0, "the swapped trigger DELETEd pre-existing audit rows");
+            assert!(
+                a_del > 0,
+                "the swapped trigger DELETEd pre-existing audit rows"
+            );
             eprintln!(
                 "T-op-substitution PASS: predicted INSERT-of-4 on `public.account_audit` \
                  satisfied at apply time by a DELETE of {a_del} pre-existing rows (same total, \
@@ -1481,8 +1491,8 @@ fn grant_for_wide(
     forward_sql: &str,
     duration_ms: u64,
 ) -> BlastRadius {
-    use pgb_core::blast_radius::Affected;
     use pgb_core::LockMode;
+    use pgb_core::blast_radius::Affected;
 
     let mut c = Client::connect(url, NoTls).expect("wide grant connect");
     let rows = c

@@ -25,7 +25,7 @@ use postgres::{Client, NoTls};
 // link this module without touching these, so suppress the per-binary
 // unused-import warning.
 #[allow(unused_imports)]
-pub use pgb_clone_orchestrator::conn::{current_wal_lsn, PgRehearsal};
+pub use pgb_clone_orchestrator::conn::{PgRehearsal, current_wal_lsn};
 
 /// Env var gating the DB-touching tests (matches the S0 spike convention).
 pub const IT_ENV: &str = "PG_BUMPERS_IT";

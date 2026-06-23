@@ -25,13 +25,13 @@ use rand_core::OsRng;
 use pgb_applyd::{ErrorCode, Service};
 use pgb_audit::{InMemorySink, SharedSink};
 use pgb_cli::{ApprovalFlow, InMemoryNonceStore, RecordingWebhookSender};
+use pgb_clone_orchestrator::Volatility;
 use pgb_clone_orchestrator::apply::{
     ApplyConn, ApplyError, CapturedRow, ForwardResult, RelationChange,
 };
 use pgb_clone_orchestrator::dry_run::{
     AffectedTable, Measurement, Rehearsal, RelationEffect, WriteKind,
 };
-use pgb_clone_orchestrator::Volatility;
 use pgb_core::blast_radius::OpCounts;
 use pgb_core::{
     ApplyBarrier, Clock, LockHeld, LockMode, MockClock, NoopBarrier, PkChecksum, PkSetBuilder,

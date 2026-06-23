@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use pgb_clone_orchestrator::{
-    guarded_apply, ApplyConn, ApplyError, CapturedRow, ForwardResult, PitrConfig, RelationChange,
-    WriteKind,
+    ApplyConn, ApplyError, CapturedRow, ForwardResult, PitrConfig, RelationChange, WriteKind,
+    guarded_apply,
 };
 use pgb_core::blast_radius::Affected;
 use pgb_core::{

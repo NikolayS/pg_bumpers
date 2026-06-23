@@ -42,8 +42,8 @@ pub mod golden;
 pub mod runner;
 pub mod verdict;
 
-pub use corpus::{corpus, Probe, Scenario};
-pub use runner::{assert_coverage_floor, GateReport, ScenarioResult};
+pub use corpus::{Probe, Scenario, corpus};
+pub use runner::{GateReport, ScenarioResult, assert_coverage_floor};
 pub use verdict::{
     Class, DefenseLayer, GoldenRecord, KnownBypass, KnownBypassLedger, Vector, Verdict,
 };

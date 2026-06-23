@@ -84,7 +84,7 @@ pnpm run license-check                # Apache/MIT/BSD/ISC only; bans GPL/AGPL
 ```
 
 CI mirrors these in `.github/workflows/ci.yml` (triggers: push + pull_request).
-Toolchain is pinned by `rust-toolchain.toml` (Rust **1.90.0**, edition 2021).
+Toolchain is pinned by `rust-toolchain.toml` (Rust **1.90.0**, edition 2024).
 
 ## 8. Where things live
 

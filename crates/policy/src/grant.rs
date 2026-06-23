@@ -311,9 +311,11 @@ mod tests {
         let clock = MockClock::starting_at(5_000); // before expiry (10_000)
 
         let live = binding.clone(); // live request matches exactly
-        assert!(token
-            .verify_for_apply(&live, &vk, &mut nonces, &clock)
-            .is_ok());
+        assert!(
+            token
+                .verify_for_apply(&live, &vk, &mut nonces, &clock)
+                .is_ok()
+        );
     }
 
     /// T-grant-sql-swap — mutate `statement_text` after signing → REJECT.
@@ -386,9 +388,11 @@ mod tests {
         let clock = MockClock::starting_at(5_000);
 
         // First apply: legitimate, succeeds and consumes the nonce.
-        assert!(token
-            .verify_for_apply(&binding, &vk, &mut nonces, &clock)
-            .is_ok());
+        assert!(
+            token
+                .verify_for_apply(&binding, &vk, &mut nonces, &clock)
+                .is_ok()
+        );
 
         // Second apply with the SAME valid token: replay → REJECT.
         let err = token

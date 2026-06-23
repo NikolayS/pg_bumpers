@@ -35,8 +35,8 @@
 use std::sync::{Arc, Mutex};
 
 use pgb_audit::{
-    verify_chain, AuditBoot, BootError, Decision, LocalSecretStore, SecretStore, Sink,
-    AUDIT_SIGNING_KEY_ID,
+    AUDIT_SIGNING_KEY_ID, AuditBoot, BootError, Decision, LocalSecretStore, SecretStore, Sink,
+    verify_chain,
 };
 use pgb_core::{Clock, MockClock};
 use pgb_proxy::Recorder;

@@ -66,7 +66,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pgb_core::inverse::{certify, InversePlanBuilder, Operation};
+use pgb_core::inverse::{InversePlanBuilder, Operation, certify};
 use pgb_core::{
     ApplyBarrier, BlastRadius, Clock, InverseKind, InversePlan, InverseRow, OpCounts, PkChecksum,
     PkSetBuilder, PkTuple, RefusedOp,
@@ -113,7 +113,9 @@ pub enum ApplyError {
     /// 0-tolerance → ROLLBACK. This is the guard *firing* — the expected outcome
     /// of every drift test (insert / delete-shrink / predicate-flip /
     /// trigger-amplification).
-    #[error("GUARD ABORT (apply-time PK-set drift on `{relation}`): dry_run={dry_run} apply_time={apply_time}")]
+    #[error(
+        "GUARD ABORT (apply-time PK-set drift on `{relation}`): dry_run={dry_run} apply_time={apply_time}"
+    )]
     PkSetDrift {
         /// The relation whose affected-PK set drifted.
         relation: String,
@@ -127,7 +129,9 @@ pub enum ApplyError {
     /// rows the forward op actually wrote (its `RETURNING` PK set) differ from the
     /// predicted set. Catches a post-snapshot trigger writing rows OUTSIDE the
     /// predicate that the pre-op recompute (step 5) cannot see. → ROLLBACK.
-    #[error("GUARD ABORT (RETURNING written-set mismatch on `{relation}`): predicted={predicted} written={written}")]
+    #[error(
+        "GUARD ABORT (RETURNING written-set mismatch on `{relation}`): predicted={predicted} written={written}"
+    )]
     WrittenSetMismatch {
         /// The relation whose written set diverged from the prediction.
         relation: String,
@@ -145,7 +149,9 @@ pub enum ApplyError {
     /// `mirror` table — and it is **irreversible** under the captured inverse. The
     /// guard fails closed: a write that touches an unpredicted relation can never
     /// commit. → ROLLBACK.
-    #[error("GUARD ABORT (unpredicted-relation write on `{relation}`): {changed} tuples changed (ins={ins} upd={upd} del={del}) but the relation is not in the dry-run blast radius")]
+    #[error(
+        "GUARD ABORT (unpredicted-relation write on `{relation}`): {changed} tuples changed (ins={ins} upd={upd} del={del}) but the relation is not in the dry-run blast radius"
+    )]
     UnpredictedRelationWrite {
         /// The relation the apply txn changed that the dry-run never predicted.
         relation: String,
@@ -171,7 +177,9 @@ pub enum ApplyError {
     /// *total*, opposite destructive op). Those excess/substituted rows have no
     /// pre-image in the inverse → irreversible. The reconciliation compares each op
     /// channel **independently** (never a collapsed total). → ROLLBACK.
-    #[error("GUARD ABORT (relation `{relation}` changed more than predicted on the `{channel}` channel): predicted=(ins={p_ins} upd={p_upd} del={p_del}) actual=(ins={a_ins} upd={a_upd} del={a_del})")]
+    #[error(
+        "GUARD ABORT (relation `{relation}` changed more than predicted on the `{channel}` channel): predicted=(ins={p_ins} upd={p_upd} del={p_del}) actual=(ins={a_ins} upd={a_upd} del={a_del})"
+    )]
     RelationOverWrite {
         /// The predicted relation whose actual change exceeded the prediction.
         relation: String,
@@ -211,7 +219,9 @@ pub enum ApplyError {
     /// a write must NEVER commit `reversible:true` with an incomplete inverse. The
     /// guard fails closed: any written row missing a pre-image for any written column
     /// aborts before commit (no mutation). → ROLLBACK.
-    #[error("GUARD ABORT (uncaptured written column on `{relation}` pk={pk}): the write mutated column(s) {missing:?} but the typed-inverse captured no pre-image for them — the change is not reversible")]
+    #[error(
+        "GUARD ABORT (uncaptured written column on `{relation}` pk={pk}): the write mutated column(s) {missing:?} but the typed-inverse captured no pre-image for them — the change is not reversible"
+    )]
     UncapturedColumn {
         /// The relation whose written column was not captured.
         relation: String,
@@ -224,7 +234,9 @@ pub enum ApplyError {
     /// The apply txn exceeded its `statement_timeout` (step 2) and was aborted by
     /// the server — **no partial commit**. Surfaced distinctly so the caller can
     /// tell a timeout abort from a drift abort.
-    #[error("APPLY TIMEOUT: apply exceeded statement_timeout of {timeout_ms}ms — aborted, nothing committed")]
+    #[error(
+        "APPLY TIMEOUT: apply exceeded statement_timeout of {timeout_ms}ms — aborted, nothing committed"
+    )]
     Timeout {
         /// The `statement_timeout` budget that was exceeded.
         timeout_ms: u64,
@@ -1059,8 +1071,8 @@ mod tests {
 
     /// A blast-radius grant for `rel` over the integer PK set `ids`.
     fn grant_for(proposal_id: &str, rel: &str, ids: &[i64], duration_ms: u64) -> BlastRadius {
-        use pgb_core::blast_radius::Affected;
         use pgb_core::LockMode;
+        use pgb_core::blast_radius::Affected;
         let mut pk_set_checksum = std::collections::BTreeMap::new();
         pk_set_checksum.insert(rel.to_string(), checksum_of(rel, ids).as_prefixed());
         let mut by_table = std::collections::BTreeMap::new();
@@ -1739,7 +1751,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(relation, audit);
-                assert_eq!(channel, "del", "the substituted DELETE tripped the del channel");
+                assert_eq!(
+                    channel, "del",
+                    "the substituted DELETE tripped the del channel"
+                );
                 assert_eq!(p_ins, 4, "the prediction was an INSERT of 4");
                 assert_eq!(p_del, 0, "the prediction had NO deletes");
                 assert_eq!(a_del, 4, "the apply DELETEd 4 pre-existing rows");

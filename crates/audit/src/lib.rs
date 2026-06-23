@@ -57,20 +57,20 @@ pub mod boot;
 pub mod pg;
 
 pub use anchor::{
+    AnchorEntry, AnchorError, AnchorVerification, Anchored, Anchorer, WormAnchor, WormAnchorError,
     head_of, verify_against_anchor, verify_against_anchor_with, verify_records_against_anchor,
-    verify_records_against_anchor_with, AnchorEntry, AnchorError, AnchorVerification, Anchored,
-    Anchorer, WormAnchor, WormAnchorError,
+    verify_records_against_anchor_with,
 };
-pub use chain::{verify_chain, AuditChain, ChainBreak, NewEntry};
+pub use chain::{AuditChain, ChainBreak, NewEntry, verify_chain};
 pub use kms::{HeadSignature, Kms, KmsError, LocalKms, OPERATOR_PRINCIPAL};
 pub use record::{
-    AuditPayload, AuditRecord, Decision, IntentTiers, Principal, WriteSafetyRefs, GENESIS_PREV_HASH,
+    AuditPayload, AuditRecord, Decision, GENESIS_PREV_HASH, IntentTiers, Principal, WriteSafetyRefs,
 };
-pub use secret::{LocalSecretStore, SecretError, SecretStore, AUDIT_SIGNING_KEY_ID};
+pub use secret::{AUDIT_SIGNING_KEY_ID, LocalSecretStore, SecretError, SecretStore};
 pub use sink::{InMemorySink, SharedSink, Sink, SinkError};
 
 #[cfg(feature = "pg")]
 pub use boot::{AnchorRole, AuditBoot, BootError};
 
 #[cfg(feature = "pg")]
-pub use pg::{PgSink, AUDIT_CHAIN_LOCK_KEY};
+pub use pg::{AUDIT_CHAIN_LOCK_KEY, PgSink};

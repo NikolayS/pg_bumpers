@@ -22,12 +22,12 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 
 use pgb_audit::{
-    verify_chain, AuditBoot, Decision, LocalSecretStore, SecretStore, Sink, AUDIT_SIGNING_KEY_ID,
+    AUDIT_SIGNING_KEY_ID, AuditBoot, Decision, LocalSecretStore, SecretStore, Sink, verify_chain,
 };
 use pgb_cli::{
     ApprovalFlow, InMemoryNonceStore, Principal, Proposal, RecordingWebhookSender, RequestId,
 };
-use pgb_core::{inverse::Operation, Clock, MockClock};
+use pgb_core::{Clock, MockClock, inverse::Operation};
 use pgb_proxy::Recorder;
 use postgres::{Client, NoTls};
 

@@ -171,11 +171,7 @@ fn process_start_time(pid: u32) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// An out-of-process ledger of live clones (SPEC §10.7). It is a directory
@@ -216,15 +212,32 @@ impl CloneLedger {
 
     /// The canonical durable ledger directory (see [`CloneLedger::canonical`]).
     pub fn canonical_dir() -> PathBuf {
-        if let Some(explicit) = std::env::var_os("PGB_CLONE_LEDGER_DIR") {
+        // Read the three env inputs here, then resolve via the pure helper. Keeping
+        // the resolution pure (no env access) lets the unit test drive it directly,
+        // so this crate never has to mutate the process environment — which under
+        // Rust 2024 is `unsafe` and would breach the crate's `#![forbid(unsafe_code)]`.
+        Self::canonical_dir_from(
+            std::env::var_os("PGB_CLONE_LEDGER_DIR"),
+            std::env::var_os("XDG_STATE_HOME"),
+            std::env::var_os("HOME"),
+        )
+    }
+
+    /// Pure resolution of [`canonical_dir`](Self::canonical_dir) from its env
+    /// inputs (override, `XDG_STATE_HOME`, `HOME`). Factored out so it is testable
+    /// without touching the process environment.
+    fn canonical_dir_from(
+        explicit: Option<std::ffi::OsString>,
+        xdg_state: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> PathBuf {
+        if let Some(explicit) = explicit {
             return PathBuf::from(explicit);
         }
-        let state_base = std::env::var_os("XDG_STATE_HOME")
+        let state_base = xdg_state
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
-            })
+            .or_else(|| home.map(|h| PathBuf::from(h).join(".local").join("state")))
             // Last resort only if even $HOME is unset (should not happen on a real
             // host); the tempdir is documented as non-durable but is better than
             // panicking, and the filesystem sweep is the backstop.
@@ -411,15 +424,15 @@ fn postmaster_pid(pidfile: &Path) -> Option<u32> {
 /// afterward.
 pub fn destroy_orphan(entry: &LedgerEntry) -> bool {
     // 1. Stop the postmaster if its pidfile names a live process.
-    if let Some(pm_pid) = postmaster_pid(&entry.pidfile()) {
-        if pid_alive(pm_pid) {
-            // SIGINT = fast shutdown (rollback in-flight, exit).
-            signal(pm_pid, "INT");
-            if !wait_pid_gone(pm_pid, 50, 100) {
-                // SIGQUIT = immediate shutdown (no checkpoint) — last resort.
-                signal(pm_pid, "QUIT");
-                wait_pid_gone(pm_pid, 50, 100);
-            }
+    if let Some(pm_pid) = postmaster_pid(&entry.pidfile())
+        && pid_alive(pm_pid)
+    {
+        // SIGINT = fast shutdown (rollback in-flight, exit).
+        signal(pm_pid, "INT");
+        if !wait_pid_gone(pm_pid, 50, 100) {
+            // SIGQUIT = immediate shutdown (no checkpoint) — last resort.
+            signal(pm_pid, "QUIT");
+            wait_pid_gone(pm_pid, 50, 100);
         }
     }
     // 2. Remove the datadir (the on-disk prod-PII copy). Absent ⇒ already gone.
@@ -527,7 +540,7 @@ fn sweep_clone_root(
         Err(e) => {
             return Err(CloneError::Tooling(format!(
                 "sweep read {clone_root:?}: {e}"
-            )))
+            )));
         }
     };
     // Snapshot the ledger once: any datadir owned by a *live* ledger entry is in
@@ -610,15 +623,14 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "pgb-ledger-test-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        base
+        ))
     }
 
     #[test]
@@ -747,11 +759,13 @@ mod tests {
         assert!(OwnerIdentity::current().is_live());
 
         // A dead pid is never live regardless of recorded start-time.
-        assert!(!OwnerIdentity {
-            pid: pick_dead_pid(),
-            start: String::new()
-        }
-        .is_live());
+        assert!(
+            !OwnerIdentity {
+                pid: pick_dead_pid(),
+                start: String::new()
+            }
+            .is_live()
+        );
     }
 
     #[test]
@@ -959,13 +973,44 @@ mod tests {
 
     #[test]
     fn canonical_dir_honors_explicit_override() {
+        // Drive the PURE resolver (no process-env mutation) so this stays
+        // `#![forbid(unsafe_code)]`-clean: under Rust 2024 `std::env::set_var` is
+        // `unsafe`, and faking the override through it would breach that crate gate.
+
         // The pinned canonical location is deployment-overridable and NOT tmp.
         let want = std::env::temp_dir().join("pgb-canonical-test-override");
-        std::env::set_var("PGB_CLONE_LEDGER_DIR", &want);
-        assert_eq!(CloneLedger::canonical_dir(), want);
-        std::env::remove_var("PGB_CLONE_LEDGER_DIR");
-        // Without the override it is anchored under a state dir, never bare tmp.
-        let derived = CloneLedger::canonical_dir();
-        assert!(derived.ends_with("pg_bumpers/clone-ledger"));
+        assert_eq!(
+            CloneLedger::canonical_dir_from(Some(want.clone().into_os_string()), None, None),
+            want
+        );
+
+        // Without the override it is anchored under a state dir, never bare tmp:
+        // an absolute $XDG_STATE_HOME wins, …
+        let xdg = std::path::Path::new("/var/lib/pgb-state");
+        assert_eq!(
+            CloneLedger::canonical_dir_from(None, Some(xdg.as_os_str().to_owned()), None),
+            xdg.join("pg_bumpers").join("clone-ledger")
+        );
+        // … else it falls back under $HOME/.local/state, …
+        let home = std::path::Path::new("/home/pgb");
+        assert_eq!(
+            CloneLedger::canonical_dir_from(None, None, Some(home.as_os_str().to_owned())),
+            home.join(".local")
+                .join("state")
+                .join("pg_bumpers")
+                .join("clone-ledger")
+        );
+        // … and a non-absolute $XDG_STATE_HOME is rejected (HOME wins instead).
+        assert_eq!(
+            CloneLedger::canonical_dir_from(
+                None,
+                Some(std::ffi::OsString::from("relative/dir")),
+                Some(home.as_os_str().to_owned()),
+            ),
+            home.join(".local")
+                .join("state")
+                .join("pg_bumpers")
+                .join("clone-ledger")
+        );
     }
 }

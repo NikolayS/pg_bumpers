@@ -49,8 +49,8 @@ use pgb_audit::verify_chain;
 use pgb_audit::Sink;
 use pgb_core::MockClock;
 use pgb_warden::{
-    tick_and_audit, PgActivitySource, PgKiller, WardenLoop, WardenThresholds, REASON_BREAKER_TRIP,
-    REASON_SLOT_ALARM, REASON_WARDEN_TERMINATE,
+    PgActivitySource, PgKiller, REASON_BREAKER_TRIP, REASON_SLOT_ALARM, REASON_WARDEN_TERMINATE,
+    WardenLoop, WardenThresholds, tick_and_audit,
 };
 
 const AGENT_APP_NAME: &str = "pgb_proxy"; // the warden tag (PROXY_APP_NAME)

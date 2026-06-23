@@ -13,9 +13,9 @@
 //! the same `SharedSink`; the env-gated PG18 IT exercises that path).
 
 use pgb_audit::{
-    head_of, verify_chain, verify_records_against_anchor, AnchorError, AnchorVerification,
-    Anchorer, Decision, InMemorySink, LocalKms, LocalSecretStore, NewEntry, Principal, SecretStore,
-    SharedSink, Sink, WormAnchor, AUDIT_SIGNING_KEY_ID,
+    AUDIT_SIGNING_KEY_ID, AnchorError, AnchorVerification, Anchorer, Decision, InMemorySink,
+    LocalKms, LocalSecretStore, NewEntry, Principal, SecretStore, SharedSink, Sink, WormAnchor,
+    head_of, verify_chain, verify_records_against_anchor,
 };
 use pgb_core::{Clock, MockClock};
 use pgb_policy::IntentTiers;

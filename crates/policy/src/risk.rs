@@ -137,7 +137,9 @@ pub struct AllowStub;
 
 impl RiskEngine for AllowStub {
     fn assess(&self, _input: &RiskInput) -> RiskVerdict {
-        RiskVerdict::allow("MVP stub: risk engine returns Allow; the deterministic floor enforces safety (SPEC §11.5)")
+        RiskVerdict::allow(
+            "MVP stub: risk engine returns Allow; the deterministic floor enforces safety (SPEC §11.5)",
+        )
     }
 }
 
