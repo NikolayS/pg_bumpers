@@ -1,6 +1,16 @@
 # `deploy/` — local dev/test stack & deployment assets
 
-The dev/test substrate for pg_bumpers (SPEC §3, §7, §12). There are **two paths**:
+> **One command to a connected demo:** `deploy/up.sh` launches the FULL assembled
+> stack — `pgb-proxy` (the agent read endpoint, in front of PG18), `pgb-applyd`
+> (the write-path socket), and `pgb-warden` (the live watchdog) — and prints a
+> ready-to-paste `claude mcp add` line. Connect a real Claude Code, then watch a
+> `DROP TABLE` get REFUSED, a no-`WHERE` `UPDATE` get bounded + approval-gated, and
+> the audit chain verify. Tear it all down with `deploy/down.sh`. See
+> [Path C](#path-c--upsh--the-one-command-runnable-demo) below. The MCP read path
+> genuinely traverses `pgb-proxy` (extended-protocol-only, WALL-enforced) — not raw
+> PG18.
+
+The dev/test substrate for pg_bumpers (SPEC §3, §7, §12). There are **three paths**:
 
 1. **`docker-compose.yml`** — the **shipped artifact** for real users (and CI on a
    docker-healthy machine). Postgres **18**, primary + optional replica + `_meta`
@@ -131,6 +141,67 @@ ports are actually free**, then fails loudly if any are still bound:
 - A partial/failed `up` self-cleans via an `EXIT`/`ERR` trap (no leaked clusters).
 - `PG_BUMPERS_LOCALSTACK_DIR` is validated (non-empty, absolute, not `/` or `$HOME`,
   confined under the repo or a `*localstack*` dir) before any `rm -rf`.
+
+---
+
+## Path C — `up.sh` — the one-command runnable demo
+
+`deploy/up.sh` is the launcher that makes pg_bumpers **actually connectable to a real
+Claude Code**. It:
+
+1. builds the binaries + the MCP shell (skip with `--no-build`);
+2. brings up the hardened throwaway PG18 via `local-stack.sh up` (primary `54321`,
+   meta `54323`, replica `54322`; **never** 5432), seeds a demo DB (`pgb_demo`) on the
+   primary with the canonical `_meta` audit chain
+   (`crates/audit/sql/10_audit_meta.sql`) and a single-int-PK `accounts` table, and
+   `GRANT`s the read surface to the WALL role `pgb_agent`;
+3. generates a **throwaway Ed25519 approver keypair** (the apply-time trust root; the
+   seed stays out-of-band in the state dir, never enters the agent path);
+4. launches the **real binaries**, health-checking each:
+   - **`pgb-proxy`** on `127.0.0.1:6432` — the agent SCRAM endpoint **in front of**
+     the primary; it originates the backend session as the WALL role `pgb_agent`.
+     Dev-mode **TLS is OFF** (`PGB_PROXY_REQUIRE_TLS=false`) — stated explicitly; the
+     proxy still does SCRAM-SHA-256 of the agent and enforces extended-protocol-only /
+     read-only / byte-row budgets / `statement_timeout` / the audit chain. The
+     **MCP read path is wired through this endpoint** (`PGB_PROXY_*`), not raw PG18.
+     The proxy is the audit-chain anchor **owner**.
+   - **`pgb-applyd`** on a Unix socket — the grant-gated `guarded_apply_with_grant`
+     write floor. Audit chain **verify-only**.
+   - **`pgb-warden`** — the live out-of-band watchdog, auditing to the **same** chain.
+5. prints the **ready-to-paste `claude mcp add`** line with the exact env the server
+   needs, plus how to do the operator approve step.
+
+```sh
+deploy/up.sh                 # build + launch + print the connect line
+deploy/up.sh --no-build      # use prebuilt artifacts
+deploy/down.sh               # stop the 3 daemons + local-stack; verify ports freed, :5432 untouched
+```
+
+The printed connect line is of the form (values filled in by the launcher):
+
+```sh
+claude mcp add pg-bumpers \
+  --env PGB_APPLYD_SOCKET=<state>/applyd.sock \
+  --env PGB_PROXY_HOST=127.0.0.1 --env PGB_PROXY_PORT=6432 \
+  --env PGB_PROXY_DB=pgb_demo --env PGB_PROXY_USER=pgb_agent \
+  --env PGB_PROXY_PASSWORD=pgb_agent_dev_pw --env PGB_PROXY_APP_NAME=pgb_proxy \
+  --env PGB_ROLE=pgb_agent --env PGB_SESSION_ID=pgb-demo-session \
+  -- node <repo>/mcp/server/dist/bin/mcpStdio.js
+```
+
+**The read path genuinely goes through `pgb-proxy`.** Because the proxy is
+extended-protocol-only (its statement-stacking defense), the MCP read client
+(`PgProxyTransport`) uses the **extended protocol** (named prepared statements); a
+plain simple-query is rejected. Two proofs the e2e test asserts: the proxy stamps
+`application_name=pgb_proxy` on the backend session as `pgb_agent` (visible in
+`pg_stat_activity`), and a read of the **non-granted** `secret_data` is `WALL_DENIED`
+(SQLSTATE 42501) — the WALL role denying default-deny, which a raw superuser path
+would not. Proven end-to-end in `mcp/server/test/upStack.e2e.test.ts` (`PG_BUMPERS_IT=1`).
+
+The operator **approve** hop (the signing key never enters the agent/MCP path) calls
+the applyd socket `approve` RPC out-of-band; see the e2e test for the exact shape, and
+`pgb-cli verify` (with `PGB_META_DSN` / `PGB_AUDIT_SIGNING_KEY` / `PGB_ANCHOR_PATH` from
+the launcher's `connect.env`) proves the unified chain.
 
 ---
 

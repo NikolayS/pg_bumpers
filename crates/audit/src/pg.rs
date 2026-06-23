@@ -73,6 +73,17 @@ impl PgSink {
         PgSink { client }
     }
 
+    /// Connect a fresh writer [`Client`] to `writer_dsn` (keyword/value; the
+    /// `pgb_audit_writer` role — never the audited agent) and wrap it. Lets a
+    /// caller build a `PgSink` from a DSN without depending on the `postgres`
+    /// crate directly (e.g. the proxy's off-runtime audit thread). Fails closed
+    /// on a connect error.
+    pub fn connect(writer_dsn: &str) -> Result<Self, SinkError> {
+        let client = Client::connect(writer_dsn, postgres::NoTls)
+            .map_err(|e| SinkError::Backend(format!("audit writer connect failed: {e}")))?;
+        Ok(PgSink { client })
+    }
+
     /// Borrow the underlying client (e.g. for the integration test to run
     /// assertions on the same connection).
     pub fn client_mut(&mut self) -> &mut Client {

@@ -45,6 +45,7 @@ pub mod enforce;
 pub mod explain;
 pub mod recorder;
 pub mod session;
+pub mod threaded_sink;
 pub mod tls;
 pub mod window;
 
@@ -56,4 +57,5 @@ pub use explain::{
 };
 pub use recorder::Recorder;
 pub use session::{SessionError, serve_connection};
+pub use threaded_sink::ThreadedSink;
 pub use window::{WindowCap, WindowMeter, WindowOutcome};

@@ -1,0 +1,38 @@
+================================================================================
+ pg_bumpers — deploy/up.sh RUNNABLE-STACK e2e transcript
+ (mcp/server/test/upStack.e2e.test.ts, PG_BUMPERS_IT=1)
+ The MCP read path genuinely traverses pgb-proxy (extended-protocol-only,
+ WALL-enforced); writes go through pgb-applyd's grant-gated floor; a live
+ pgb-warden watches; one anchored _meta chain verifies. :5432 untouched.
+================================================================================
+
+running deploy/up.sh --no-build (launches pgb-proxy + pgb-applyd + pgb-warden)…
+stack up; MCP read path → pgb-proxy at 127.0.0.1:6432 (backend PG18 is :54321).
+a REAL MCP client is connected to the shipped stdio shell.
+tools/list → 9 tools.
+read: query(accounts) → 8 rows through pgb-proxy.
+PROXY PROOF #1: backend session tagged application_name='pgb_proxy' as role 'pgb_agent' seen in pg_stat_activity (the proxy originated it).
+PROXY PROOF #2: query(secret_data) → WALL_DENIED — the WALL role the proxy connects as denied the non-granted table (raw superuser would not).
+REFUSED: propose_write("DROP TABLE public.accounts") → NOT_REHEARSABLE (neutralized by refusal, NOT executed).
+REFUSED: propose_write("TRUNCATE public.accounts") → NOT_REHEARSABLE (neutralized by refusal, NOT executed).
+BOUNDED: dry_run → blast radius 4 rows, reversible=true.
+apply WITHOUT a grant → APPROVAL_REQUIRED (retryable=true).
+operator approve (out-of-band CLI-minted grant verified at apply).
+COMMITTED: apply WITH the grant → bounded (4 even zeroed, 4 odd untouched), reversible=true.
+get_audit → 0 record(s).
+pgb-cli verify → the shared `_meta` chain VERIFIES.
+--- pgb-cli verify output ---
+pgb-cli verify: the shared `_meta` chain VERIFIES (8 records) and the durable anchored head MATCHES the chain head.
+  head = b561f452964f3a653540b3e0da519df73cf687f90156e7a5b6f145be8f07ea52
+  anchored_seq = 7
+  decisions by reason_code:
+    NOT_REHEARSABLE                  x2
+    apply_committed                  x1
+    approval_required                x1
+    explain_failed                   x1
+    grant_signed                     x1
+    ok                               x2
+================================
+
+vitest result line:
+      Tests  5 passed (5)

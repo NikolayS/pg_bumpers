@@ -58,7 +58,7 @@ use pgb_audit::{AUDIT_SIGNING_KEY_ID, AnchorRole, AuditBoot, LocalSecretStore, S
 use pgb_core::{Clock, SystemClock};
 use pgb_policy::PolicyConfig;
 use pgb_proxy::config::{BackendTarget, TlsConfig};
-use pgb_proxy::{ProxyConfig, Recorder, serve_connection};
+use pgb_proxy::{ProxyConfig, Recorder, ThreadedSink, serve_connection};
 use tokio::net::TcpListener;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -184,12 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("{e} (fail-closed)"))?;
 
-    let mut boot =
-        AuditBoot::connect_with_anchor(&meta_dsn, &store, anchor_interval_ms, &anchor_path)
-            .map_err(|e| format!("audit _meta boot failed (fail-closed): {e}"))?;
-
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
+    // The audit boot uses the SYNCHRONOUS `postgres` crate (a blocking client
+    // that drives its OWN internal tokio runtime via `block_on`). Calling it
+    // directly from this `#[tokio::main]` async context panics
+    // ("Cannot start a runtime from within a runtime"). Run the connect + the
+    // FAIL-CLOSED verify-before-anchor boot on a dedicated blocking thread
+    // (`spawn_blocking`) so the sync client never collides with this runtime.
+    //
     // FAIL-CLOSED boot sequence — for the OWNER, VERIFY BEFORE ANCHOR (SPEC
     // §3/§10.9): verify the persisted `_meta` chain against the PRIOR durable
     // anchored head FIRST, and only on a clean verify anchor the current head
@@ -199,23 +202,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ⇒ mismatch ⇒ refuse to start. (Genesis/first boot: empty durable WORM,
     // nothing to verify against yet; anchored as the baseline.) A VERIFY-only role
     // checks but never anchors. Any error here is a hard exit.
-    boot.boot(anchor_role, clock.monotonic_millis())
-        .map_err(|e| format!("audit startup verification failed — refusing to start: {e}"))?;
+    let boot = {
+        let meta_dsn = meta_dsn.clone();
+        let anchor_path = anchor_path.clone();
+        let boot_clock = clock.clone();
+        tokio::task::spawn_blocking(move || -> Result<AuditBoot, String> {
+            let mut boot =
+                AuditBoot::connect_with_anchor(&meta_dsn, &store, anchor_interval_ms, &anchor_path)
+                    .map_err(|e| format!("audit _meta boot failed (fail-closed): {e}"))?;
+            boot.boot(anchor_role, boot_clock.monotonic_millis())
+                .map_err(|e| {
+                    format!("audit startup verification failed — refusing to start: {e}")
+                })?;
+            Ok(boot)
+        })
+        .await
+        .map_err(|e| format!("audit boot task join failed: {e}"))??
+    };
     eprintln!(
         "pgb-proxy: audit `_meta` chain verified against its durable anchored head on startup \
          (anchor role: {anchor_role:?}, anchor {anchor_path}, interval {anchor_interval_ms}ms)"
     );
 
-    // Inject the SAME shared sink into the proxy `Recorder` (the exact
-    // `Arc<Mutex<dyn Sink + Send>>` the boot handle wraps), so every gate verdict
-    // appends to the canonical `_meta` chain.
-    let sink: Arc<Mutex<dyn Sink + Send>> = boot.sink_arc();
+    // The proxy `Recorder` appends a gate verdict SYNCHRONOUSLY on every statement
+    // from inside an async connection task. The `_meta` `PgSink` is the sync
+    // `postgres` client (its own `block_on`), which panics if driven from inside
+    // this runtime. So the recorder writes through a `ThreadedSink`: its OWN writer
+    // client on a dedicated OS thread (off the runtime). Cross-process chain
+    // integrity is preserved — `PgSink::append` serializes head-read + insert under
+    // a `pg_advisory_xact_lock`, so this client appends safely alongside the boot's
+    // anchor client and applyd/warden onto the ONE shared `_meta.audit_log`.
+    let recorder_sink = ThreadedSink::connect(&meta_dsn)
+        .map_err(|e| format!("audit recorder sink connect failed (fail-closed): {e}"))?;
+    let sink: Arc<Mutex<dyn Sink + Send>> = Arc::new(Mutex::new(recorder_sink));
     let recorder = Recorder::new(sink, clock.clone(), cfg.backend.role.clone());
 
     // Run the interval anchorer in the background ONLY when this binary OWNS the
     // anchor (item 3) — a verify-only role must never anchor. The anchorer ticks
-    // on the same injected clock cadence; `AuditBoot` (sync Postgres client) is
-    // driven under a Mutex from a spawned task.
+    // on the same injected clock cadence; `AuditBoot` (sync Postgres client) runs
+    // its blocking `maybe_anchor` on a `spawn_blocking` thread per tick so the sync
+    // client never blocks (or collides with) this tokio runtime.
     let boot = Arc::new(Mutex::new(boot));
     if anchor_role.is_owner() {
         let boot = boot.clone();
@@ -227,10 +253,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 let now = clock.monotonic_millis();
-                if let Ok(mut b) = boot.lock()
-                    && let Err(e) = b.maybe_anchor(now)
-                {
-                    eprintln!("pgb-proxy: audit anchor tick failed: {e}");
+                let boot = boot.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut b = boot
+                        .lock()
+                        .map_err(|_| "anchor mutex poisoned".to_string())?;
+                    b.maybe_anchor(now).map_err(|e| e.to_string()).map(|_| ())
+                })
+                .await;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("pgb-proxy: audit anchor tick failed: {e}"),
+                    Err(e) => eprintln!("pgb-proxy: audit anchor task join failed: {e}"),
                 }
             }
         });

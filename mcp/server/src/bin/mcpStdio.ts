@@ -27,7 +27,7 @@
 import { createInterface } from "node:readline";
 
 import { createServer, TOOL_NAMES, type McpServer } from "../server.js";
-import { PgProxyTransport } from "../pgProxy.js";
+import { LazyProxyTransport } from "../lazyProxy.js";
 import { ApplydCore } from "../applydCore.js";
 import { isBlock } from "../blockContract.js";
 
@@ -85,10 +85,15 @@ async function main(): Promise<void> {
   const socketPath = env("PGB_APPLYD_SOCKET");
 
   // Reads go through the LIVE proxy (a real libpq client to the proxy endpoint).
+  // LAZY-CONNECT: the proxy dial is deferred to the FIRST read (mirroring the
+  // already-lazy ApplydCore socket) so the MCP `initialize` / `tools/list`
+  // handshake ALWAYS completes — even when the proxy/backend is down. A down
+  // backend then surfaces as a RECOVERABLE per-read block (PROXY_UNAVAILABLE),
+  // never a process death that shows Claude Code a silent `✘ Failed to connect`.
   // The session carries the proxy `application_name` tag so the out-of-band warden
   // (SPEC §3 layer 2) recognizes + can terminate an agent-tagged runaway read. NOT
   // a security control — the un-strippable anchor is the hardened agent role.
-  const transport = await PgProxyTransport.connect({
+  const transport = new LazyProxyTransport({
     host: env("PGB_PROXY_HOST", "127.0.0.1"),
     port: Number(env("PGB_PROXY_PORT", "6432")),
     database: env("PGB_PROXY_DB", "postgres"),
@@ -98,6 +103,8 @@ async function main(): Promise<void> {
   });
 
   // Writes go through the production ApplydCore → pgb-applyd (the real floor).
+  // ApplydCore is already lazy (its socket connects on the first RPC), so this
+  // too imposes no connect at startup.
   const core = new ApplydCore({ socketPath, role, sessionId });
 
   const server = createServer({ transport, core, role });
