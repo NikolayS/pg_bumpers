@@ -22,7 +22,10 @@
 #      SCRAM-SHA-256 of the agent and originates the backend session as the WALL
 #      role. The proxy is the audit-chain anchor OWNER.
 #   4. pgb-applyd — the write-path daemon on a Unix socket (the grant-gated
-#      guarded_apply floor). Audit-chain VERIFY-only (the proxy owns the anchor).
+#      guarded_apply floor). It connects to the primary as the CONSTRAINED, DML-only
+#      applier role `pgb_applier` (S5 #77) — NOT the superuser and NOT the read-only
+#      WALL role — so a bug in the apply path cannot DDL (defense-in-depth under the
+#      §4 application-layer floor). Audit-chain VERIFY-only (the proxy owns the anchor).
 #   5. pgb-warden — the live out-of-band watchdog (terminates agent-tagged runaway
 #      reads; audits to the SAME `_meta` chain).
 #
@@ -68,6 +71,11 @@ ANCHOR_PATH="$STATE_DIR/audit.anchor.worm"
 # Dev secrets (placeholders matching the local-stack WALL role; production sources
 # them from a secret store — see deploy/proxy.env.example).
 AGENT_PASSWORD="pgb_agent_dev_pw"
+# The constrained, DML-ONLY applier credential (S5 #77). applyd connects as this role to
+# run the guarded apply on the primary. It has SELECT/INSERT/UPDATE/DELETE on the demo
+# tables and CANNOT DDL (NOSUPERUSER, no CREATE on schema) — defense-in-depth under the
+# §4 application-layer apply floor. Running applyd as the superuser is discouraged.
+APPLIER_PASSWORD="pgb_applier_dev_pw"
 # The audit-WRITER credential: it can INSERT audit rows. It stays ONLY with the
 # proxy/applyd/warden (the path that legitimately appends the chain) — it is NEVER
 # forwarded into the agent-facing pgb-mcp process.
@@ -145,11 +153,14 @@ psql_primary postgres "SELECT 1 FROM pg_database WHERE datname='$DEMO_DB'" | gre
 "$PGBIN/psql" -X -h "$HOST" -p "$PRIMARY_PORT" -U postgres -d "$DEMO_DB" -v ON_ERROR_STOP=1 -q \
   -f "$REPO_ROOT/crates/audit/sql/10_audit_meta.sql" >/dev/null
 
-# The hardened WALL role `pgb_agent` already exists on the primary (applied by
-# local-stack to the `postgres` DB), but role-level grants on THIS demo DB's
-# objects must be granted here. Seed the demo tables + GRANT the read surface to
-# the WALL role so reads THROUGH THE PROXY (which connects as pgb_agent) succeed,
-# while a write table is owned by postgres (applyd writes as postgres).
+# The hardened WALL role `pgb_agent` and the constrained applier role `pgb_applier`
+# already exist on the primary (applied by local-stack to the `postgres` DB), but
+# role-level grants on THIS demo DB's objects must be granted here. Seed the demo
+# tables + GRANT the read surface to the WALL role so reads THROUGH THE PROXY (which
+# connects as pgb_agent) succeed, and GRANT DML on the writable table to pgb_applier
+# (S5 #77) so applyd's guarded apply runs under the constrained, DDL-incapable role
+# rather than the superuser. The tables stay owned by postgres, so pgb_applier can
+# mutate ROWS but cannot ALTER/DROP them.
 "$PGBIN/psql" -X -h "$HOST" -p "$PRIMARY_PORT" -U postgres -d "$DEMO_DB" -v ON_ERROR_STOP=1 -q <<SQL >/dev/null
 -- single-int-PK accounts: the MVP bounded-reversible-write shape.
 CREATE TABLE IF NOT EXISTS public.accounts (
@@ -166,17 +177,30 @@ INSERT INTO public.accounts(id, owner, balance, notes)
 GRANT USAGE ON SCHEMA public TO pgb_agent;
 GRANT SELECT ON public.accounts TO pgb_agent;
 
--- A NON-whitelisted secret the WALL must keep from the agent (default-deny proof).
+-- THE APPLIER'S DML SURFACE (S5 #77): the constrained write role applyd connects as
+-- gets SELECT (for the FOR-UPDATE pre-image) + INSERT/UPDATE/DELETE (forward op + the
+-- typed-inverse revert) on the writable table — and NOTHING that lets it DDL (it owns
+-- no objects and has no CREATE on the schema, so it cannot ALTER/DROP `accounts`).
+GRANT USAGE ON SCHEMA public TO pgb_applier;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.accounts TO pgb_applier;
+
+-- A NON-whitelisted secret the WALL must keep from the agent (default-deny proof). The
+-- applier has no business reading/writing it either (defense-in-depth default-deny).
 CREATE TABLE IF NOT EXISTS public.secret_data (id int PRIMARY KEY, secret text NOT NULL);
 INSERT INTO public.secret_data(id, secret) VALUES (1, 'TOP SECRET — never to the agent')
   ON CONFLICT (id) DO NOTHING;
 REVOKE ALL ON public.secret_data FROM pgb_agent;
+REVOKE ALL ON public.secret_data FROM pgb_applier;
 
 -- Drift-correct the SELECT-only audit reader's dev login password so the agent-facing
 -- reader DSN below authenticates. The role + its SELECT grant (and the REVOKE of every
 -- write) are created by 10_audit_meta.sql applied just above; this only pins the password
 -- (CREATE ROLE in that file runs once; ALTER keeps it in sync across re-runs).
 ALTER ROLE pgb_audit_reader LOGIN PASSWORD '$AUDIT_READER_PASSWORD';
+-- Drift-correct the constrained applier's dev login password so the applyd launch below
+-- authenticates as pgb_applier. The role + its attribute matrix are created by
+-- 10_hardened_role.sql (applied by local-stack); this only pins the password.
+ALTER ROLE pgb_applier LOGIN PASSWORD '$APPLIER_PASSWORD';
 SQL
 
 # The audit-WRITER DSN — used ONLY by the proxy/applyd/warden daemons (the path that
@@ -267,7 +291,7 @@ log "generated throwaway Ed25519 approver keypair (pubkey ${APPROVER_PUBKEY:0:16
 # ----------------------------------------------------------------------------
 # 6. Launch pgb-applyd — the write-path socket daemon. VERIFY-only on the chain.
 # ----------------------------------------------------------------------------
-log "launching pgb-applyd (Unix socket $SOCKET_PATH; write role on the primary; audit verify-only)…"
+log "launching pgb-applyd (Unix socket $SOCKET_PATH; constrained DML-only role pgb_applier on the primary; audit verify-only)…"
 APPLYD_LOG="$STATE_DIR/applyd.log"
 env \
   PGB_APPLYD_SOCKET="$SOCKET_PATH" \
@@ -277,8 +301,8 @@ env \
   PGB_BACKEND_HOST="$HOST" \
   PGB_BACKEND_PORT="$PRIMARY_PORT" \
   PGB_BACKEND_DB="$DEMO_DB" \
-  PGB_BACKEND_ROLE=postgres \
-  PGB_BACKEND_PASSWORD=unused-trust \
+  PGB_BACKEND_ROLE=pgb_applier \
+  PGB_BACKEND_PASSWORD="$APPLIER_PASSWORD" \
   PGB_META_DSN="$META_WRITER_DSN" \
   PGB_AUDIT_SIGNING_KEY="$AUDIT_SIGNING_KEY" \
   PGB_ANCHOR_PATH="$ANCHOR_PATH" \

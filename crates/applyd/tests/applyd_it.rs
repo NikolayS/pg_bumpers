@@ -119,6 +119,66 @@ fn read_accounts(url: &str) -> BTreeMap<i32, (String, i64)> {
     .collect()
 }
 
+/// Dev password for the constrained applier role in these tests.
+const APPLIER_PW: &str = "pgb_applier_it_pw";
+
+/// Provision the constrained, DML-only `pgb_applier` role (S5 #77) in the seeded
+/// DB, mirroring `deploy/sql/10_hardened_role.sql`. `over_grant=true` deliberately
+/// gives it SUPERUSER (the RED lever: a too-powerful applier that CAN DDL) so the
+/// DDL-denied assertion fails — proving the test has teeth. `over_grant=false` is
+/// the shipped least-privilege shape (NOSUPERUSER, NOCREATEDB/ROLE, no CREATE on
+/// public, DML-only on the app table).
+fn provision_applier(admin_url: &str, over_grant: bool) {
+    let mut c = Client::connect(admin_url, NoTls).expect("provision connect");
+    // Recreate cleanly so a prior run's grants/ownership never leak across tests.
+    // DROP OWNED first so a role that (e.g. in a RED run) created an object can still
+    // be dropped; then DROP ROLE. Both are no-ops when the role is absent.
+    if c.query_one(
+        "SELECT count(*) FROM pg_roles WHERE rolname='pgb_applier'",
+        &[],
+    )
+    .map(|r| r.get::<_, i64>(0))
+    .unwrap_or(0)
+        > 0
+    {
+        c.batch_execute("DROP OWNED BY pgb_applier CASCADE").ok();
+        c.batch_execute("DROP ROLE pgb_applier")
+            .expect("drop stale pgb_applier");
+    }
+    let attrs = if over_grant {
+        // RED lever: a superuser applier bypasses every grant → CAN DDL.
+        "SUPERUSER"
+    } else {
+        // Shipped shape: cannot DDL, cannot escalate.
+        "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+    };
+    c.batch_execute(&format!(
+        "CREATE ROLE pgb_applier LOGIN PASSWORD '{APPLIER_PW}' {attrs};"
+    ))
+    .expect("create pgb_applier");
+    // DML-only on the app table; USAGE on the schema; NO CREATE on public (the
+    // structural DDL denial). Ownership stays with the seeding superuser, so the
+    // applier can mutate ROWS but cannot ALTER/DROP the table.
+    c.batch_execute(
+        "REVOKE CREATE ON SCHEMA public FROM pgb_applier;\n\
+         GRANT USAGE ON SCHEMA public TO pgb_applier;\n\
+         GRANT SELECT, INSERT, UPDATE, DELETE ON public.accounts TO pgb_applier;",
+    )
+    .expect("grant applier DML");
+}
+
+/// Build a libpq URL that connects as `pgb_applier` to the given seeded DB url.
+fn applier_url(url: &str) -> String {
+    let mut parts: Vec<String> = url
+        .split_whitespace()
+        .filter(|kv| !kv.starts_with("user=") && !kv.starts_with("password="))
+        .map(|s| s.to_string())
+        .collect();
+    parts.push("user=pgb_applier".to_string());
+    parts.push(format!("password={APPLIER_PW}"));
+    parts.join(" ")
+}
+
 fn policy() -> pgb_policy::PolicyConfig {
     use pgb_policy::{
         AutonomyLevel, CloneConfig, CloneProvider, PitrConfig as PolicyPitr, PolicyConfig,
@@ -272,6 +332,188 @@ fn lifecycle_apply_commits_bounded_update_and_revert_restores_prestate() {
     );
 
     drop_db(&admin, &dbname);
+}
+
+// ===========================================================================
+//  (1b) LEAST-PRIVILEGE APPLIER ROLE (S5 #77) — the guarded apply COMMITS under the
+//       constrained, DML-only `pgb_applier` role (reads rows back), AND `pgb_applier`
+//       is genuinely DML-ONLY: a DDL attempt as that role is `permission denied`.
+//
+//  This is the teeth for the #77 hardening: applyd's resident apply connection no
+//  longer needs the SUPERUSER. We run the SAME grant-gated apply path as test (1),
+//  but the apply `Client` connects as `pgb_applier` (not `postgres`) — proving the
+//  write path works under reduced privilege — and we separately attempt CREATE/ALTER/
+//  DROP **plus the destructive write-capable vectors TRUNCATE and COPY … FROM/TO
+//  PROGRAM** as `pgb_applier` and assert each is rejected (42501), so a bug in the
+//  apply path cannot escalate into arbitrary DDL, nuke a table out-of-band, or run a
+//  server-side program. TRUNCATE/COPY-PROGRAM matter MOST precisely because this role
+//  CAN write rows — they are the high-blast vectors a write role must still be denied.
+//
+//  RED→GREEN: with `provision_applier(.., over_grant=true)` the role is SUPERUSER and
+//  the denied assertions FAIL (a too-powerful applier CAN DDL/TRUNCATE/COPY-PROGRAM —
+//  SUPERUSER bypasses every grant + holds pg_execute_server_program implicitly); with
+//  the shipped least-privilege shape (`over_grant=false`) every denial PASSES.
+// ===========================================================================
+
+#[test]
+fn guarded_apply_commits_as_constrained_applier_and_applier_cannot_ddl() {
+    if !it_enabled() {
+        eprintln!("[skip] set PG_BUMPERS_IT=1 to run the applier-role IT");
+        return;
+    }
+    let (admin, dbname) = create_seeded_db("applier_role");
+    let url = url_for(&admin, &dbname);
+
+    // Shipped least-privilege shape. Flip to `true` to reproduce RED.
+    provision_applier(&url, false);
+    let applier = applier_url(&url);
+
+    // ---- (a) the guarded write COMMITS under `pgb_applier` ----
+    let before = read_accounts(&url);
+    let (sk, vk) = keypair();
+    let clock = SystemClock::new();
+    let mut svc = service(vk);
+    let (proposal_id, total_rows, token) = approve_through(
+        &mut svc,
+        &sk,
+        &clock,
+        &url,
+        FORWARD,
+        "sess-applier",
+        "nonce-applier",
+    );
+
+    // The apply connection is `pgb_applier`, NOT the superuser — exactly what applyd
+    // now does by default (PGB_BACKEND_ROLE=pgb_applier).
+    let mut apply_client =
+        Client::connect(&applier, NoTls).expect("connect apply Client as pgb_applier");
+    let res = {
+        let mut conn = PgApplyConn::new(&mut apply_client, FORWARD, "id % 2 = 0");
+        svc.apply(
+            &proposal_id,
+            total_rows,
+            Some(&token),
+            &mut conn,
+            &NoopBarrier::new(),
+            &clock,
+        )
+        .expect("the grant-gated apply must COMMIT under the constrained pgb_applier role")
+    };
+    assert!(res.applied, "applied under pgb_applier");
+    assert_eq!(res.rows_written, 4, "bounded write committed 4 rows");
+    assert!(res.reversible, "reversible apply");
+
+    // Read the committed rows back (the write genuinely landed under reduced privilege).
+    let after = read_accounts(&url);
+    for &id in &[2, 4, 6, 8] {
+        assert_eq!(after[&id].1, 0, "even {id} zeroed by the committed write");
+    }
+    for &id in &[1, 3, 5, 7] {
+        assert_ne!(after[&id].1, 0, "odd {id} untouched (bounded)");
+    }
+    assert_ne!(before, after, "the apply changed state");
+
+    // ---- (b) `pgb_applier` is genuinely DML-ONLY: every DDL attempt is denied ----
+    let mut as_applier =
+        Client::connect(&applier, NoTls).expect("second connect as pgb_applier for DDL probes");
+
+    // CREATE TABLE — needs CREATE on schema (revoked) → permission denied.
+    let create_err = as_applier
+        .batch_execute("CREATE TABLE public.pgb_applier_should_not_exist (x int)")
+        .expect_err("CREATE TABLE as pgb_applier MUST be rejected (no CREATE on public)");
+    assert_permission_denied("CREATE TABLE", &create_err);
+
+    // DROP TABLE — the applier does not own `accounts` → permission denied.
+    let drop_err = as_applier
+        .batch_execute("DROP TABLE public.accounts")
+        .expect_err("DROP TABLE as pgb_applier MUST be rejected (not the owner)");
+    assert_permission_denied("DROP TABLE", &drop_err);
+
+    // ALTER TABLE — likewise an ownership-gated DDL → permission denied.
+    let alter_err = as_applier
+        .batch_execute("ALTER TABLE public.accounts ADD COLUMN sneaky int")
+        .expect_err("ALTER TABLE as pgb_applier MUST be rejected (not the owner)");
+    assert_permission_denied("ALTER TABLE", &alter_err);
+
+    // TRUNCATE — the destructive vector that matters MOST for a write-capable role: it
+    // empties the whole table in one statement, bypassing the bounded/reversible apply
+    // path entirely, and is NOT reversible by our typed-inverse. The applier has only
+    // SELECT/INSERT/UPDATE/DELETE (NO TRUNCATE privilege) and does not own `accounts`, so
+    // it is `permission denied` (42501). This is the teeth: a write-capable role must
+    // still be unable to nuke a table out-of-band.
+    let truncate_err = as_applier
+        .batch_execute("TRUNCATE public.accounts")
+        .expect_err("TRUNCATE as pgb_applier MUST be rejected (no TRUNCATE priv, not owner)");
+    assert_permission_denied("TRUNCATE", &truncate_err);
+
+    // COPY … FROM PROGRAM — the server-side command-execution / exfil vector. It is gated
+    // on pg_execute_server_program (member-of-nothing → NOT granted) + the superuser bit
+    // (NOSUPERUSER), both stripped for pgb_applier, so the attempt is `permission denied`
+    // (42501) BEFORE any program runs. (We assert both directions: FROM PROGRAM, the
+    // command-injection/ingest vector, and TO PROGRAM, the exfil vector.)
+    let copy_from_prog_err = as_applier
+        .batch_execute("COPY public.accounts FROM PROGRAM 'echo 1,owner,0'")
+        .expect_err("COPY FROM PROGRAM as pgb_applier MUST be rejected (no server-program priv)");
+    assert_permission_denied("COPY FROM PROGRAM", &copy_from_prog_err);
+
+    let copy_to_prog_err = as_applier
+        .batch_execute("COPY public.accounts TO PROGRAM 'cat > /tmp/pgb_applier_exfil'")
+        .expect_err("COPY TO PROGRAM as pgb_applier MUST be rejected (no server-program priv)");
+    assert_permission_denied("COPY TO PROGRAM", &copy_to_prog_err);
+
+    // Sanity: the DDL was truly blocked — `accounts` is intact and `sneaky` absent.
+    let cols: i64 = Client::connect(&url, NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='accounts' AND column_name='sneaky'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(cols, 0, "ALTER was blocked — no `sneaky` column added");
+
+    // Sanity: TRUNCATE was truly blocked — the 8 seeded rows are all still present (an
+    // empty table would prove the TRUNCATE leaked through despite the 42501).
+    let rows: i64 = Client::connect(&url, NoTls)
+        .unwrap()
+        .query_one("SELECT count(*) FROM public.accounts", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        rows, 8,
+        "TRUNCATE was blocked — all seeded rows still present"
+    );
+
+    // Teardown: drop the per-DB objects AND the cluster-global `pgb_applier` role so it
+    // does not persist after the test. The DML grants lived on objects inside `dbname`
+    // (gone with the DROP DATABASE), and the role owns nothing (ownership stayed with the
+    // seeding superuser), so DROP ROLE succeeds; `provision_applier` is also idempotent
+    // and re-drops defensively, so this is safe either way.
+    drop_db(&admin, &dbname);
+    {
+        let mut c = Client::connect(&admin, NoTls).expect("teardown admin connect");
+        // DROP OWNED is a no-op (the role owns nothing) but mirrors provision's defense.
+        c.batch_execute("DROP OWNED BY pgb_applier CASCADE").ok();
+        c.batch_execute("DROP ROLE IF EXISTS pgb_applier")
+            .expect("drop cluster-global pgb_applier role in teardown");
+    }
+}
+
+/// Assert a `postgres::Error` is an `insufficient_privilege` (SQLSTATE 42501,
+/// "permission denied") — the DB-level deny we want, not some other failure.
+fn assert_permission_denied(op: &str, err: &postgres::Error) {
+    use postgres::error::SqlState;
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("{op}: expected a DB error, got: {err}"));
+    assert_eq!(
+        *db.code(),
+        SqlState::INSUFFICIENT_PRIVILEGE,
+        "{op}: expected permission denied (42501), got {}: {}",
+        db.code().code(),
+        db.message()
+    );
 }
 
 // ===========================================================================

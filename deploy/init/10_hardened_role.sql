@@ -82,6 +82,92 @@ ALTER ROLE pgb_agent
 ALTER ROLE pgb_agent SET search_path = pg_catalog, "public";
 
 -- -------------------------------------------------------------------------------------
+-- 0b. The CONSTRAINED APPLY role `pgb_applier` (S5 #77 — least-privilege write path).
+--     The write-path daemon (`pgb-applyd`) connects as THIS role to run the grant-gated
+--     bounded-reversible apply (`guarded_apply_with_grant`). The deterministic floor
+--     (the application-layer §4 guards: WALL classify, cap/predicate gate, pre-image
+--     capture, reconciliation) is the PRIMARY control on what may be written. THIS role
+--     is DEFENSE-IN-DEPTH: it bounds what a bug in the apply path could even ATTEMPT at
+--     the DB level. It is DML-ONLY (SELECT/INSERT/UPDATE/DELETE on the application tables,
+--     granted in §6 below) and CANNOT DDL — no CREATE/ALTER/DROP, NOT superuser, owns no
+--     objects, member of nothing. Before #77 the only WORKING deployment ran applyd as the
+--     Postgres SUPERUSER (because `pgb_agent` is read-only and cannot write), so a bug in
+--     `guarded_apply_with_grant` could have issued arbitrary DDL. `pgb_applier` closes that.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgb_applier') THEN
+    -- Dev placeholder password; production credentials come from the secret store, not
+    -- this file. LOGIN so the daemon can connect.
+    CREATE ROLE pgb_applier LOGIN PASSWORD 'pgb_applier_dev_pw';
+  END IF;
+END
+$$;
+
+-- [ATTR] Re-assert the applier's attribute matrix every run (idempotent drift defense).
+-- Like pgb_agent it is NOT superuser, cannot create DBs/roles, cannot replicate, and
+-- RLS binds. NOCREATEDB/NOCREATEROLE + NOSUPERUSER are the structural DDL/escalation
+-- denials; INHERIT is fine (it is granted no roles to inherit from — member of nothing).
+ALTER ROLE pgb_applier
+  NOSUPERUSER       -- [ATTR] not superuser (no bypass-everything bit → no arbitrary DDL)
+  NOCREATEDB        -- [ATTR] cannot CREATE DATABASE
+  NOCREATEROLE      -- [ATTR] cannot create/alter roles (no lateral escalation)
+  NOREPLICATION     -- [ATTR] cannot start replication / create slots
+  NOBYPASSRLS       -- [ATTR] RLS policies bind
+  LOGIN;
+-- Pin the applier's search_path too (defense-in-depth; same honest caveat as pgb_agent's:
+-- a non-superuser can change its own role GUC, the authoritative path is set per-session).
+ALTER ROLE pgb_applier SET search_path = pg_catalog, "public";
+-- [REVOKE] The applier owns no schema and may NOT create objects in public — this is the
+-- key DDL denial at the schema level (a bug cannot `CREATE TABLE` even if it tried). It
+-- gets USAGE on public so it can reach the application tables its DML grants name (§6).
+REVOKE CREATE ON SCHEMA public FROM pgb_applier;
+GRANT  USAGE  ON SCHEMA public TO   pgb_applier;
+
+-- [REVOKE] Member-of-nothing for the APPLIER too — strip EVERY predefined pg_* role +
+-- any other (drift defense). pgb_applier is write-capable, so the destructive predefined
+-- roles (pg_execute_server_program → COPY … PROGRAM; pg_read/write_server_files → server-
+-- file read/write; pg_write_all_data) matter MORE here, not less. These are belt-and-
+-- suspenders (the role is NOSUPERUSER + member-of-nothing by construction), but re-asserting
+-- them every run is the whole point: a drifted GRANT can never silently arm the applier.
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT g.rolname AS granted_role
+    FROM pg_auth_members m
+    JOIN pg_roles a ON a.oid = m.member
+    JOIN pg_roles g ON g.oid = m.roleid
+    WHERE a.rolname = 'pgb_applier'
+  LOOP
+    EXECUTE format('REVOKE %I FROM pgb_applier', r.granted_role);
+  END LOOP;
+END
+$$;
+
+-- [REVOKE] Belt-and-suspenders: explicitly REVOKE the headline predefined roles from the
+-- applier (same list + same NOTICE-silencing as pgb_agent above). The destructive-vector
+-- ones for a WRITE-capable role are pg_execute_server_program (COPY … PROGRAM),
+-- pg_read_server_files / pg_write_server_files (server-file I/O), and pg_write_all_data;
+-- the applier's IT asserts a TRUNCATE and a COPY … PROGRAM as pgb_applier are denied.
+SET LOCAL client_min_messages = error;
+REVOKE pg_read_all_data            FROM pgb_applier;
+REVOKE pg_write_all_data           FROM pgb_applier;   -- no write outside the DML grants
+REVOKE pg_read_all_settings        FROM pgb_applier;
+REVOKE pg_read_all_stats           FROM pgb_applier;
+REVOKE pg_stat_scan_tables         FROM pgb_applier;
+REVOKE pg_monitor                  FROM pgb_applier;
+REVOKE pg_execute_server_program   FROM pgb_applier;   -- the COPY … PROGRAM gate
+REVOKE pg_read_server_files        FROM pgb_applier;   -- pg_read_file / server-file read
+REVOKE pg_write_server_files       FROM pgb_applier;   -- server-file write
+REVOKE pg_maintain                 FROM pgb_applier;
+REVOKE pg_checkpoint               FROM pgb_applier;
+REVOKE pg_signal_backend           FROM pgb_applier;
+REVOKE pg_create_subscription      FROM pgb_applier;
+REVOKE pg_use_reserved_connections FROM pgb_applier;
+RESET client_min_messages;
+
+-- -------------------------------------------------------------------------------------
 -- 1. [REVOKE] Member-of-nothing — strip EVERY predefined pg_* role + any other.
 --    Enumerate ALL roles the agent is a member of and REVOKE them, so the matrix test's
 --    "pg_auth_members empty for the agent" assertion holds. This explicitly covers
@@ -248,6 +334,17 @@ GRANT SELECT ON public.allowed_read TO pgb_agent;
 -- defends against drift where a prior run / operator granted it).
 REVOKE ALL ON public.secret_data FROM pgb_agent;
 
+-- THE APPLIER'S DML SURFACE (S5 #77): the constrained write role gets SELECT/INSERT/
+-- UPDATE/DELETE on the application table(s) the bounded-reversible apply may touch — and
+-- NOTHING that lets it DDL. (The apply needs SELECT for the FOR-UPDATE pre-image capture,
+-- INSERT/UPDATE/DELETE for the forward op + the typed-inverse revert.) Real deployments
+-- replace `public.allowed_read` with their own writable application relations and grant
+-- the applier DML on exactly those. NO ownership is transferred (owner = postgres), so
+-- the applier still cannot ALTER/DROP these tables — only mutate their ROWS.
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.allowed_read TO pgb_applier;
+-- The applier must NOT read/write the secret (default-deny; drift defense).
+REVOKE ALL ON public.secret_data FROM pgb_applier;
+
 COMMIT;
 
 -- =====================================================================================
@@ -266,4 +363,12 @@ COMMIT;
 -- a trojan. deploy/test/wall_matrix.sh asserts every deny by attempting it as the agent,
 -- AND asserts the search_path invariant (agent mutates path + RESET ALL → STILL cannot
 -- read non-whitelisted data or write anywhere).
+--
+-- pgb_applier (S5 #77): the constrained write-path role applyd connects as. LOGIN,
+-- NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on public, owns
+-- no objects -> it CANNOT DDL (no CREATE/ALTER/DROP). It is granted DML ONLY (SELECT/
+-- INSERT/UPDATE/DELETE) on the application table(s) above -- the defense-in-depth floor
+-- under the §4 application-layer apply guards (which remain the primary control). The
+-- applyd IT proves both halves: a guarded write COMMITS as pgb_applier AND a DDL attempt
+-- as pgb_applier is rejected with `permission denied`.
 -- =====================================================================================

@@ -86,3 +86,26 @@ approvers:
 # §10.9 — external append-only / WORM audit anchor (wired in S4).
 audit:
   anchor_endpoint: "https://audit-anchor.internal/v1/append"
+
+# §4 "Warden", §10.10 — the live out-of-band watchdog's operational thresholds.
+#
+# HOW WARDEN READS THIS: the warden parses ITS OWN `warden:` section out of this same
+# policy.yaml (crates/warden/src/thresholds.rs `WardenThresholds::from_policy_yaml`,
+# loaded fail-closed at startup by `load_thresholds_fail_closed`). It is parsed
+# SEPARATELY from `PolicyConfig` (which owns the role model above) so the warden owns
+# its own knobs without widening the policy crate's schema — the two share ONE file
+# without coupling their types. A MISSING `warden:` section is NOT an un-guarded warden:
+# the warden falls back to the conservative built-in `WardenThresholds::default()`
+# (the exact values shown below). A PRESENT-but-invalid section (any value that would
+# DISABLE a guard — a 0ms busy-loop poll, a multi-hour poll, a zero ceiling, a zero
+# trip-count/cooldown) is REJECTED and the warden refuses to start (fail-closed).
+#
+# The values below are the shipped defaults, made explicit so a deployment can SEE and
+# tune what the warden enforces rather than relying on invisible hardcoded numbers.
+warden:
+  poll_interval_millis: 2000              # poll cadence (SPEC §4: 1–5s). Bounds: (0, 1h].
+  max_query_runtime_millis: 60000         # kill an AGENT-tagged backend past this (runaway).
+  slot_retained_wal_alarm_bytes: 67108864 # 64 MiB: alarm when a replication slot retains more.
+  breaker_lag_trip_bytes: 134217728       # 128 MiB: trip the breaker on replication lag past this.
+  breaker_runaway_trip_count: 3           # trip when this many concurrent agent runaways are seen.
+  breaker_cooldown_millis: 30000          # how long the breaker stays OPEN before probing recovery.

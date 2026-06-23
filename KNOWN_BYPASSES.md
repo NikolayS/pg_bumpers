@@ -64,6 +64,49 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
   prove the WALL denies DROP / COPY…PROGRAM / pg_read_file / non-whitelisted reads
   when the agent connects WITHOUT the proxy. The marquee's CLASS 1 shows the
   applyd refusal even when driven *through* the MCP.
+- **These recoverable denials are UNAUDITED BY DESIGN (S5 #77 item 3) — but at TWO
+  distinct seams; the per-code attribution matters.** A `_meta` audit record is written
+  only when a mutation actually executes; none of these does, so none is audited. Where
+  the *rejection itself* happens, however, differs by code — and only the first two are
+  truly "at the shell before any RPC":
+  - **`READ_ONLY`** — emitted by the cooperative MCP shell **before any RPC**: a
+    `query`/`explain_plan` whose inner statement is a write/DDL or a stacked statement is
+    blocked by the cooperative classifier (`pgb_pgwire::classify`) before the proxy wire
+    (`crates/mcp/src/server.rs` `tool_query` / `tool_explain`).
+  - **`CONFIRM_REQUIRED`** — emitted by the cooperative MCP shell **before any RPC**:
+    `apply_write` called with no `confirm_rows` is blocked at the shell (absence ≠ "just
+    apply") *before* the applyd `apply` RPC (`tool_apply_write`'s `confirm_rows` guard).
+  - **`PROPOSAL_NOT_FOUND`** — this is an **applyd-side** code, NOT a shell short-circuit.
+    The MCP `PgBumpersMcp` struct holds **no proposal registry** (only `role` / `session_id`
+    / `proxy` / `applyd` / `audit` — §4 statelessness), so it *cannot* know whether an id
+    exists: `dry_run`/`apply_write` forward the request to applyd, and **applyd** rejects it
+    at proposal-lookup (`crates/applyd/src/protocol.rs` `ErrorCode::ProposalNotFound`,
+    raised in `crates/applyd/src/service.rs`). The request DOES reach applyd; it is just
+    rejected **before any write executes**, so still no mutation and still no `_meta` record.
+  - **`NOT_REHEARSABLE`** — likewise primarily an **applyd-side** code: applyd raises it at
+    `dry_run`/classify when the statement is structural/irreversible, a non-`int4` PK, or a
+    steerable (non-self-determined) predicate (`crates/applyd/src/service.rs` →
+    `crates/applyd/src/protocol.rs` `ErrorCode::NotRehearsable`). The request reaches applyd
+    and is refused **before any write executes**. (The MCP read classifier can independently
+    fail-close a malformed/empty *read* statement to a `READ_ONLY` block, but the
+    `NOT_REHEARSABLE` write-refusal verdict is applyd's.)
+  This is **intentional and acceptable**: the floor + its audit live in the
+  **proxy + applyd** (the real boundaries). The umbrella honesty point holds for all four —
+  the denial is unaudited because **no mutation ever executes**, whether it is rejected at
+  the cooperative MCP seam (`READ_ONLY` / `CONFIRM_REQUIRED`, before any RPC) OR by applyd
+  before executing a write (`PROPOSAL_NOT_FOUND` / `NOT_REHEARSABLE`, at proposal-lookup /
+  classify) — there is nothing for the durable chain to attest. Critically, the agent-facing
+  `pgb-mcp` process holds **only the
+  SELECT-only `pgb_audit_reader`** credential (#97; it *reads* the `_meta` tail for
+  `get_audit` but has **no** INSERT capability) — emitting a shell-side audit record
+  would require putting an audit-WRITE credential into the agent process, which is
+  **forbidden** (least privilege; "the audited cannot write audit", SPEC §3/§10.9).
+  So the honest contract is: the MCP seam may *cooperatively short-circuit* a request
+  with a recoverable block, but the **authoritative, audited** denials are the ones the
+  proxy/WALL and applyd record — and those still fire for any request that reaches the
+  wire (incl. an agent that *skips* the cooperative shell entirely). Whenever an
+  MCP-seam block would also be a real floor violation, driving the same statement
+  *through to* applyd/proxy (or directly to the DB) produces the audited refusal.
 - **SPEC.amendments tie:** "S5 — MCP production wire + live Core (#67)" →
   *"Not a security boundary (the honesty contract)"*.
 

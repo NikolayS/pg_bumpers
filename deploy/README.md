@@ -171,7 +171,10 @@ Claude Code**. It:
      **MCP read path is wired through this endpoint** (`PGB_PROXY_*`), not raw PG18.
      The proxy is the audit-chain anchor **owner**.
    - **`pgb-applyd`** on a Unix socket — the grant-gated `guarded_apply_with_grant`
-     write floor. Audit chain **verify-only**.
+     write floor. It connects to the primary as the **constrained, DML-only applier
+     role `pgb_applier`** (S5 #77) — not the superuser, not the read-only WALL role —
+     so a bug in the apply path cannot DDL (defense-in-depth under the §4 floor). Audit
+     chain **verify-only**.
    - **`pgb-warden`** — the live out-of-band watchdog, auditing to the **same** chain.
 5. prints the **ready-to-paste `claude mcp add`** line with the exact env the server
    needs, plus how to do the operator approve step.
@@ -262,7 +265,7 @@ proxy** — and refuses any agent connection that doesn't originate from the pro
 
 | Artifact | What it is |
 |----------|------------|
-| `sql/10_hardened_role.sql` | **Canonical, idempotent** hardened-role migration: creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles + PUBLIC EXECUTE, **revokes TEMP on the database + the in-DB large-object write built-ins** (so there is **no write grant ANYWHERE**), sets a **best-effort** role-level `search_path` pin (see note below), grants **SELECT-whitelist only**, default-deny everywhere. |
+| `sql/10_hardened_role.sql` | **Canonical, idempotent** hardened-role migration: creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles + PUBLIC EXECUTE, **revokes TEMP on the database + the in-DB large-object write built-ins** (so there is **no write grant ANYWHERE**), sets a **best-effort** role-level `search_path` pin (see note below), grants **SELECT-whitelist only**, default-deny everywhere. It also creates the **constrained, DML-only applier role `pgb_applier`** (S5 #77 — the role `pgb-applyd` connects as): LOGIN, NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on `public`, owns nothing → **cannot DDL**; granted **SELECT/INSERT/UPDATE/DELETE on the application table(s) only** (defense-in-depth under the §4 application-layer apply floor — running applyd as the superuser is discouraged). |
 | `init/10_hardened_role.sql` | Byte-for-byte **synced copy** of the canonical SQL, picked up by the docker entrypoint (`/docker-entrypoint-initdb.d`, runs after `00_README.sql`). `sql/check-init-sync.sh` guards against drift. |
 | `hba/pg_hba.agent-boundary.conf.template` | **Layer 0** `pg_hba` rules: agent role permitted **only from the proxy host's CIDR**; every other origin `reject`ed. |
 | `hba/render-hba.sh` | Generator that substitutes the template's placeholders (`--proxy-cidr 10.0.0.5/32 …`). Append its output to `$PGDATA/pg_hba.conf` **above** any catch-all. |

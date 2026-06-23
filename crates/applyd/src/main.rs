@@ -18,7 +18,10 @@
 //! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` /
 //!   `PGB_BACKEND_ROLE` / `PGB_BACKEND_PASSWORD` — the PRIMARY the resident apply
 //!   `Client` connects to (defaults `127.0.0.1` / `54321` / `postgres` /
-//!   `pgb_agent`; **never 5432**).
+//!   `pgb_applier`; **never 5432**). `PGB_BACKEND_ROLE` defaults to the constrained,
+//!   DML-ONLY applier role `pgb_applier` (S5 #77) — NOT the read-only WALL role
+//!   `pgb_agent`, and NOT the superuser. It is defense-in-depth at the DB level under
+//!   the application-layer §4 apply floor; running applyd as superuser is discouraged.
 //! - `PGB_META_DSN` / `PGB_AUDIT_SIGNING_KEY` / `PGB_ANCHOR_PATH` /
 //!   `PGB_ANCHOR_INTERVAL_MS` — the shared `_meta` audit chain (same as the proxy).
 //!
@@ -119,13 +122,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let sink = SharedSink::from_arc(boot.sink_arc());
 
-    // The resident PG18 apply Client (the primary as the WALL role; never 5432).
+    // The resident PG18 apply Client connects to the primary as the CONSTRAINED,
+    // DML-ONLY applier role `pgb_applier` (S5 #77; never 5432). This is NOT the WALL
+    // role: the WALL role (`pgb_agent`) is read-only and CANNOT write, so it can never
+    // carry the apply path. The deterministic floor on the write is the application-layer
+    // §4 guard set (`guarded_apply_with_grant`: WALL classify, cap/predicate gate,
+    // pre-image capture, reconciliation). `pgb_applier` is DEFENSE-IN-DEPTH at the DB
+    // level: it has DML only (SELECT/INSERT/UPDATE/DELETE on the application tables) and
+    // CANNOT DDL (NOSUPERUSER, no CREATE on the schema, owns no objects), so a bug in the
+    // apply path cannot do arbitrary DDL. (Running applyd as the Postgres SUPERUSER — the
+    // pre-#77 workaround for `pgb_agent` being read-only — is what this default avoids.)
     let backend_dsn = format!(
         "host={} port={} dbname={} user={} password={}",
         env_or("PGB_BACKEND_HOST", "127.0.0.1"),
         env_or("PGB_BACKEND_PORT", "54321"),
         env_or("PGB_BACKEND_DB", "postgres"),
-        env_or("PGB_BACKEND_ROLE", "pgb_agent"),
+        env_or("PGB_BACKEND_ROLE", "pgb_applier"),
         env_secret("PGB_BACKEND_PASSWORD")?,
     );
     let apply_client = Client::connect(&backend_dsn, NoTls)

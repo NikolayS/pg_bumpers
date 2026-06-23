@@ -12,7 +12,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The warden's operational thresholds (SPEC §4, §10.10).
+///
+/// `deny_unknown_fields`: a MISSPELLED threshold key inside the `warden:` section
+/// (e.g. `breaker_cooldwn_millis`) is a **parse error**, not a silently-ignored
+/// field that leaves the default in place — so a typo in `policy.yaml` fails closed
+/// (and the shipped-example drift test catches it). This only rejects unknown keys
+/// *within* this struct; the surrounding document's other top-level keys (`version`,
+/// `roles`, …) are parsed by `pgb_policy::PolicyConfig` and are unaffected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WardenThresholds {
     /// Poll cadence in milliseconds (SPEC §4: 1–5s; **mockable** via the
     /// injected [`Clock`](pgb_core::Clock)). Bounds keep an operator from
@@ -226,5 +234,84 @@ warden:
     #[test]
     fn default_validates() {
         assert!(WardenThresholds::default().validate().is_ok());
+    }
+
+    /// The SHIPPED policy example now documents a `warden:` section (S5 #77 item 2).
+    /// Assert it parses, validates, AND equals the conservative built-in default — so
+    /// the example is HONEST (a deployment sees exactly what the warden enforces) and a
+    /// drift between the doc'd numbers and the code default would fail CI.
+    ///
+    /// STRUCTURAL drift, not just value drift (S5 #77 review fix): the value-equality
+    /// check ALONE is blind to a *missing/misspelled* section or field — because a
+    /// renamed `warden:` key (or, before `deny_unknown_fields`, a typo'd threshold field)
+    /// silently falls back to `default()`, so `default == default` would still pass and
+    /// hide the drift. We therefore ALSO assert the example string literally CONTAINS a
+    /// `warden:` section header and every expected field name before/alongside the value
+    /// comparison. Combined with `#[serde(deny_unknown_fields)]` on `WardenThresholds`
+    /// (a misspelled threshold key now fails to PARSE), the test fails if the section is
+    /// renamed OR any field is misspelled — not only if a value drifts.
+    #[test]
+    fn shipped_policy_example_warden_section_matches_the_default() {
+        const EXAMPLE: &str = include_str!("../../policy/policy.example.yaml");
+
+        // (1) STRUCTURE: the section header + every field name must be literally present.
+        // Catches a renamed `warden:` key (which would otherwise fall back to default()
+        // and pass the value check) and a renamed/dropped field. We match the `<field>:`
+        // form so a *value* edit can't accidentally satisfy a *field-name* assertion.
+        assert!(
+            EXAMPLE.contains("\nwarden:"),
+            "policy.example.yaml must document a top-level `warden:` section \
+             (a renamed key silently falls back to WardenThresholds::default())"
+        );
+        for field in [
+            "poll_interval_millis:",
+            "max_query_runtime_millis:",
+            "slot_retained_wal_alarm_bytes:",
+            "breaker_lag_trip_bytes:",
+            "breaker_runaway_trip_count:",
+            "breaker_cooldown_millis:",
+        ] {
+            assert!(
+                EXAMPLE.contains(field),
+                "policy.example.yaml `warden:` section is missing the `{field}` field \
+                 (a misspelled/dropped field would silently use the default)"
+            );
+        }
+
+        // (2) PARSE + VALIDATE: `deny_unknown_fields` means a typo'd threshold key here
+        // is a hard parse error, not a silently-defaulted field.
+        let t = WardenThresholds::from_policy_yaml(EXAMPLE)
+            .expect("the shipped policy.example.yaml `warden:` section must parse + validate");
+
+        // (3) VALUES: the documented numbers must match the conservative built-in default.
+        assert_eq!(
+            t,
+            WardenThresholds::default(),
+            "the documented `warden:` values must match WardenThresholds::default() — \
+             update both together if you change a threshold"
+        );
+    }
+
+    /// `deny_unknown_fields` teeth: a MISSPELLED threshold key inside `warden:` is a
+    /// parse error (fail-closed), not a silently-ignored field that leaves the default.
+    /// This is what makes the structural half of the drift test bite for a field typo.
+    #[test]
+    fn rejects_unknown_warden_threshold_key() {
+        // A full, otherwise-valid warden section with ONE misspelled key.
+        let yaml = "warden:\n  \
+            poll_interval_millis: 2000\n  \
+            max_query_runtime_millis: 60000\n  \
+            slot_retained_wal_alarm_bytes: 67108864\n  \
+            breaker_lag_trip_bytes: 134217728\n  \
+            breaker_runaway_trip_count: 3\n  \
+            breaker_cooldwn_millis: 30000\n"; // typo: cooldwn
+        let err = WardenThresholds::from_policy_yaml(yaml).expect_err(
+            "a misspelled warden threshold key must FAIL to parse (deny_unknown_fields)",
+        );
+        // It is a parse error (not a validation error).
+        assert!(
+            matches!(err, ThresholdError::Parse(_)),
+            "expected a Parse error for the unknown key, got: {err}"
+        );
     }
 }
