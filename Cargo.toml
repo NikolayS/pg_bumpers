@@ -37,6 +37,10 @@ members = [
     # golden file. Its pure-logic gate runs in the fast `cargo test`; DB-backed
     # scenarios are env-gated (PG_BUMPERS_IT=1).
     "dbsafe-bench",
+    # The ONE shared test-support helper (issue #44): the unified PG18 bin-dir
+    # resolver every env-gated IT calls, so the precedence lives + is unit-tested
+    # in exactly one place. publish = false; dev-dependency only.
+    "crates/test-support",
 ]
 
 # Shared metadata for every crate in the workspace. Crates opt in via

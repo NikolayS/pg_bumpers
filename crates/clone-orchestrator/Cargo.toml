@@ -72,3 +72,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # `SigningKey::generate(&mut OsRng)` compiles (cargo unions features across the
 # normal + dev dep). The library dep stays default-features = false.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# The ONE shared PG18 bin-dir resolver every env-gated IT calls (issue #44), so
+# the `PG_BUMPERS_PG18_BIN → PG_BUMPERS_PGBIN → Homebrew` precedence lives + is
+# unit-tested in exactly one place (no per-resolver drift).
+pgb-test-support = { path = "../test-support" }

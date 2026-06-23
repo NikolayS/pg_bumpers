@@ -45,7 +45,9 @@ This is an MVP under active construction. Honest status as of this writing:
 
 `postgresql@18` is **keg-only**, so its binaries are not symlinked onto `PATH`. They
 live at `/opt/homebrew/opt/postgresql@18/bin` — the path every dev script defaults to
-(override with `PGBIN=` / `PG_BUMPERS_PGBIN=`).
+(override with the unified `PG_BUMPERS_PG18_BIN` — the one variable CI sets, honored by
+every shell script *and* every Rust IT and taking precedence over the legacy `PGBIN=` /
+`PG_BUMPERS_PGBIN=`).
 
 ```sh
 brew install postgresql@18
@@ -106,7 +108,8 @@ against the primary on every run.
 | meta    | **54323** | separate cluster hosting the append-only `_meta` audit DB (§4) |
 
 Override per-cluster with `PG_BUMPERS_PRIMARY_PORT` / `PG_BUMPERS_REPLICA_PORT` /
-`PG_BUMPERS_META_PORT`, the bin dir with `PGBIN`, and the data dir with
+`PG_BUMPERS_META_PORT`, the bin dir with the unified `PG_BUMPERS_PG18_BIN` (the one
+variable CI sets, taking precedence over the legacy `PGBIN`), and the data dir with
 `PG_BUMPERS_LOCALSTACK_DIR`.
 
 Connect (trust auth, loopback only — throwaway dev clusters; `-X` bypasses your `~/.psqlrc`):

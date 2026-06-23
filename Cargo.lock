@@ -270,6 +270,7 @@ dependencies = [
  "pgb-pgwire",
  "pgb-policy",
  "pgb-proxy",
+ "pgb-test-support",
  "postgres",
  "serde",
  "serde_json",
@@ -834,6 +835,7 @@ dependencies = [
  "pgb-clone-orchestrator",
  "pgb-core",
  "pgb-policy",
+ "pgb-test-support",
  "postgres",
  "rand_core 0.6.4",
  "serde",
@@ -865,6 +867,7 @@ dependencies = [
  "pgb-pgwire",
  "pgb-policy",
  "pgb-proxy",
+ "pgb-test-support",
  "postgres",
  "rand_core 0.6.4",
  "rcgen",
@@ -931,12 +934,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgb-test-support"
+version = "0.0.0"
+
+[[package]]
 name = "pgb-warden"
 version = "0.0.0"
 dependencies = [
  "pgb-audit",
  "pgb-core",
  "pgb-policy",
+ "pgb-test-support",
  "postgres",
  "serde",
  "serde_yaml_ng",

@@ -35,27 +35,13 @@ fn it_enabled() -> bool {
     std::env::var(IT_ENV).map(|v| v == "1").unwrap_or(false)
 }
 
-/// The Homebrew keg path — the macOS dev fallback shared by every IT resolver.
-const HOMEBREW_PG18_BIN: &str = "/opt/homebrew/opt/postgresql@18/bin";
-
-/// Pure precedence for the unified PG18 bin-dir resolution (issue #44):
-/// `PG_BUMPERS_PG18_BIN` (the ONE cross-IT/CI var) wins, then the crate's legacy
-/// var (back-compat for local dev), then the Homebrew keg path. Factored out so
-/// the ordering is unit-tested without mutating process-global env.
-fn resolve_pg18_bin(pg18: Option<&str>, legacy: Option<&str>) -> String {
-    pg18.filter(|s| !s.is_empty())
-        .or(legacy.filter(|s| !s.is_empty()))
-        .unwrap_or(HOMEBREW_PG18_BIN)
-        .to_string()
-}
-
-/// The PG18 bin dir. Precedence (unified across every IT — issue #44):
-/// `PG_BUMPERS_PG18_BIN` → `PG_BUMPERS_PGBIN` (legacy) → the Homebrew keg path.
+/// The PG18 bin dir, via the ONE shared resolver (issue #44). Precedence
+/// (unified across every IT): `PG_BUMPERS_PG18_BIN` (non-empty) →
+/// `PG_BUMPERS_PGBIN` (legacy, non-empty) → the Homebrew keg path. The precedence
+/// — including the set-but-empty fall-through — is unit-tested in `pgb-test-support`
+/// against this exact function.
 fn pg_bin() -> PathBuf {
-    PathBuf::from(resolve_pg18_bin(
-        std::env::var("PG_BUMPERS_PG18_BIN").ok().as_deref(),
-        std::env::var("PG_BUMPERS_PGBIN").ok().as_deref(),
-    ))
+    pgb_test_support::resolve_pg18_bin("PG_BUMPERS_PGBIN")
 }
 
 fn tool(name: &str) -> PathBuf {
@@ -369,39 +355,4 @@ fn proxy_classifier_block_agrees_with_the_server_for_writes() {
     );
 
     eprintln!("[gate_it] proxy classifier ↔ server agreement (write blocked, read allowed) — PASS");
-}
-
-/// DB-FREE unit test (issue #44): the unified PG18 bin-dir precedence —
-/// `PG_BUMPERS_PG18_BIN` (the ONE cross-IT/CI var) wins over the legacy var,
-/// which wins over the Homebrew fallback; empty strings are ignored. Runs in the
-/// fast (DB-free) job too, so a regression in the resolver ordering is caught
-/// even without a live PG18.
-#[test]
-fn pg18_bin_precedence_is_unified() {
-    // 1. The cross-IT/CI var wins over the legacy var.
-    assert_eq!(
-        resolve_pg18_bin(Some("/ci/pg18"), Some("/legacy")),
-        "/ci/pg18",
-        "PG_BUMPERS_PG18_BIN must take precedence over the legacy var"
-    );
-    // 2. The legacy var is honored when the cross-IT/CI var is absent (local dev).
-    assert_eq!(
-        resolve_pg18_bin(None, Some("/legacy")),
-        "/legacy",
-        "the legacy var is the local-dev back-compat fallback"
-    );
-    // 3. The Homebrew keg path is the final fallback when neither is set.
-    assert_eq!(
-        resolve_pg18_bin(None, None),
-        HOMEBREW_PG18_BIN,
-        "the Homebrew keg path is the macOS dev fallback"
-    );
-    // 4. An empty cross-IT/CI var falls through to the legacy var (not "").
-    assert_eq!(
-        resolve_pg18_bin(Some(""), Some("/legacy")),
-        "/legacy",
-        "an empty PG_BUMPERS_PG18_BIN must not shadow the legacy var"
-    );
-    // 5. Empty everywhere → the Homebrew fallback (never an empty bin dir).
-    assert_eq!(resolve_pg18_bin(Some(""), Some("")), HOMEBREW_PG18_BIN);
 }

@@ -84,3 +84,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 hex = "0.4"
+# The ONE shared PG18 bin-dir resolver every env-gated IT calls (issue #44), so
+# the `PG_BUMPERS_PG18_BIN → PG_BUMPERS_PG_BINDIR → Homebrew` precedence lives + is
+# unit-tested in exactly one place (no per-resolver drift).
+pgb-test-support = { path = "../test-support" }

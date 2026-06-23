@@ -16,16 +16,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The PG18 bin dir. Precedence (unified across every IT — issue #44):
-/// 1. `PG_BUMPERS_PG18_BIN` — the ONE cross-IT/CI variable (set on the runner).
-/// 2. `PG_BUMPERS_PGBIN` — this crate's legacy var (back-compat for local dev).
-/// 3. the Homebrew keg path — the macOS dev fallback.
+/// The PG18 bin dir, via the ONE shared resolver (issue #44). Precedence
+/// (unified across every IT): `PG_BUMPERS_PG18_BIN` (non-empty) → `PG_BUMPERS_PGBIN`
+/// (this crate's legacy var, non-empty) → the Homebrew keg path. The precedence —
+/// including the set-but-empty fall-through — is unit-tested in `pgb-test-support`.
 pub fn pg_bin() -> PathBuf {
-    PathBuf::from(
-        std::env::var("PG_BUMPERS_PG18_BIN")
-            .or_else(|_| std::env::var("PG_BUMPERS_PGBIN"))
-            .unwrap_or_else(|_| "/opt/homebrew/opt/postgresql@18/bin".to_string()),
-    )
+    pgb_test_support::resolve_pg18_bin("PG_BUMPERS_PGBIN")
 }
 
 fn tool(name: &str) -> PathBuf {

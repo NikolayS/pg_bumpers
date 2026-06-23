@@ -104,6 +104,19 @@ jobs:
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          # FAIL CLOSED: pin the PGDG signing-key fingerprint before it ever
+          # enters the apt keyring. A substituted key (MITM / compromised mirror)
+          # has a different fingerprint, so this aborts the whole install instead
+          # of trusting an attacker's repo (issue #44 review, FIX 3).
+          PGDG_KEY_FPR=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+          got_fpr=$(gpg --show-keys --with-colons --with-fingerprint \
+            /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            | awk -F: '$1 == "fpr" { print $10; exit }')
+          if [ "$got_fpr" != "$PGDG_KEY_FPR" ]; then
+            echo "PGDG signing-key fingerprint mismatch: got '${got_fpr}', expected '${PGDG_KEY_FPR}' — aborting (fail closed)" >&2
+            exit 1
+          fi
+          echo "PGDG signing-key fingerprint verified: ${got_fpr}"
           # shellcheck disable=SC1091
           . /etc/os-release
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \

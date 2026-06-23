@@ -61,13 +61,14 @@ fn it_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// The PG18 bin dir. Precedence (unified across every IT — issue #44):
-/// `PG_BUMPERS_PG18_BIN` (the ONE cross-IT/CI var) → `PG_BUMPERS_PGBIN` (legacy,
-/// local back-compat) → the Homebrew keg path (macOS dev fallback).
+/// The PG18 bin dir, via the ONE shared resolver (issue #44). Precedence
+/// (unified across every IT): `PG_BUMPERS_PG18_BIN` (non-empty) → `PG_BUMPERS_PGBIN`
+/// (legacy, non-empty) → the Homebrew keg path. The precedence — including the
+/// set-but-empty fall-through — is unit-tested in `pgb-test-support`.
 fn pgbin() -> String {
-    std::env::var("PG_BUMPERS_PG18_BIN")
-        .or_else(|_| std::env::var("PG_BUMPERS_PGBIN"))
-        .unwrap_or_else(|_| "/opt/homebrew/opt/postgresql@18/bin".to_string())
+    pgb_test_support::resolve_pg18_bin("PG_BUMPERS_PGBIN")
+        .to_string_lossy()
+        .into_owned()
 }
 
 // --------------------------------------------------------------------------

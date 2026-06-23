@@ -247,8 +247,9 @@ bash deploy/smoke.sh
 ```
 
 The smoke harness targets the **Path B** ports by default; override via
-`PG_BUMPERS_PRIMARY_PORT` / `PG_BUMPERS_REPLICA_PORT` / `PG_BUMPERS_META_PORT` (and
-`PGBIN`) to point it at any equivalent stack.
+`PG_BUMPERS_PRIMARY_PORT` / `PG_BUMPERS_REPLICA_PORT` / `PG_BUMPERS_META_PORT` (and the
+bin dir with the unified `PG_BUMPERS_PG18_BIN` — the one variable CI sets, taking
+precedence over the legacy `PGBIN`) to point it at any equivalent stack.
 
 ---
 

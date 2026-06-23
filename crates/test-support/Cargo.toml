@@ -1,0 +1,25 @@
+# pgb-test-support — the ONE shared helper for the env-gated PG18 integration
+# tests (issue #44). Today it carries a single thing: the unified PG18 bin-dir
+# resolver, so all four IT resolvers (dbsafe-bench gate_it, clone-orchestrator
+# cluster, warden_it, mcp write_path_e2e) share ONE implementation of the
+# `PG_BUMPERS_PG18_BIN → <legacy var> → Homebrew keg` precedence — and the
+# precedence is unit-tested against the exact function the callers use, not a
+# per-resolver copy. NOT a production crate (`publish = false`); pulled in only
+# as a `[dev-dependencies]` of the IT crates.
+[package]
+name = "pgb-test-support"
+description = "pg_bumpers shared test-support: the unified PG18 bin-dir resolver for the env-gated integration tests (issue #44)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pgb_test_support"
+path = "src/lib.rs"
+
+# No dependencies — std-only. Keeps the dev-dep surface (and cargo-deny) trivial.
+[dependencies]

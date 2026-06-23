@@ -39,3 +39,7 @@ serde_json = "1"
 # via psql/initdb (no extra deps) plus a synchronous client for the WALL
 # direct-to-DB-bypass denial.
 postgres = "0.19"
+# The ONE shared PG18 bin-dir resolver every env-gated IT calls (issue #44), so
+# the `PG_BUMPERS_PG18_BIN → legacy → Homebrew` precedence lives + is unit-tested
+# in exactly one place (no per-resolver drift).
+pgb-test-support = { path = "../crates/test-support" }

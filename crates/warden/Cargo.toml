@@ -42,3 +42,10 @@ thiserror = "2"
 # client the proxy + audit `_meta` sink use, so it adds no new license surface and
 # keeps `cargo deny check` green. Feature-gated so the pure logic builds without it.
 postgres = { version = "0.19", optional = true }
+
+[dev-dependencies]
+# The ONE shared PG18 bin-dir resolver every env-gated IT calls (issue #44), so
+# the `PG_BUMPERS_PG18_BIN → PG_BUMPERS_PGBIN → Homebrew` precedence lives + is
+# unit-tested in exactly one place (no per-resolver drift). Used by the env-gated
+# `warden_it` integration test (`PG_BUMPERS_IT=1`).
+pgb-test-support = { path = "../test-support" }
