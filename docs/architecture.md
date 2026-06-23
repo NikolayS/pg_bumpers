@@ -72,7 +72,7 @@ Architecture is **four layers plus one blocking network boundary** (SPEC §3). T
 
 ## 2. The crate map (as built)
 
-A Cargo workspace (root [`Cargo.toml`](../Cargo.toml), resolver 2, edition 2024, rust 1.90, Apache-2.0). All crates are `publish = false`. The MCP server is a separate pnpm/TS package under [`mcp/server`](../mcp/server); `proto/` is a placeholder.
+A Cargo workspace (root [`Cargo.toml`](../Cargo.toml), resolver 2, edition 2024, rust 1.90, Apache-2.0). All crates are `publish = false`. The MCP server is the native Rust `pgb-mcp` ([`crates/mcp`](../crates/mcp)) — a workspace member, single-language (the old TS `mcp/server` was removed in EPIC #83); `proto/` is a placeholder.
 
 ```
 crates/
@@ -84,8 +84,9 @@ crates/
   proxy/                pgb-proxy     — inline enforcement endpoint (lib + pgb-proxy bin)
   warden/               pgb-warden    — out-of-band watchdog (STUB; live loop = S4)
   cli/                  pgb-cli       — operator approval flow (STUB; live flow = S4)
+  mcp/                  pgb-mcp       — the deployable stdio MCP server (the nine §11 tools)
+  applyd/               pgb-applyd    — the write-path Unix-socket daemon (guarded_apply floor)
 spikes/fidelity/        — throwaway S0 fidelity-spike harness (publish=false, env-gated DB tests)
-mcp/server/             @pg-bumpers/mcp-server — TS skeleton; real tools land in S4
 proto/                  — placeholder; no IDL generated in S0
 deploy/                 — docker-compose.yml, local-stack.sh, smoke.sh, hba/, init/, sql/
 ```
@@ -171,9 +172,9 @@ The classifier is **advisory and foolable** (e.g. `pg_sleep`/`nextval` classify 
 - **`pgb-warden`** ([`crates/warden/src/main.rs`](../crates/warden/src/main.rs)) is an **S0 stub**. It carries the targeting predicate (`may_terminate` — kill **only** agent-tagged sessions, never shared roles) plus its test. The live polling loop (`pg_stat_activity`/`pg_stat_statements`/lag + replication-slot monitoring, mockable interval) and the authenticated circuit breaker land in **S4**.
 - **`pgb-cli`** ([`crates/cli/src/main.rs`](../crates/cli/src/main.rs)) is an **S0 stub** for the SPEC §14 MVP approval surface. It carries the single-use, proposal-bound grant-consumption seam (`consume_for` — wrong proposal id refused, replay refused) plus its test. The live operator approval flow (issuing the signed grant via the `pgb-policy` grant token + one generic webhook) lands in **S4**.
 
-### MCP server and `proto/` — skeletons
+### MCP server and `proto/`
 
-- **`mcp/server`** is a TS skeleton ([`mcp/server/package.json`](../mcp/server/package.json)). It carries only the **block contract** shape — `{status, code, reason, remedy, retryable}` ([`mcp/server/src/blockContract.ts`](../mcp/server/src/blockContract.ts), fail-closed: `retryable` defaults to false) plus its vitest test. The real tool surface (`whoami`, `discover_schema`, `query`, `explain_plan`, `propose_write`, `dry_run`, `apply_write`, `request_elevation`, `get_audit`) lands in **S4**. It is cooperative, not a security boundary — every tool executes *through* the proxy, and result data can never widen capability.
+- **`crates/mcp`** (binary `pgb-mcp`) is the native Rust MCP server — the one and only deployable MCP server after EPIC #83 (the TS `mcp/server` is removed). It serves the nine §11 tools (`whoami`, `discover_schema`, `query`, `explain_plan`, `propose_write`, `dry_run`, `apply_write`, `request_elevation`, `get_audit`) over stdio via the `rmcp` SDK, with the fail-closed block contract `{status, code, reason, remedy, retryable}` (`retryable` defaults to false). It is cooperative, not a security boundary — the read path executes *through* `pgb-proxy`, the write path *through* the `pgb-applyd` socket, and result data can never widen capability. The binary entrypoint is [`crates/mcp/src/bin/pgb_mcp.rs`](../crates/mcp/src/bin/pgb_mcp.rs).
 - **`proto/`** is a placeholder ([`proto/README.md`](../proto/README.md)). Nothing is generated from it in S0; the warden↔proxy breaker protocol and any cross-process schemas are added incrementally as the consuming code lands.
 
 ---

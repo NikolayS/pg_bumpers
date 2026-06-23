@@ -5,8 +5,9 @@
 
 This ledger is the honesty contract behind the marquee. The MVP genuinely
 **refuses** irreversible/structural ops and **bounds + reverses** the supported
-reversible write shape (proven end-to-end in `deploy/marquee.sh` /
-`mcp/server/test/marquee.integration.test.ts`). We do **not** claim "deletes are
+reversible write shape (proven end-to-end in `deploy/marquee.sh`, which runs the
+env-gated Rust e2e `crates/mcp/tests/{write_path_e2e,read_path_e2e}.rs`). We do
+**not** claim "deletes are
 impossible" or "tamper-proof". This file documents the residual, disclosed limits
 — what the floor does NOT yet contain — each with a repro note and tied to its
 `docs/spec/SPEC.amendments.md` entry.
@@ -152,7 +153,8 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
   LLM detection plane is a non-CI-gating fast-follow (SPEC §13.5).
 - **Repro:** `dbsafe-bench` is the deterministic floor plane (no model in the path);
   every dangerous scenario is contained by the floor with the RiskEngine stubbed.
-  The MCP `dry_run` logs the stub `Allow` verdict (`mcp/server/src/riskEngine.ts`).
+  The MCP `dry_run` logs the stub `Allow` verdict (the `AllowStub` in
+  `crates/policy/src/risk.rs`, captured by `crates/mcp/src/server.rs`).
 - **SPEC.amendments tie:** CLAUDE.md §2 (the LLM risk-gate is tighten-only; MVP
   `RiskEngine` is an `Allow` stub) + SPEC §15.1.
 

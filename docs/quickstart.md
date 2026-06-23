@@ -39,7 +39,7 @@ This is an MVP under active construction. Honest status as of this writing:
 | Rust | **1.90.0** | Pinned by [`rust-toolchain.toml`](../rust-toolchain.toml) (rustfmt + clippy). `rustup` auto-selects it. |
 | PostgreSQL | **18** | Client + server binaries (`initdb`, `pg_ctl`, `pg_basebackup`, `psql`, `pg_isready`). |
 | `cargo-deny` | latest | License/advisory gate: `cargo install cargo-deny`. |
-| Node + pnpm | Node 22, pnpm 11.8 | Only needed to build/test the MCP server (`mcp/server`). |
+| Node | Node 22 | Only used by `deploy/up.sh` to generate a throwaway Ed25519 approver keypair for the demo. Not needed to build/test (the MCP server `pgb-mcp` is pure Rust). |
 
 ### Install PostgreSQL 18 (macOS, Homebrew)
 
@@ -75,15 +75,9 @@ cargo test  --workspace --locked
 cargo deny  check
 ```
 
-Optionally, the MCP server (TypeScript):
-
-```sh
-cd mcp/server
-pnpm install --frozen-lockfile
-pnpm run build            # tsc --noEmit
-pnpm test                 # vitest
-pnpm run license-check    # Apache/MIT/BSD/ISC only; bans GPL/AGPL
-```
+The MCP server (`pgb-mcp`, crate `crates/mcp`) is a workspace member, so the
+commands above already build, test, and license-check it — there is no separate
+Node/pnpm step (the old TS `mcp/server` was removed in EPIC #83).
 
 ---
 
@@ -302,10 +296,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
 cargo test  --workspace --locked
 cargo deny  check
-
-cd mcp/server
-pnpm install --frozen-lockfile && pnpm run build && pnpm test && pnpm run license-check
 ```
+
+(The MCP server `pgb-mcp` lives in `crates/mcp` and is covered by the
+`--workspace` build/test + `cargo deny` above — no separate Node/pnpm step.)
 
 Engineering rules (red/green TDD, fail-closed, PR lifecycle) are in
 [`CLAUDE.md`](../CLAUDE.md) and [`docs/development.md`](development.md).

@@ -1,10 +1,10 @@
 //! The structured tool-result envelopes the MCP server returns (SPEC §4): the
 //! recoverable **block contract** and the `whoami` posture result.
 //!
-//! These mirror the TypeScript `mcp/server` block contract
-//! `{status, code, reason, remedy, retryable}` and the `whoami` result
-//! (`{role, security_boundary:false, tools}`) so the agent-facing surface is
-//! identical across the TS→Rust consolidation (EPIC #83).
+//! These mirror the block contract `{status, code, reason, remedy, retryable}`
+//! and the `whoami` result (`{role, security_boundary:false, tools}`) of the
+//! former TypeScript MCP server, so the agent-facing surface stayed identical
+//! across the TS→Rust consolidation (EPIC #83; the TS `mcp/server` is removed).
 //!
 //! Honesty invariant (SPEC §3): a denial is NEVER an opaque error — it is a
 //! structured block carrying a machine-readable `code` and an actionable

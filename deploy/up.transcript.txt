@@ -1,6 +1,6 @@
 ================================================================================
  pg_bumpers — deploy/up.sh RUNNABLE-STACK e2e transcript
- (mcp/server/test/upStack.e2e.test.ts, PG_BUMPERS_IT=1)
+ (crates/mcp/tests/{read_path_e2e,write_path_e2e}.rs, PG_BUMPERS_IT=1)
  The MCP read path genuinely traverses pgb-proxy (extended-protocol-only,
  WALL-enforced); writes go through pgb-applyd's grant-gated floor; a live
  pgb-warden watches; one anchored _meta chain verifies. :5432 untouched.

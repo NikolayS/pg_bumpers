@@ -6,7 +6,7 @@ A per-crate map of what exists in the tree today. Source of truth: [`docs/spec/S
 
 **Honesty posture (SPEC §1).** Writes are bounded + reversible (zero catastrophic data-loss false-negatives *by construction*, via the closed certified-action set and PK-set guard). Reads are **bounded disclosure** — a per-role byte/row budget then a hard cutoff — plus best-effort detection; never "zero", never "impossible". The audit chain is **tamper-evident**, not tamper-proof.
 
-The Cargo workspace (`Cargo.toml`) members: `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli}` plus the throwaway `spikes/fidelity` harness. The MCP server (`mcp/server`) is a separate pnpm/TypeScript package. SQL + pg_hba assets live under `deploy/` and `crates/audit/sql/`.
+The Cargo workspace (`Cargo.toml`) members: `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli,mcp,applyd}` plus the throwaway `spikes/fidelity` harness. The MCP server (`crates/mcp`, binary `pgb-mcp`) is a Rust workspace member — single-language (the old TS `mcp/server` was removed in EPIC #83). SQL + pg_hba assets live under `deploy/` and `crates/audit/sql/`.
 
 ---
 
@@ -109,9 +109,9 @@ The deterministic floor's lowest two layers, asserted by attempting the denied a
 
 ---
 
-## mcp/server (`mcp/server`)
+## pgb-mcp (`crates/mcp`)
 
-The agent-facing intent/UX layer (SPEC §3 layer 3) — **cooperative, not a security boundary**; every tool executes *through* the proxy. Currently a **skeleton**: `src/blockContract.ts` defines the structured, recoverable `BlockContract` (`{status:"blocked", code, reason, remedy, retryable}`) and a `block()` constructor that defaults `retryable` to `false` (fail-closed). The real tool surface (`whoami`, `query`, `propose_write`, `dry_run`, `apply_write`, …) is S4. Tooling: TypeScript + `vitest` (`test/blockContract.test.ts` covers the fail-closed default + recoverable-remedy cases), plus a license-check script.
+The agent-facing intent/UX layer (SPEC §3 layer 3) — **cooperative, not a security boundary**; every tool executes *through* the deterministic floor. This is the native Rust **`pgb-mcp`**, the one and only deployable MCP server after EPIC #83 (the old TS `mcp/server` is removed). It serves the nine §11 tools over stdio via the `rmcp` SDK; the read path (`query`/`explain_plan`/`discover_schema`/`get_audit`) executes through `pgb-proxy`, the write path (`propose_write`/`dry_run`/`request_elevation`/`apply_write`) through the `pgb-applyd` Unix socket. The structured, recoverable block contract `{status:"blocked", code, reason, remedy, retryable}` defaults `retryable` to `false` (fail-closed). The catalog (`src/catalog.rs`) pins exactly nine tools (no `approve` — the signing-key hop stays out of the agent stdio); env-gated e2e tests (`tests/{write_path_e2e,read_path_e2e}.rs`) drive it end-to-end against a throwaway PG18. The deployable entrypoint is `src/bin/pgb_mcp.rs`.
 
 ---
 

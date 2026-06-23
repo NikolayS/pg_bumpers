@@ -737,14 +737,21 @@ reads go through the live proxy. Concretely:
   proposal-A's session can never be redirected onto proposal-B, because there are no
   apply-time fields to redirect.) The §14.3 binding hash + `verify_for_apply` enforce this.
 
-- **`ApplydCore` (TS, `mcp/server/src/applydCore.ts`)** — a thin Unix-socket JSON-RPC client
+> **HISTORICAL (EPIC #83): the TS files below are DELETED.** This entry records what
+> shipped at #67. The Rust equivalents are `crates/mcp/src/applyd.rs` (`ApplydCore` →
+> `ApplydClient`) and `crates/mcp/src/bin/pgb_mcp.rs` (the stdio shell). See the EPIC #83
+> amendment at the end of this file.
+
+- **`ApplydCore` (TS, `mcp/server/src/applydCore.ts` — now Rust `crates/mcp/src/applyd.rs`)** —
+  a thin Unix-socket JSON-RPC client
   implementing the `Core` interface; the production peer of `FakeCore`. It maps
   `propose/dryRun/apply/requestElevation/getAudit` onto `pgb-applyd` and translates a
   JSON-RPC error into the existing `ApplyResult{outcome:"blocked", block}` / `{notFound}`
   shape so every denial stays a recoverable contract. Node `net` + `readline` only — NO new
   dependencies (`license-check` stays green).
 
-- **The stdio MCP shell (TS, `mcp/server/src/bin/mcpStdio.ts`, bin `pgb-mcp`)** — the single
+- **The stdio MCP shell (TS, `mcp/server/src/bin/mcpStdio.ts`, bin `pgb-mcp` — now Rust
+  `crates/mcp/src/bin/pgb_mcp.rs`)** — the single
   new deployable entrypoint. It speaks MCP `initialize`/`tools/list`/`tools/call` over
   stdin/stdout (line-delimited JSON-RPC 2.0) and constructs `createServer({ transport:
   PgProxyTransport.connect({...proxy...}), core: new ApplydCore({socketPath}), role })`,
@@ -817,9 +824,10 @@ damage class** — honestly, no overclaim.
 
 ### What ran LIVE (end-to-end, `PG_BUMPERS_IT=1`, dedicated high port 54341; NEVER 5432)
 
-`mcp/server/test/marquee.integration.test.ts` (run + transcript-captured by `deploy/marquee.sh`,
-evidence in `deploy/marquee.transcript.txt`) drives a REAL MCP client over `pgb-mcp` and asserts,
-per damage class:
+`mcp/server/test/marquee.integration.test.ts` (**HISTORICAL — now the env-gated Rust e2e
+`crates/mcp/tests/{write_path_e2e,read_path_e2e}.rs`** per EPIC #83; run + transcript-captured by
+`deploy/marquee.sh`, evidence in `deploy/marquee.transcript.txt`) drives a REAL MCP client over
+`pgb-mcp` and asserts, per damage class:
 
 - **Irreversible / structural** (DROP DATABASE/TABLE, TRUNCATE, ALTER) → **REFUSED**,
   default-deny (`NOT_REHEARSABLE` at the applyd classify choke); a DROP on the read tool →
@@ -1318,3 +1326,89 @@ composite/wider PK is refused upstream, not gated here.
   exceeded`. The #89 `concurrent-drift-delete-missing-preimage` golden (the pre-image seam) is
   unaffected. The catastrophic-FN ledger (`golden/known_bypasses.json`) stays **empty**
   (0 FN, 0 FP).
+
+---
+
+## EPIC #83 — "Rust for all": the deployable MCP server is now the native Rust `pgb-mcp`; the TypeScript `mcp/server` is REMOVED
+
+**SPEC sections touched:** §1 / §3 layer 3 (the agent-facing MCP intent/UX layer — the
+implementation language, not the contract), and the repo-layout note in §7 (the
+"Cargo workspace **+ pnpm**" / "`mcp/server` (TS)" phrasing). The tool *contract* (the
+exactly-nine §11 tools, the block contract, the `confirm_rows` forcing function, the
+result-data-can-never-widen-capability defense) is **unchanged** — this is an
+implementation-language consolidation, not a behavior change to the floor.
+
+**Issue:** EPIC #83 ("Rust for all"), PR4 (final). PR1 (skeleton), PR2 (read path, #95),
+PR3 (write path, #96) ported the TS server to Rust; this PR4 deletes the now-redundant TS
+implementation and repoints the dev stack at the Rust binary.
+
+### Deviation
+
+The original build shipped the agent-facing MCP server as a **TypeScript/pnpm package**
+under `mcp/server` (recorded in the S4 and the "S5 — MCP production wire + live Core (#67)"
+sections above — the TS `ApplydCore`, the TS `mcpStdio.ts` stdio shell `bin pgb-mcp`, the
+TS `PgProxyTransport`, the vitest contract + integration tests). EPIC #83 ported that
+surface, **verbatim in contract**, to a native Rust crate. As of this PR the repo is
+**single-language Rust**:
+
+- The one and only deployable MCP server is the Rust **`pgb-mcp`** (crate `crates/mcp`,
+  binary target `pgb-mcp`). Its stdio entrypoint is `crates/mcp/src/bin/pgb_mcp.rs` (it
+  serves MCP `initialize`/`tools/list`/`tools/call` over stdin/stdout via the `rmcp` SDK).
+  Full **nine-tool parity** with the deleted TS server is verified (identical `TOOL_NAMES`;
+  no `approve` tool — the signing-key hop stays out of the agent stdio).
+- The **TypeScript `mcp/server` tree is deleted in its entirety** (`src/`, `test/`,
+  `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `tsconfig*`, `vitest.config.ts`,
+  `scripts/license-check.mjs`, the README). No pnpm/Node/TS artifact remains in the repo.
+- **The dev stack now launches the Rust binary.** `deploy/up.sh` builds `pgb-mcp` via
+  `cargo build` (no more `pnpm install && pnpm run build`) and its printed `claude mcp add`
+  line ends with `-- <repo>/target/debug/pgb-mcp` (no `node`), forwarding the `PGB_*` env
+  (proxy host/port/db/user/password, the applyd socket, and the `_meta` DSN). `deploy/marquee.sh`
+  runs the env-gated Rust e2e (`crates/mcp/tests/{write_path_e2e,read_path_e2e}.rs`) in place
+  of the deleted TS vitest marquee test.
+- **CI:** the dedicated pnpm/Node `mcp:` job is removed from `.github/workflows/ci.yml`.
+  `crates/mcp` is a workspace member, so the existing `rust` job builds + tests it
+  (`cargo {build,test} --workspace`) and `cargo deny check` license-checks its deps — there
+  is no longer a separate TS `license-check.mjs`.
+
+### Rationale
+
+The founder's standing ask is **"Rust for all"**: a single-language control plane is
+simpler to build, test, license-check (one `cargo deny` gate instead of two), and ship.
+Two language toolchains (Rust + Node/pnpm) for one process was redundant once the Rust port
+reached parity. **`pgb-applyd` stays a separate daemon** (crate `crates/applyd`) — the
+write-credential boundary is deliberate and unchanged; the MCP server is still cooperative,
+NOT a security boundary (every read passes the proxy/WALL, every write passes applyd's
+deterministic floor). Removing the TS surface changes the *implementation language*, never
+the *floor*.
+
+### Historical-pointer corrections (the prior TS file refs above are SUPERSEDED)
+
+The earlier amendment entries describe the now-deleted TS files. Their Rust equivalents are:
+
+- `mcp/server/src/applydCore.ts` (the TS Unix-socket `Core` client) → **`crates/mcp/src/applyd.rs`**
+  (the `ApplydClient`/`ApplydConfig`).
+- `mcp/server/src/bin/mcpStdio.ts` (the TS stdio shell, `bin pgb-mcp`) → **`crates/mcp/src/bin/pgb_mcp.rs`**
+  (the `pgb-mcp` binary).
+- `mcp/server/src/pgProxy.ts` (the TS read transport) → **`crates/mcp/src/proxy.rs`**
+  (the `ProxyTransport`/`ProxyConfig`).
+- `mcp/server/src/server.ts` (the TS tool dispatcher) → **`crates/mcp/src/server.rs`**
+  (the `PgBumpersMcp` handler).
+- `mcp/server/src/riskEngine.ts` (the TS `Allow` stub) → the Rust **`AllowStub`** in
+  `crates/policy/src/risk.rs`, captured by `crates/mcp/src/server.rs`.
+- `mcp/server/test/{marquee.integration,upStack.e2e}.test.ts` (the TS live-stack tests) →
+  the env-gated Rust e2e **`crates/mcp/tests/{write_path_e2e,read_path_e2e}.rs`** (run by
+  `deploy/marquee.sh`).
+
+The historical entries are left in place as a record of what shipped at the time; this entry
+is the authoritative pointer to the current (Rust) reality.
+
+### Evidence (red→green)
+
+- **RED:** `git grep -n 'mcp/server'` returns no hit in code/scripts (only historical notes in
+  this file); the `node …/mcpStdio.js` path no longer exists; `git ls-files | grep -iE
+  'mcp/server|pnpm|\.ts$|vitest'` is empty.
+- **GREEN:** the §7 Rust gate (`cargo fmt --check` · `clippy -D warnings` · `build --locked` ·
+  `test --locked` · `deny check`) is green with `crates/mcp` building the `pgb-mcp` binary; the
+  dev stack stands up (throwaway PG18 on a high port; NEVER :5432) and `pgb-mcp` is driven live
+  end-to-end (`initialize` → `tools/list` = 9 tools → a read through `pgb-proxy` → a bounded,
+  operator-approved write through `pgb-applyd` read back from PG18 → `get_audit`).

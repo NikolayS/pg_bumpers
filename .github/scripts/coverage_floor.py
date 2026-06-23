@@ -63,7 +63,8 @@ import sys
 #                                     wiring + the resident PG18 apply Client — an
 #                                     inherently DB-and-IO-only seam proven ONLY
 #                                     under the env-gated PG18 IT (tests/applyd_it.rs)
-#                                     + the TS IT (mcp/server), exactly like
+#                                     + the Rust MCP e2e (crates/mcp/tests/
+#                                     write_path_e2e.rs), exactly like
 #                                     pgb-audit's pg.rs and pgb-proxy's session
 #                                     loop/main.rs. Floor 54% bounds that IT-only
 #                                     surface while keeping the service/protocol

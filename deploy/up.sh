@@ -30,10 +30,11 @@
 #
 # Usage:
 #   deploy/up.sh                 # build (unless --no-build) + launch + print connect line
-#   deploy/up.sh --no-build      # skip the cargo/pnpm build (use prebuilt artifacts)
+#   deploy/up.sh --no-build      # skip the cargo build (use prebuilt artifacts)
 #
 # Requirements: the Homebrew keg-only postgresql@18 binaries (PGBIN), a Rust
-# toolchain, Node + pnpm. Clean-room; Apache/MIT/BSD/ISC deps only.
+# toolchain, and Node (only for the throwaway Ed25519 approver-keypair gen below).
+# Clean-room; Apache/MIT/BSD/ISC deps only.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -91,20 +92,19 @@ psql_primary() {
 }
 
 # ----------------------------------------------------------------------------
-# 1. Build the binaries + the MCP shell (unless --no-build).
+# 1. Build the binaries + the deployable MCP server (unless --no-build).
 # ----------------------------------------------------------------------------
 if [ "$DO_BUILD" = "1" ]; then
-  command -v pnpm >/dev/null || die "pnpm not found"
-  log "building pgb-proxy, pgb-applyd, pgb-warden, pgb-cli…"
-  ( cd "$REPO_ROOT" && cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli )
-  log "building the deployable MCP stdio shell (pgb-mcp)…"
-  ( cd "$REPO_ROOT/mcp/server" && pnpm install --frozen-lockfile && pnpm run build )
+  log "building pgb-proxy, pgb-applyd, pgb-warden, pgb-cli, pgb-mcp…"
+  ( cd "$REPO_ROOT" && cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli -p pgb-mcp )
 fi
 
 PROXY_BIN="$REPO_ROOT/target/debug/pgb-proxy"
 APPLYD_BIN="$REPO_ROOT/target/debug/pgb-applyd"
 WARDEN_BIN="$REPO_ROOT/target/debug/pgb-warden"
-MCP_BIN="$REPO_ROOT/mcp/server/dist/bin/mcpStdio.js"
+# The single deployable MCP server: the native Rust pgb-mcp (EPIC #83). The TS
+# mcp/server is gone — this binary IS the connectable stdio MCP server.
+MCP_BIN="$REPO_ROOT/target/debug/pgb-mcp"
 for b in "$PROXY_BIN" "$APPLYD_BIN" "$WARDEN_BIN" "$MCP_BIN"; do
   [ -e "$b" ] || die "missing build artifact: $b (run without --no-build, or build first)"
 done
@@ -336,16 +336,18 @@ cat >&2 <<BANNER
   Connect a REAL Claude Code to this stack — paste this single line:
 
   claude mcp add pg-bumpers \\
-    --env PGB_APPLYD_SOCKET=$SOCKET_PATH \\
     --env PGB_PROXY_HOST=$HOST \\
     --env PGB_PROXY_PORT=$PROXY_PORT \\
     --env PGB_PROXY_DB=$DEMO_DB \\
     --env PGB_PROXY_USER=pgb_agent \\
     --env PGB_PROXY_PASSWORD=$AGENT_PASSWORD \\
     --env PGB_PROXY_APP_NAME=pgb_proxy \\
+    --env PGB_PROXY_REQUIRE_TLS=false \\
     --env PGB_ROLE=pgb_agent \\
     --env PGB_SESSION_ID=$SESSION_ID \\
-    -- node $MCP_BIN
+    --env PGB_APPLYD_SOCKET=$SOCKET_PATH \\
+    --env PGB_META_DSN='$META_DSN' \\
+    -- $MCP_BIN
 
   Then ask Claude Code to:
     • read:    "query SELECT * FROM public.accounts"        → rows (bounded; through pgb-proxy)

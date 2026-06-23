@@ -118,24 +118,21 @@ Toolchain is pinned to **Rust 1.90.0** (`rust-toolchain.toml`, edition 2024) via
 it away without a reason. `--locked` means the lockfile must already satisfy the
 build; if you changed deps, commit the updated `Cargo.lock`.
 
-### Job `mcp` — build · test · license-check
+### The MCP server is a Rust workspace member (no separate CI job)
 
-Runs in `mcp/server` with **pnpm 11.8.0** and **Node 22**:
+The deployable MCP server is the native Rust **`pgb-mcp`** (crate `crates/mcp`,
+binary `pgb-mcp`) — the one and only MCP server after
+[EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83) (the old TS
+`mcp/server` and its pnpm/Node CI job are removed). Because `crates/mcp` is a
+workspace member, the `rust` job above already builds + tests it
+(`cargo {build,test} --workspace`), and `cargo deny` license-checks its deps — so
+there is **no** dedicated MCP CI job.
 
-| Step | Command | Gate |
-|---|---|---|
-| install | `pnpm install --frozen-lockfile` | lockfile must be current |
-| build | `pnpm run build` (`tsc --noEmit`) | typechecks |
-| test | `pnpm test` (`vitest run`) | TS contract tests |
-| license-check | `pnpm run license-check` | Apache/MIT/BSD/ISC only; bans GPL/AGPL |
-
-The MCP server is a **runnable stdio shell** (`@pg-bumpers/mcp-server`, `private`)
-with the nine §11 tools, a live `pg`-client read path through `pgb-proxy`, and a
-write path through the `pgb-applyd` socket; `test/upStack.e2e.test.ts` drives it
-end-to-end against the `deploy/up.sh` stack (env-gated `PG_BUMPERS_IT=1`). The
-block-contract test (`mcp/server/test/blockContract.test.ts`) pins the
-fail-closed shape: blocks default `retryable: false`. The TS server is being
-ported to a native Rust `pgb-mcp` ([EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83)).
+It is a **runnable stdio shell** with the nine §11 tools, a live read path through
+`pgb-proxy`, and a write path through the `pgb-applyd` socket. The env-gated Rust
+e2e tests `crates/mcp/tests/{write_path_e2e,read_path_e2e}.rs` drive the shipped
+`PgBumpersMcp` handler end-to-end against a throwaway PG18 (`PG_BUMPERS_IT=1`); the
+catalog test pins the fail-closed surface (exactly nine tools, no `approve`).
 
 ### Run all gates locally before pushing
 
@@ -143,19 +140,13 @@ Reproduce CI exactly (also in `CLAUDE.md` §7). Get these green **before** openi
 or updating a PR:
 
 ```sh
-# Rust workspace
+# Rust workspace (single-language; the MCP server `pgb-mcp` is a workspace member
+# in crates/mcp, so these build, test, and license-check it too).
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
 cargo test  --workspace --locked
 cargo deny  check
-
-# MCP server (TypeScript)
-cd mcp/server
-pnpm install --frozen-lockfile
-pnpm run build
-pnpm test
-pnpm run license-check
 ```
 
 > **Pages.** A separate workflow (`.github/workflows/pages.yml`) deploys the
@@ -170,10 +161,11 @@ pnpm run license-check
 
 Two test tiers, by design:
 
-- **Fast tier (always-on).** Plain `cargo test` and `pnpm test` run unit and
-  contract tests with **no live database**. This is what CI runs, so CI stays
-  fast and DB-free. Integration test files still **build and link** under the
-  fast job (the crate compiles); they just **skip** their assertions.
+- **Fast tier (always-on).** Plain `cargo test` runs unit and contract tests
+  (across the whole workspace, including `crates/mcp`) with **no live database**.
+  This is what CI runs, so CI stays fast and DB-free. Integration test files still
+  **build and link** under the fast job (the crate compiles); they just **skip**
+  their assertions.
 - **Integration tier (gated, real).** Tests that need a live Postgres 18 are
   gated behind the env var **`PG_BUMPERS_IT=1`**. When the gate is unset, they
   print a `[skip]` line and exit success; when it's set, they run for **real**
@@ -282,15 +274,15 @@ the permissive `Unicode-*` data licenses. `cargo deny check` also gates **bans**
 carries a comment explaining why — keep that hygiene if you add one, and prefer
 **not** adding one.
 
-### TypeScript — `license-check.mjs`
+### The MCP server's deps are covered by `cargo deny`
 
-`mcp/server/scripts/license-check.mjs` mirrors the Rust guard for the MCP server.
-It walks the **full** transitive tree via `pnpm licenses list --json` and fails on
-any non-permissive license. The forbidden substrings are `GPL`, `AGPL`, `LGPL` —
-checked case-insensitively, so a sneaky casing can't slip through.
+The MCP server is the Rust `pgb-mcp` (`crates/mcp`), a workspace member — so its
+dependency tree is gated by the same `cargo deny check` above (there is no longer
+a separate TS `license-check.mjs`; it was removed with the TS `mcp/server` in
+EPIC #83).
 
-If a new dependency trips either gate, the fix is **drop the dependency**, not
-widen the allow-list. A copyleft dep is a no-go, full stop.
+If a new dependency trips the gate, the fix is **drop the dependency**, not widen
+the allow-list. A copyleft dep is a no-go, full stop.
 
 ---
 
@@ -336,8 +328,8 @@ The flow, enforced in order (`CLAUDE.md` §§3–4). It loops until satisfied.
 
 ## 8. Where things live
 
-- **Crates:** `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli}`.
-- **MCP server (TS):** `mcp/server`.
+- **Crates:** `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli,mcp,applyd}`.
+- **MCP server (Rust):** `crates/mcp`, binary `pgb-mcp` (the one deployable MCP server).
 - **Deploy / dev-stack:** `deploy/` (`local-stack.sh`, `smoke.sh`,
   `docker-compose.yml`, `hba/`, `init/`, `sql/`).
 - **Protocols (placeholder):** `proto/`.

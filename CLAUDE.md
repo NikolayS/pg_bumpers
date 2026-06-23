@@ -99,8 +99,9 @@ The **process** spec lives in GitHub issue #1.
   **Apache-2.0 / MIT / BSD / ISC** only (SPEC §4).
 - Rust: **`cargo deny check`** gates licenses, bans, advisories (RUSTSEC), and
   sources. `deny.toml` is the **AGPL guard** — GPL/AGPL/LGPL deps make the check FAIL.
-- TS (`mcp/server`): the `license-check` script walks the full pnpm tree and fails
-  on any non-permissive license.
+  This now covers the MCP server too: it is the native Rust `pgb-mcp` (`crates/mcp`),
+  a workspace member, so its deps are license-checked by the same `cargo deny` gate
+  (the old TS `mcp/server` + its pnpm `license-check` script are gone — EPIC #83).
 
 ## 6. pgDog clean-room rule (AGPL — inspiration only)
 
@@ -112,19 +113,13 @@ from the SPEC.
 ## 7. Local CI commands — run ALL of these green before pushing
 
 ```sh
-# Rust workspace
+# Rust workspace (single-language; the MCP server `pgb-mcp` is a workspace member
+# in crates/mcp, so these commands build, test, and license-check it too).
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --locked
 cargo test  --workspace --locked
 cargo deny  check                     # licenses + bans + advisories + sources
-
-# MCP server (TypeScript)
-cd mcp/server
-pnpm install --frozen-lockfile
-pnpm run build                        # tsc --noEmit
-pnpm test                             # vitest
-pnpm run license-check                # Apache/MIT/BSD/ISC only; bans GPL/AGPL
 ```
 
 CI mirrors these in `.github/workflows/ci.yml` (triggers: push + pull_request).
@@ -136,5 +131,6 @@ Toolchain is pinned by `rust-toolchain.toml` (Rust **1.90.0**, edition 2024).
   in feature PRs.
 - **Decisions / rationale:** `docs/spec/decisions.md`.
 - **Intentional deviations:** record in `docs/spec/SPEC.amendments.md` with rationale.
-- **Crates:** `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli}`.
-- **MCP server (TS):** `mcp/server`. **Deploy/dev-stack:** `deploy/`. **Protocols:** `proto/`.
+- **Crates:** `crates/{proxy,warden,core,policy,clone-orchestrator,pgwire,audit,cli,mcp,applyd}`.
+- **MCP server (Rust):** `crates/mcp`, binary **`pgb-mcp`** (the one and only deployable
+  MCP server — EPIC #83). **Deploy/dev-stack:** `deploy/`. **Protocols:** `proto/`.

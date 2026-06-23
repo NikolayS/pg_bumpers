@@ -65,9 +65,10 @@ bounded write get approved.
 > **Dev-quickstart honesty.** This local stack runs with **TLS off**
 > (`PGB_PROXY_REQUIRE_TLS=false`) — SCRAM-SHA-256 auth is still enforced. It uses
 > throwaway Postgres clusters on **dedicated high ports** (it never touches
-> `5432`) and tears them down cleanly. The agent-facing MCP server is currently
-> the Node stdio shell shipped in `mcp/server/`; a native Rust `pgb-mcp` is
-> landing (see [EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83)).
+> `5432`) and tears them down cleanly. The agent-facing MCP server is the native
+> Rust **`pgb-mcp`** (crate `crates/mcp`) — the one and only deployable MCP server
+> ([EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83) is complete; the
+> old TS `mcp/server` is removed).
 
 ### 1. Prerequisites
 
@@ -78,7 +79,8 @@ bounded write get approved.
   brew install postgresql@18
   export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
   ```
-- **Node 22 + pnpm** (for the current MCP stdio shell)
+- **Node 22** (only used by `deploy/up.sh` to generate a throwaway Ed25519
+  approver keypair for the demo; the MCP server itself is pure Rust)
 - **[Claude Code](https://claude.com/claude-code)** (the agent you'll connect)
 
 ### 2. Clone and build
@@ -92,8 +94,7 @@ cd pg_bumpers
 up front:
 
 ```sh
-cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli
-( cd mcp/server && pnpm install --frozen-lockfile && pnpm run build )
+cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli -p pgb-mcp
 ```
 
 ### 3. Launch the stack
@@ -119,16 +120,18 @@ warden, and prints a ready-to-paste connect line. Real output:
   Connect a REAL Claude Code to this stack — paste this single line:
 
   claude mcp add pg-bumpers \
-    --env PGB_APPLYD_SOCKET=/tmp/pg_bumpers-up/applyd.sock \
     --env PGB_PROXY_HOST=127.0.0.1 \
     --env PGB_PROXY_PORT=6432 \
     --env PGB_PROXY_DB=pgb_demo \
     --env PGB_PROXY_USER=pgb_agent \
     --env PGB_PROXY_PASSWORD=pgb_agent_dev_pw \
     --env PGB_PROXY_APP_NAME=pgb_proxy \
+    --env PGB_PROXY_REQUIRE_TLS=false \
     --env PGB_ROLE=pgb_agent \
     --env PGB_SESSION_ID=pgb-demo-session \
-    -- node <repo>/mcp/server/dist/bin/mcpStdio.js
+    --env PGB_APPLYD_SOCKET=/tmp/pg_bumpers-up/applyd.sock \
+    --env PGB_META_DSN='host=127.0.0.1 port=54321 dbname=pgb_demo user=pgb_audit_writer password=...' \
+    -- <repo>/target/debug/pgb-mcp
 ```
 
 **Paste the exact `claude mcp add` line `up.sh` printed** into your shell (the
@@ -239,11 +242,12 @@ bash deploy/down.sh
 Stops the three daemons, drops the throwaway clusters, frees the high ports, and
 verifies `:5432` was never touched.
 
-> The exact same flow runs end-to-end as an automated test:
-> `PG_BUMPERS_IT=1 pnpm test` in `mcp/server`
-> (`test/upStack.e2e.test.ts`) launches `up.sh`, drives the shipped MCP shell
-> through every step above, and runs `down.sh` — see
-> [`deploy/up.transcript.txt`](deploy/up.transcript.txt) for the captured run.
+> The same end-to-end flow runs as env-gated Rust integration tests against a
+> throwaway PG18:
+> `PG_BUMPERS_IT=1 cargo test -p pgb-mcp --test write_path_e2e --test read_path_e2e`
+> drives the shipped `pgb-mcp` handler through the write path (via `pgb-applyd`)
+> and the read path (via `pgb-proxy`) — see
+> [`deploy/up.transcript.txt`](deploy/up.transcript.txt) for a captured `up.sh` run.
 
 ## How it works
 
