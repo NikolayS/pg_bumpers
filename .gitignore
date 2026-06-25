@@ -3,10 +3,6 @@
 **/target/
 *.rs.bk
 
-# Node (only used by deploy/up.sh for throwaway Ed25519 keypair gen; the MCP
-# server is pure Rust — the TS mcp/server was removed in EPIC #83).
-node_modules/
-
 # Environment / secrets
 .env
 .env.*

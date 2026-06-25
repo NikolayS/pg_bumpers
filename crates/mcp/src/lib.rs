@@ -4,7 +4,7 @@
 //! This crate speaks the **real Model Context Protocol over stdio** via the
 //! official Rust SDK [`rmcp`], so `claude mcp add pg-bumpers -- pgb-mcp`
 //! connects a real Claude Code to the §4 nine-tool catalog. It is the Rust
-//! replacement for the TypeScript `mcp/server` (the TS→Rust consolidation).
+//! replacement for the original non-Rust MCP server (the consolidation onto Rust).
 //!
 //! **Honesty (SPEC §3): the MCP server is COOPERATIVE, NOT a security boundary.**
 //! It adds no privilege of its own; the deterministic floor — proxy + WALL +

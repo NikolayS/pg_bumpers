@@ -4,7 +4,7 @@
 //! the `pgb-applyd` daemon (NOT a TCP port, NOT raw PG). `applyd` owns the
 //! write-safety STATE (the propose→dry_run→approve→apply lifecycle) and drives the
 //! merged grant-gated apply floor (`guarded_apply_with_grant`). This module is the
-//! Rust analogue of the TypeScript `ApplydCore`: a thin line-delimited JSON-RPC
+//! Rust analogue of the original non-Rust `ApplydCore`: a thin line-delimited JSON-RPC
 //! client that maps the MCP write tools onto the applyd socket and translates
 //! every applyd denial into the recoverable block contract.
 //!

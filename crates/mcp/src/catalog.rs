@@ -1,10 +1,10 @@
 //! The §4 nine-tool catalog: the EXACT tool names, one-line descriptions, and
 //! JSON input schemas the MCP server advertises in `tools/list`.
 //!
-//! This is the agent-facing contract. The names + shapes MIRROR the TypeScript
-//! `mcp/server` this Rust server replaces (EPIC #83) so a client sees the same
-//! surface regardless of which implementation is wired. The schemas are derived
-//! from the `pgb-applyd` wire params (`crates/applyd/src/protocol.rs`) and the TS
+//! This is the agent-facing contract. The names + shapes MIRROR the original
+//! non-Rust MCP server this Rust server replaces (EPIC #83) so a client sees the
+//! same surface regardless of which implementation is wired. The schemas are derived
+//! from the `pgb-applyd` wire params (`crates/applyd/src/protocol.rs`) and the prior
 //! `McpServer` call signatures — but NOTHING is wired to those engines yet (PR1
 //! is the skeleton; reads land in PR2, writes in PR3).
 

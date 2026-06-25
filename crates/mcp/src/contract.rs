@@ -3,8 +3,8 @@
 //!
 //! These mirror the block contract `{status, code, reason, remedy, retryable}`
 //! and the `whoami` result (`{role, security_boundary:false, tools}`) of the
-//! former TypeScript MCP server, so the agent-facing surface stayed identical
-//! across the TS→Rust consolidation (EPIC #83; the TS `mcp/server` is removed).
+//! former non-Rust MCP server, so the agent-facing surface stayed identical
+//! across the consolidation onto Rust (EPIC #83; the original MCP server is removed).
 //!
 //! Honesty invariant (SPEC §3): a denial is NEVER an opaque error — it is a
 //! structured block carrying a machine-readable `code` and an actionable

@@ -79,8 +79,6 @@ bounded write get approved.
   brew install postgresql@18
   export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
   ```
-- **Node 22** (only used by `deploy/up.sh` to generate a throwaway Ed25519
-  approver keypair for the demo; the MCP server itself is pure Rust)
 - **[Claude Code](https://claude.com/claude-code)** (the agent you'll connect)
 
 ### 2. Clone and build
@@ -296,5 +294,6 @@ demo, and the WALL SQL/hba) is documented in [`deploy/README.md`](deploy/README.
 ## License
 
 [Apache-2.0](LICENSE). Dependencies are Apache / MIT / BSD / ISC only — GPL/AGPL
-are banned and enforced by `cargo deny` (Rust) and a `license-check` script (TS).
-This is a **clean-room** implementation.
+are banned and enforced by `cargo deny`, the single license gate for the whole
+Rust-only workspace (the MCP server is a workspace member, so its deps are covered
+too). This is a **clean-room** implementation.

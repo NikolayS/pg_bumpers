@@ -122,9 +122,9 @@ build; if you changed deps, commit the updated `Cargo.lock`.
 
 The deployable MCP server is the native Rust **`pgb-mcp`** (crate `crates/mcp`,
 binary `pgb-mcp`) — the one and only MCP server after
-[EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83) (the old TS
-`mcp/server` and its pnpm/Node CI job are removed). Because `crates/mcp` is a
-workspace member, the `rust` job above already builds + tests it
+[EPIC #83](https://github.com/NikolayS/pg_bumpers/issues/83) (the original non-Rust
+MCP server and its separate-toolchain CI job are removed; the build is Rust-only).
+Because `crates/mcp` is a workspace member, the `rust` job above already builds + tests it
 (`cargo {build,test} --workspace`), and `cargo deny` license-checks its deps — so
 there is **no** dedicated MCP CI job.
 

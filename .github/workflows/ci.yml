@@ -64,11 +64,22 @@ jobs:
           bash -n deploy/local-stack.sh
           bash deploy/test/local_stack_guards.sh
 
+      # Rust-only grep-acceptance gate (issue #101, spec v0.8.1 §0.5): no banned
+      # non-Rust scripting/typed-compiler/package-manager technology tokens in the
+      # tracked source/docs/CI/toolchain (the gate's own token list lives in the
+      # script). Pure `git grep` over tracked files — NO PostgreSQL required — so it
+      # runs in this FAST gate. Also syntax-checks deploy/up.sh (it now mints the
+      # approver keypair via `pgb-cli keygen`). Both commands are static (no event input).
+      - name: rust-only gate — no non-Rust toolchain residuals
+        run: |
+          bash -n deploy/up.sh
+          bash deploy/test/no_node_residuals.sh
+
   # NOTE: the deployable MCP server is the native Rust `pgb-mcp` (crate
   # `crates/mcp`), which is a workspace member — the `rust` job above already
   # builds + tests it (`cargo {build,test} --workspace`), and `cargo deny`
-  # license-checks its deps. The old pnpm/Node `mcp:` job (the TS `mcp/server`)
-  # was removed with that tree in EPIC #83; no replacement step is needed.
+  # license-checks its deps. The dedicated job for the original non-Rust MCP
+  # server was removed with that tree in EPIC #83; no replacement step is needed.
 
   # ===========================================================================
   # THE SAFETY INTEGRATION JOB (issue #44) — runs the REAL deterministic-floor

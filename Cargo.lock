@@ -816,6 +816,7 @@ name = "pgb-cli"
 version = "0.0.0"
 dependencies = [
  "ed25519-dalek",
+ "hex",
  "pgb-audit",
  "pgb-core",
  "pgb-policy",

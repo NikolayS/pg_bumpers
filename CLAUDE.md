@@ -101,7 +101,8 @@ The **process** spec lives in GitHub issue #1.
   sources. `deny.toml` is the **AGPL guard** — GPL/AGPL/LGPL deps make the check FAIL.
   This now covers the MCP server too: it is the native Rust `pgb-mcp` (`crates/mcp`),
   a workspace member, so its deps are license-checked by the same `cargo deny` gate
-  (the old TS `mcp/server` + its pnpm `license-check` script are gone — EPIC #83).
+  (the original non-Rust MCP server + its separate license-check script are gone —
+  EPIC #83; `cargo deny` is now the single license gate for the Rust-only workspace).
 
 ## 6. pgDog clean-room rule (AGPL — inspiration only)
 

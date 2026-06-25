@@ -37,9 +37,9 @@
 #   deploy/up.sh                 # build (unless --no-build) + launch + print connect line
 #   deploy/up.sh --no-build      # skip the cargo build (use prebuilt artifacts)
 #
-# Requirements: the Homebrew keg-only postgresql@18 binaries (PGBIN), a Rust
-# toolchain, and Node (only for the throwaway Ed25519 approver-keypair gen below).
-# Clean-room; Apache/MIT/BSD/ISC deps only.
+# Requirements: the Homebrew keg-only postgresql@18 binaries (PGBIN) and a Rust
+# toolchain. The throwaway Ed25519 approver keypair is minted by the Rust-native
+# `pgb-cli keygen` (no extra runtime). Clean-room; Apache/MIT/BSD/ISC deps only.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -104,7 +104,6 @@ log "pre-flight :5432 listener(s): ${PRE_5432:-<none>} (we NEVER touch these)"
 
 [ -x "$PGBIN/initdb" ] || die "PG18 initdb not found at $PGBIN; set PGBIN to your postgresql@18 bin dir"
 command -v cargo >/dev/null || die "cargo not found"
-command -v node  >/dev/null || die "node not found"
 
 psql_primary() {
   "$PGBIN/psql" -X -h "$HOST" -p "$PRIMARY_PORT" -U postgres -d "${1:-postgres}" -v ON_ERROR_STOP=1 -tAc "$2"
@@ -121,10 +120,12 @@ fi
 PROXY_BIN="$REPO_ROOT/target/debug/pgb-proxy"
 APPLYD_BIN="$REPO_ROOT/target/debug/pgb-applyd"
 WARDEN_BIN="$REPO_ROOT/target/debug/pgb-warden"
-# The single deployable MCP server: the native Rust pgb-mcp (EPIC #83). The TS
-# mcp/server is gone — this binary IS the connectable stdio MCP server.
+# The CLI binary — also mints the throwaway approver keypair via `keygen` below.
+CLI_BIN="$REPO_ROOT/target/debug/pgb-cli"
+# The single deployable MCP server: the native Rust pgb-mcp (EPIC #83). The
+# original non-Rust mcp/server is gone — this binary IS the connectable stdio MCP server.
 MCP_BIN="$REPO_ROOT/target/debug/pgb-mcp"
-for b in "$PROXY_BIN" "$APPLYD_BIN" "$WARDEN_BIN" "$MCP_BIN"; do
+for b in "$PROXY_BIN" "$APPLYD_BIN" "$WARDEN_BIN" "$CLI_BIN" "$MCP_BIN"; do
   [ -e "$b" ] || die "missing build artifact: $b (run without --no-build, or build first)"
 done
 
@@ -268,21 +269,12 @@ log "pgb-proxy up (pid $PROXY_PID; reads route through here, NOT raw PG18)."
 # 5. Generate the throwaway Ed25519 approver keypair (the apply-time trust root).
 #    Same shape crates/policy/crates/cli expect: a 32-byte seed (hex) signs grants
 #    at `approve`; the 32-byte public key (hex) is applyd's configured trust root.
-#    Produced with Node's crypto (Ed25519), matching the integration tests'
-#    ed25519Hex() derivation (last 32 bytes of the DER spki/pkcs8).
+#    Minted by the Rust-native `pgb-cli keygen` (issue #101) — it prints the seed
+#    on line 1 and the pubkey on line 2, byte-identical to the old (last-32-bytes-
+#    of-the-PKCS8/SPKI-DER) derivation, so applyd's from_bytes parsers are unchanged.
 # ----------------------------------------------------------------------------
-KEYS_JSON="$(node -e '
-  const { generateKeyPairSync } = require("crypto");
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  const pub = publicKey.export({ type: "spki", format: "der" });
-  const priv = privateKey.export({ type: "pkcs8", format: "der" });
-  process.stdout.write(JSON.stringify({
-    pub: pub.subarray(pub.length - 32).toString("hex"),
-    seed: priv.subarray(priv.length - 32).toString("hex"),
-  }));
-')"
-APPROVER_PUBKEY="$(printf '%s' "$KEYS_JSON" | node -e 'process.stdin.on("data",d=>process.stdout.write(JSON.parse(d).pub))')"
-APPROVER_SEED="$(printf '%s' "$KEYS_JSON" | node -e 'process.stdin.on("data",d=>process.stdout.write(JSON.parse(d).seed))')"
+{ read -r APPROVER_SEED; read -r APPROVER_PUBKEY; } < <("$CLI_BIN" keygen)
+[ -n "$APPROVER_SEED" ] && [ -n "$APPROVER_PUBKEY" ] || die "pgb-cli keygen produced no keypair"
 printf '%s' "$APPROVER_PUBKEY" > "$STATE_DIR/approver.pub.hex"
 printf '%s' "$APPROVER_SEED"  > "$STATE_DIR/approver.seed.hex"
 chmod 0600 "$STATE_DIR/approver.seed.hex"

@@ -34,6 +34,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # RNG for generating the demo signing key in the binary. Same crate/features the
 # policy crate's grant tests already use (keeps the tree single-version).
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Hex encode the `keygen` seed/pubkey lines (issue #101) — the Rust-native
+# replacement for the removed `node -e` keypair generation in deploy/up.sh. Same
+# crate/version applyd uses to DECODE PGB_APPROVER_PUBKEY (keeps the tree single-version).
+hex = "0.4"
 
 [dev-dependencies]
 # The S5 cross-component IT (issue #64) drives a REAL proxy reject (via the proxy

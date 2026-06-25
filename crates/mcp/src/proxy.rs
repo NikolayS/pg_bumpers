@@ -4,7 +4,7 @@
 //! the **proxy's agent endpoint**, NOT raw PG. In production that endpoint is the
 //! Apache Rust `pgb-proxy` (proxy + warden + WALL = the real boundary); the proxy
 //! is what enforces extended-protocol-only / read-only / budgets / audit. This
-//! module is the Rust analogue of the TypeScript `PgProxyTransport`: it speaks
+//! module is the Rust analogue of the original non-Rust `PgProxyTransport`: it speaks
 //! `tokio-postgres` to the proxy and surfaces what the proxy returns.
 //!
 //! Honesty (SPEC §3): the MCP server is COOPERATIVE, NOT a security boundary. The

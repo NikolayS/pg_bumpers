@@ -12,7 +12,6 @@
 # Lockfiles, vendored data, and generated artifacts are not prose — skip them.
 extend-exclude = [
     "*.lock",
-    "pnpm-lock.yaml",
     "Cargo.lock",
     "fuzz/corpus/**",
 ]

@@ -9,6 +9,13 @@
 //! - `pgb-cli demo` — runs the full request → approve → verify-at-apply flow
 //!   in-process against an in-memory store + audit chain, printing each step.
 //!   This is a runnable smoke of the §14 mechanism (no DB, no network).
+//! - `pgb-cli keygen` — generate a throwaway Ed25519 approver keypair and print
+//!   two hex lines to stdout: line 1 = the 32-byte signing-key **seed**, line 2 =
+//!   the 32-byte **verifying key** (pubkey). This is the Rust-native replacement
+//!   for the keypair generation `deploy/up.sh` previously shelled out to: the seed
+//!   feeds `SigningKey::from_bytes` and the pubkey feeds applyd's
+//!   `PGB_APPROVER_PUBKEY` (`VerifyingKey::from_bytes`) — byte-identical to the
+//!   old `last-32-bytes-of-the-PKCS8-DER` derivation, so existing keys still work.
 //!
 //! The cryptography is entirely `pgb_policy`'s grant token (reused, not
 //! reimplemented); this binary is glue + UX.
@@ -62,13 +69,18 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Some("keygen") => {
+            run_keygen();
+            ExitCode::SUCCESS
+        }
         _ => {
             println!(
                 "pgb-cli — pg_bumpers approval CLI (SPEC §14 MVP).\n\
                  usage:\n  \
                  pgb-cli approve <request-id>   sign a proposal-bound grant (human approver)\n  \
                  pgb-cli demo                   run request -> approve -> verify-at-apply\n  \
-                 pgb-cli verify                 load + verify the shared `_meta` chain + anchored head\n\
+                 pgb-cli verify                 load + verify the shared `_meta` chain + anchored head\n  \
+                 pgb-cli keygen                 print a fresh Ed25519 approver keypair (seed hex, then pubkey hex)\n\
                  \n\
                  Set PGB_META_DSN (audit-writer DSN) + PGB_AUDIT_SIGNING_KEY to run the demo\n\
                  against the SHARED, persistent, anchored `_meta` chain (the one the proxy\n\
@@ -78,6 +90,28 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `pgb-cli keygen` — generate a fresh throwaway Ed25519 approver keypair and
+/// print it as two hex lines to stdout: line 1 = the 32-byte signing-key **seed**
+/// (`SigningKey::to_bytes`), line 2 = the 32-byte **verifying key**
+/// (`VerifyingKey::to_bytes`, the apply-time trust root).
+///
+/// This is the Rust-native replacement for the keypair generation `deploy/up.sh`
+/// previously shelled out to (issue #101). The shapes are **byte-identical** to the
+/// values `crates/applyd` parses: the seed round-trips through
+/// `SigningKey::from_bytes`, and the pubkey is exactly what
+/// `PGB_APPROVER_PUBKEY` feeds into `VerifyingKey::from_bytes`. The old non-Rust
+/// generator took the last 32 bytes of the PKCS8 DER as the seed, which is the same
+/// 32 bytes `to_bytes()` returns — so keys minted either way are interchangeable.
+fn run_keygen() {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    // Line 1: the 32-byte seed — the private signing material the approve path parses
+    // via `SigningKey::from_bytes` to SIGN the grant; applyd verifies at apply time
+    // with the line-2 public key.
+    println!("{}", hex::encode(signing_key.to_bytes()));
+    // Line 2: the 32-byte public verifying key (applyd's PGB_APPROVER_PUBKEY).
+    println!("{}", hex::encode(signing_key.verifying_key().to_bytes()));
 }
 
 /// `pgb-cli verify` — load the shared, persistent `_meta` chain and **fail-closed
