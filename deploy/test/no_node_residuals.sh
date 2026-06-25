@@ -100,7 +100,7 @@ PROSE_ALLOWLIST_RE=':[0-9]+:.*nodes?[[:space:]]+[^-[:space:]]'
 # the prose clause. This stops a LIVE `node -e`/`node x.js`/`Node 22` slipping into an
 # otherwise prose-allowlisted file. (Note: the trusted DOC clauses still apply first, so
 # the documenting `node -e` comments in crates/cli stay benign.)
-HARD_RESIDUAL_RE='node[[:space:]]+-|node[[:space:]]+[^[:space:]]*\.(js|mjs|cjs|tsx?)|Node[[:space:]][0-9]|Node\.js|nodejs|node_modules|pnpm|typescript|vitest|tsconfig|ts-node|package(-lock)?\.json|yarn\.lock|@types/node|(^|[^[:alnum:]])tsc([^[:alnum:]]|$)|(^|[^[:alnum:]])npm([^[:alnum:]]|$)'
+HARD_RESIDUAL_RE='node[[:space:]]+-|node[[:space:]]+[^[:space:]]*\.(js|mjs|cjs|tsx?)|\.tsx?([^[:alnum:]]|$)|Node[[:space:]][0-9]|Node\.js|nodejs|node_modules|pnpm|typescript|vitest|tsconfig|ts-node|package(-lock)?\.json|yarn\.lock|@types/node|(^|[^[:alnum:]])tsc([^[:alnum:]]|$)|(^|[^[:alnum:]])npm([^[:alnum:]]|$)'
 
 # Files excluded wholesale from the scan (documented above).
 EXCLUDES=(
@@ -156,7 +156,10 @@ run_self_test() {
   git archive --format=tar HEAD | (cd "$tmp" && tar -xf -)
   ( cd "$tmp" && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm base )
   cp "$0" "$tmp/deploy/test/no_node_residuals.sh"
-  ( cd "$tmp" && git add -A && git -c user.email=t@t -c user.name=t commit -qm gate )
+  # `--allow-empty`: the cp above is byte-identical to the archived gate copy, so there is
+  # nothing to commit; without this the empty `git commit` exits 1 and `set -Eeuo pipefail`
+  # aborts the whole self-test before the case loop runs.
+  ( cd "$tmp" && git add -A && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m gate )
 
   # The realistic residuals. Each is appended to a tracked file (default deploy/up.sh).
   # format: "label::residual-line::target-file"
