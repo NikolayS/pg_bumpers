@@ -137,6 +137,179 @@ pub struct CloneConfig {
     pub provider: CloneProvider,
 }
 
+/// A **credential-less** connection target (SPEC §0.5 BYO Postgres). The user
+/// declares *where* to connect — host/port/database/role — in `policy.yaml`, but
+/// **never** a literal password: that resolves out-of-band from the secret store /
+/// env (matching the existing "no literal passwords in files" posture). An
+/// optional [`secret_ref`](DsnTarget::secret_ref) names the secret-store key the
+/// daemon resolves the password under.
+///
+/// This is the BYO surface: `policy.yaml` is **authoritative** for the targets;
+/// the `PGB_BACKEND_*` / `PGB_PROXY_*` / `PGB_META_DSN` env vars become
+/// **overrides** layered on top (env override > policy.yaml target > fail-closed —
+/// there is **no** silent throwaway-cluster default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DsnTarget {
+    /// The target host (e.g. `db.internal` — the user's existing primary). This
+    /// is the user's own database; there is no throwaway-cluster assumption.
+    pub host: String,
+    /// The target port.
+    pub port: u16,
+    /// The database to connect to.
+    pub database: String,
+    /// The role to connect as (e.g. `pgb_agent` on the primary, `pgb_applier`
+    /// for the applier, `pgb_audit_writer` for `_meta`). Credential-less: the
+    /// **password is not here** — it resolves from the secret store / env.
+    pub role: String,
+    /// Optional reference into the secret store for this target's password (e.g.
+    /// `kms://pg-bumpers/primary-pw/v1`). Absent ⇒ the daemon resolves the
+    /// password from its conventional env var (the existing posture). The literal
+    /// secret is **never** stored in `policy.yaml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+}
+
+impl DsnTarget {
+    /// Build a **credential-less** keyword/value DSN string (host/port/db/user, no
+    /// `password=`). The daemon appends the resolved password from the secret
+    /// store / env before connecting; this never carries a literal secret.
+    pub fn to_credential_less_dsn(&self) -> String {
+        format!(
+            "host={} port={} dbname={} user={}",
+            self.host, self.port, self.database, self.role
+        )
+    }
+}
+
+/// A **resolved** connection target — the host/port/db/role a daemon will actually
+/// connect to, after layering env overrides on top of the `policy.yaml` BYO target
+/// (SPEC §0.5). Credential-less: the password is resolved separately from the
+/// secret store / env and is **never** carried here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    /// The resolved host.
+    pub host: String,
+    /// The resolved port.
+    pub port: u16,
+    /// The resolved database.
+    pub database: String,
+    /// The resolved role.
+    pub role: String,
+}
+
+impl ResolvedTarget {
+    /// Build a credential-less keyword/value DSN (no `password=`).
+    pub fn to_credential_less_dsn(&self) -> String {
+        format!(
+            "host={} port={} dbname={} user={}",
+            self.host, self.port, self.database, self.role
+        )
+    }
+}
+
+/// The error a fail-closed target resolution returns when **neither** the env
+/// override **nor** the `policy.yaml` BYO target supplies a required field. This is
+/// the §0.5 / §2 fail-closed posture: there is **no** silent throwaway-cluster
+/// default (no hardcoded `54321`) — a daemon with no target refuses to start.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "no connection target for `{field}`: set it via the env override `{env_key}`, or declare \
+     the BYO target in policy.yaml ({policy_hint}). There is NO throwaway-cluster default \
+     (fail-closed, SPEC §0.5)."
+)]
+pub struct TargetResolutionError {
+    /// Which logical field was unresolvable (`host` / `port`).
+    pub field: &'static str,
+    /// The env var the operator can set to override.
+    pub env_key: &'static str,
+    /// A hint pointing at the policy.yaml section that would supply it.
+    pub policy_hint: &'static str,
+}
+
+/// Layered resolution of a connection target: **env override > policy.yaml BYO
+/// target > fail-closed** (SPEC §0.5, §2). This is the single helper every daemon
+/// (proxy / applyd / warden / mcp) uses so the precedence is identical and there is
+/// exactly one place the (now-removed) `54321` default used to live.
+///
+/// `host`/`port` are the connection essentials and are **fail-closed**: if neither
+/// the env override nor the policy target provides them, resolution errors (the
+/// daemon refuses to start). `database`/`role` fall back to the supplied
+/// `default_database` / `default_role` (conventional, non-secret, non-targeting
+/// values like `postgres` / `pgb_agent`) when neither source names them, because a
+/// missing db/role is not a *targeting* hole the way a missing host/port is.
+///
+/// Every argument is taken explicitly (no process-env reads) so this is **pure and
+/// unit-testable** — the daemon binaries pass `std::env::var(..).ok()` for the
+/// overrides and the loaded `policy.yaml` target.
+pub struct TargetResolver<'a> {
+    /// The BYO target from `policy.yaml` (authoritative when no env override).
+    pub policy_target: Option<&'a DsnTarget>,
+    /// env override for the host (e.g. `PGB_BACKEND_HOST`).
+    pub host_override: Option<String>,
+    /// env override for the port (e.g. `PGB_BACKEND_PORT`).
+    pub port_override: Option<String>,
+    /// env override for the database (e.g. `PGB_BACKEND_DB`).
+    pub db_override: Option<String>,
+    /// env override for the role (e.g. `PGB_BACKEND_ROLE`).
+    pub role_override: Option<String>,
+    /// Conventional default database when neither env nor policy names one.
+    pub default_database: &'a str,
+    /// Conventional default role when neither env nor policy names one.
+    pub default_role: &'a str,
+    /// The env var name reported in the fail-closed error for host.
+    pub host_env_key: &'static str,
+    /// The env var name reported in the fail-closed error for port.
+    pub port_env_key: &'static str,
+    /// The policy.yaml section hint reported in the fail-closed error.
+    pub policy_hint: &'static str,
+}
+
+impl<'a> TargetResolver<'a> {
+    /// Resolve the target, fail-closed on a missing host/port.
+    pub fn resolve(&self) -> Result<ResolvedTarget, TargetResolutionError> {
+        let host = self
+            .host_override
+            .clone()
+            .or_else(|| self.policy_target.map(|t| t.host.clone()))
+            .ok_or(TargetResolutionError {
+                field: "host",
+                env_key: self.host_env_key,
+                policy_hint: self.policy_hint,
+            })?;
+        let port = match &self.port_override {
+            Some(p) => p.parse::<u16>().map_err(|_| TargetResolutionError {
+                field: "port",
+                env_key: self.port_env_key,
+                policy_hint: self.policy_hint,
+            })?,
+            None => self
+                .policy_target
+                .map(|t| t.port)
+                .ok_or(TargetResolutionError {
+                    field: "port",
+                    env_key: self.port_env_key,
+                    policy_hint: self.policy_hint,
+                })?,
+        };
+        let database = self
+            .db_override
+            .clone()
+            .or_else(|| self.policy_target.map(|t| t.database.clone()))
+            .unwrap_or_else(|| self.default_database.to_string());
+        let role = self
+            .role_override
+            .clone()
+            .or_else(|| self.policy_target.map(|t| t.role.clone()))
+            .unwrap_or_else(|| self.default_role.to_string());
+        Ok(ResolvedTarget {
+            host,
+            port,
+            database,
+            role,
+        })
+    }
+}
+
 /// Replica configuration (SPEC §12.2: `replica.dsn?`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReplicaConfig {
@@ -144,6 +317,12 @@ pub struct ReplicaConfig {
     /// budgets (degraded mode, SPEC §10.8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsn: Option<String>,
+    /// Optional **credential-less** replica target (SPEC §0.5 BYO). The typed BYO
+    /// form of [`dsn`](ReplicaConfig::dsn) — host/port/db/role + a secret
+    /// reference, no literal password. Either form may be present; the typed
+    /// target is the BYO-first surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<DsnTarget>,
 }
 
 /// PITR configuration (SPEC §12.2: `pitr.enabled`).
@@ -168,11 +347,30 @@ pub struct ApproverSet {
     pub cli_signing_key_id: Option<String>,
 }
 
-/// Audit-anchor placeholder (SPEC §10.9, §14.3 audit-key-grade handling).
+/// Audit configuration (SPEC §10.9, §14.3 audit-key-grade handling) — carries the
+/// `_meta` **location** AND the external WORM anchor endpoint, two distinct things:
+///
+/// - [`target`](AuditAnchorConfig::target) is the **credential-less `_meta` DSN
+///   target** (SPEC §0.5 BYO — host/port/db/role of the database holding the
+///   hash-chained `_meta` audit chain; commonly co-located on the primary, or a
+///   separate audit DB). This is where the daemons append + verify the chain.
+/// - [`anchor_endpoint`](AuditAnchorConfig::anchor_endpoint) is the **external
+///   append-only / WORM anchor endpoint** that pins the chain *head* — a different
+///   sink entirely (object-lock / transparency log), NOT a Postgres DSN.
+///
+/// Both are optional and orthogonal; adding the `_meta` target did not disturb the
+/// pre-existing anchor field.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AuditAnchorConfig {
+    /// The **credential-less `_meta` DSN target** (SPEC §0.5 BYO): where the
+    /// hash-chained audit chain lives. Host/port/db/role + an optional secret
+    /// reference; no literal password. Absent ⇒ the `_meta` DSN comes from the
+    /// `PGB_META_DSN` env (the existing posture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<DsnTarget>,
     /// The external append-only / WORM anchor endpoint (placeholder; wired in
-    /// S4). Absent ⇒ local-only audit (documented downgrade).
+    /// S4). Absent ⇒ local-only audit (documented downgrade). NOT a Postgres DSN —
+    /// distinct from [`target`](AuditAnchorConfig::target).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_endpoint: Option<String>,
 }
@@ -185,6 +383,15 @@ pub struct PolicyConfig {
     /// Per-role policies, keyed by role name. [`BTreeMap`] for deterministic
     /// serialization.
     pub roles: BTreeMap<String, RolePolicy>,
+    /// The **primary** BYO connection target (SPEC §0.5): the WALL/agent +
+    /// applier connection target — the user's existing production database the
+    /// proxy and applyd connect to. **Credential-less** (host/port/db/role +
+    /// optional secret reference; no literal password). Absent ⇒ the daemons read
+    /// the target from the `PGB_BACKEND_*` env (which then must be set — there is
+    /// **no** silent throwaway-cluster default; resolution is env override >
+    /// policy.yaml target > fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<DsnTarget>,
     /// Replica configuration.
     #[serde(default)]
     pub replica: ReplicaConfig,
@@ -482,6 +689,218 @@ roles:
         assert_eq!(cfg.clone.provider, CloneProvider::None);
         assert!(!cfg.pitr.enabled);
         assert!(cfg.replica.dsn.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // SPEC §0.5 BYO Postgres — the typed DSN-target surface + layered resolution.
+    // ---------------------------------------------------------------------------
+
+    /// RED #1: `PolicyConfig` parses a BYO `policy.yaml` carrying the THREE §0.5
+    /// DSN targets — `primary`, `replica` (typed `target`), and the `audit`/`_meta`
+    /// location — as credential-less host/port/db/role + a secret reference (no
+    /// literal password). Before the BYO fields exist this fails to parse.
+    #[test]
+    fn parses_the_three_byo_dsn_targets() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+primary:
+  host: db.internal
+  port: 5432
+  database: app
+  role: pgb_agent
+  secret_ref: "kms://pg-bumpers/primary-pw/v1"
+replica:
+  target:
+    host: replica.internal
+    port: 5432
+    database: app
+    role: pgb_agent
+audit:
+  target:
+    host: db.internal
+    port: 5432
+    database: app_meta
+    role: pgb_audit_writer
+    secret_ref: "kms://pg-bumpers/meta-pw/v1"
+  anchor_endpoint: "https://audit-anchor.internal/v1/append"
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).expect("BYO targets must parse");
+
+        // primary — credential-less, with a secret reference (NOT a literal pw).
+        let primary = cfg.primary.as_ref().expect("primary target present");
+        assert_eq!(primary.host, "db.internal");
+        assert_eq!(primary.port, 5432);
+        assert_eq!(primary.database, "app");
+        assert_eq!(primary.role, "pgb_agent");
+        assert_eq!(
+            primary.secret_ref.as_deref(),
+            Some("kms://pg-bumpers/primary-pw/v1")
+        );
+        // The credential-less DSN carries NO password keyword.
+        let dsn = primary.to_credential_less_dsn();
+        assert!(!dsn.contains("password"), "no literal password in DSN: {dsn}");
+        assert!(dsn.contains("user=pgb_agent"), "{dsn}");
+
+        // replica — the typed BYO target alongside the legacy `dsn` string form.
+        let replica = cfg.replica.target.as_ref().expect("replica target present");
+        assert_eq!(replica.host, "replica.internal");
+        assert!(replica.secret_ref.is_none());
+
+        // audit/_meta — the DSN location is distinct from the WORM anchor endpoint.
+        let meta = cfg.audit.target.as_ref().expect("audit/_meta target present");
+        assert_eq!(meta.database, "app_meta");
+        assert_eq!(meta.role, "pgb_audit_writer");
+        assert_eq!(
+            cfg.audit.anchor_endpoint.as_deref(),
+            Some("https://audit-anchor.internal/v1/append")
+        );
+    }
+
+    /// The BYO targets round-trip through serde unchanged (so a re-emitted
+    /// `policy.yaml` is byte-stable and still credential-less).
+    #[test]
+    fn byo_targets_round_trip_through_serde() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+primary:
+  host: db.internal
+  port: 5432
+  database: app
+  role: pgb_agent
+audit:
+  target:
+    host: db.internal
+    port: 5432
+    database: app
+    role: pgb_audit_writer
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).unwrap();
+        let reemitted = serde_yaml_ng::to_string(&cfg).unwrap();
+        let reparsed = PolicyConfig::load_from_yaml(&reemitted).unwrap();
+        assert_eq!(cfg, reparsed);
+        // The re-emitted document still contains NO literal password.
+        assert!(
+            !reemitted.to_lowercase().contains("password"),
+            "policy.yaml must never carry a literal password: {reemitted}"
+        );
+    }
+
+    /// The BYO targets are all OPTIONAL — a policy with none still loads (the
+    /// daemons then resolve targets purely from env; see the resolver tests).
+    #[test]
+    fn byo_targets_are_optional() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L0
+    budget:
+      max_bytes: 100
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 1000, max_rows: 1000 }
+"#;
+        let cfg = PolicyConfig::load_from_yaml(yaml).unwrap();
+        assert!(cfg.primary.is_none());
+        assert!(cfg.replica.target.is_none());
+        assert!(cfg.audit.target.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // RED #2 (HEADLINE): layered target resolution — env override > policy.yaml BYO
+    // target > FAIL-CLOSED. There is NO throwaway-cluster 54321 default anywhere.
+    // ---------------------------------------------------------------------------
+
+    fn target(host: &str, port: u16, db: &str, role: &str) -> DsnTarget {
+        DsnTarget {
+            host: host.to_string(),
+            port,
+            database: db.to_string(),
+            role: role.to_string(),
+            secret_ref: None,
+        }
+    }
+
+    fn resolver<'a>(
+        policy_target: Option<&'a DsnTarget>,
+        host: Option<&str>,
+        port: Option<&str>,
+    ) -> TargetResolver<'a> {
+        TargetResolver {
+            policy_target,
+            host_override: host.map(String::from),
+            port_override: port.map(String::from),
+            db_override: None,
+            role_override: None,
+            default_database: "postgres",
+            default_role: "pgb_agent",
+            host_env_key: "PGB_BACKEND_HOST",
+            port_env_key: "PGB_BACKEND_PORT",
+            policy_hint: "policy.yaml `primary:`",
+        }
+    }
+
+    #[test]
+    fn resolve_uses_policy_target_when_no_env_override() {
+        let t = target("db.internal", 6543, "app", "pgb_agent");
+        let r = resolver(Some(&t), None, None).resolve().unwrap();
+        assert_eq!(r.host, "db.internal");
+        assert_eq!(r.port, 6543);
+        assert_eq!(r.database, "app");
+        assert_eq!(r.role, "pgb_agent");
+        // CRITICAL: the resolved port is the BYO target's, NEVER the removed 54321.
+        assert_ne!(r.port, 54321, "must not fall back to the throwaway 54321");
+    }
+
+    #[test]
+    fn resolve_env_override_wins_over_policy_target() {
+        let t = target("db.internal", 6543, "app", "pgb_agent");
+        let r = resolver(Some(&t), Some("other.host"), Some("7000"))
+            .resolve()
+            .unwrap();
+        assert_eq!(r.host, "other.host");
+        assert_eq!(r.port, 7000);
+    }
+
+    #[test]
+    fn resolve_fails_closed_when_no_env_and_no_policy_target() {
+        // The headline §0.5 / §2 assertion: with NEITHER an env override NOR a
+        // policy.yaml target, resolution FAILS CLOSED — it does NOT silently
+        // default the host/port to the throwaway 54321 cluster.
+        let err = resolver(None, None, None).resolve().unwrap_err();
+        assert_eq!(err.field, "host");
+        let msg = err.to_string();
+        assert!(msg.contains("NO throwaway-cluster default"), "{msg}");
+        assert!(msg.contains("fail-closed"), "{msg}");
+        assert!(!msg.contains("54321"), "no 54321 anywhere: {msg}");
+
+        // Host from env but port missing entirely ⇒ still fail-closed on the port
+        // (no 54321 fallback for the port either).
+        let err = resolver(None, Some("h"), None).resolve().unwrap_err();
+        assert_eq!(err.field, "port");
+    }
+
+    #[test]
+    fn resolve_db_and_role_fall_back_to_conventional_defaults() {
+        // host/port come from env; db/role unspecified anywhere ⇒ the conventional
+        // (non-targeting) defaults, not a fail-closed error (a missing db/role is
+        // not a targeting hole the way a missing host/port is).
+        let r = resolver(None, Some("h"), Some("6000")).resolve().unwrap();
+        assert_eq!(r.database, "postgres");
+        assert_eq!(r.role, "pgb_agent");
     }
 
     #[test]

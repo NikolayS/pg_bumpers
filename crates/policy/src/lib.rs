@@ -37,8 +37,9 @@ pub mod risk;
 pub mod verdict;
 
 pub use config::{
-    ApproverSet, AuditAnchorConfig, AutonomyLevel, CloneConfig, CloneProvider, PitrConfig,
-    PolicyConfig, PolicyError, ReplicaConfig, RoleBudget, RolePolicy, WindowBudget,
+    ApproverSet, AuditAnchorConfig, AutonomyLevel, CloneConfig, CloneProvider, DsnTarget,
+    PitrConfig, PolicyConfig, PolicyError, ReplicaConfig, ResolvedTarget, RoleBudget, RolePolicy,
+    TargetResolutionError, TargetResolver, WindowBudget,
 };
 pub use grant::{GrantBinding, GrantError, GrantToken, InMemoryNonceStore, NonceStore};
 pub use intent::{

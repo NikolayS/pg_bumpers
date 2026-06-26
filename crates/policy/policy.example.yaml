@@ -68,9 +68,38 @@ roles:
         max_rows: 100000
     autonomy: L0
 
-# §12.2 — optional components (runtime-detected; never silently downgraded).
+# =====================================================================================
+# §0.5 — BRING-YOUR-OWN POSTGRES: the three DSN targets (the first-user experience).
+# =====================================================================================
+# pg_bumpers points at YOUR existing PostgreSQL 14-18. policy.yaml is AUTHORITATIVE for
+# the connection TARGETS — host/port/database/role of (1) your primary, (2) an optional
+# read replica, and (3) the audit/`_meta` location. The `PGB_BACKEND_*` / `PGB_PROXY_*` /
+# `PGB_META_DSN` env vars are OVERRIDES layered on top (precedence: env override >
+# policy.yaml target > FAIL-CLOSED — there is NO throwaway-cluster default).
+#
+# CREDENTIALS STAY OUT OF THIS FILE. A target is CREDENTIAL-LESS (host/port/db/role +
+# an optional `secret_ref` naming the secret-store key); the literal password resolves
+# from the secret store / env at connect time. This matches the existing "no literal
+# passwords in files" posture. Uncomment + edit the three targets below to point at your
+# database, then run `pgb-cli doctor` to verify the connection + WALL hardening.
+#
+# primary — the WALL/agent + applier connection target (proxy + applyd connect here):
+# primary:
+#   host: db.internal
+#   port: 5432
+#   database: app
+#   role: pgb_agent            # the hardened WALL role (apply deploy/sql/10_hardened_role.sql)
+#   secret_ref: "kms://pg-bumpers/primary-pw/v1"   # OPTIONAL; password never literal here
+
+# §12.2 — optional read replica (runtime-detected; never silently downgraded). Either the
+# legacy `dsn` string OR the typed BYO `target` (credential-less) may be set.
 replica:
   dsn: "postgresql://reader@replica.internal:5432/app"
+  # target:                    # the BYO-first typed form (credential-less)
+  #   host: replica.internal
+  #   port: 5432
+  #   database: app
+  #   role: pgb_agent
 
 clone:
   provider: dblab            # none | dblab
@@ -83,8 +112,18 @@ pitr:
 approvers:
   cli_signing_key_id: "kms://pg-bumpers/approval-key/v1"
 
-# §10.9 — external append-only / WORM audit anchor (wired in S4).
+# §0.5 / §10.9 — the audit chain. Two DISTINCT things live here:
+#   * `target` — the credential-less `_meta` DSN LOCATION (where the hash-chained audit
+#     chain lives; commonly co-located on the primary, or a separate audit DB). BYO.
+#   * `anchor_endpoint` — the external append-only / WORM anchor that pins the chain HEAD
+#     (object-lock / transparency log; NOT a Postgres DSN). Wired in S4.
 audit:
+  # target:                    # the BYO `_meta` DSN location (credential-less)
+  #   host: db.internal
+  #   port: 5432
+  #   database: app_meta
+  #   role: pgb_audit_writer
+  #   secret_ref: "kms://pg-bumpers/meta-pw/v1"
   anchor_endpoint: "https://audit-anchor.internal/v1/append"
 
 # §4 "Warden", §10.10 — the live out-of-band watchdog's operational thresholds.

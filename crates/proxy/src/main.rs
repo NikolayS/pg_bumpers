@@ -13,10 +13,14 @@
 //!   Default: TLS is **required** whenever cert+key are configured (no silent
 //!   cleartext downgrade). Set `false` for the explicit dev-only no-TLS mode;
 //!   setting `true` with no TLS material is a hard error (fail-closed).
-//! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` — PG18 target
-//!   (defaults `127.0.0.1` / `54321` / `postgres`; **never 5432**).
-//! - `PGB_BACKEND_ROLE` — the WALL role the proxy connects as (default
-//!   `pgb_agent`).
+//! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` — the BYO primary
+//!   target (SPEC §0.5). These are **overrides** layered on top of the `primary:`
+//!   target in `policy.yaml`; precedence is **env override > policy.yaml `primary:`
+//!   target > FAIL-CLOSED**. There is **no** throwaway-cluster default — if neither
+//!   the env nor `policy.yaml` supplies host/port the proxy refuses to start (no
+//!   silent `54321`). **Never 5432** unless that is the user's own database.
+//! - `PGB_BACKEND_ROLE` — the WALL role the proxy connects as (falls back to the
+//!   `policy.yaml` primary target's role, then `pgb_agent`).
 //! - `PGB_BACKEND_PASSWORD` — the WALL role's password. **Required**: there is
 //!   no default secret literal in the binary (source it from the secret store /
 //!   env, e.g. `deploy/proxy.env.example`).
@@ -56,13 +60,41 @@ use std::time::Duration;
 
 use pgb_audit::{AUDIT_SIGNING_KEY_ID, AnchorRole, AuditBoot, LocalSecretStore, SecretStore, Sink};
 use pgb_core::{Clock, SystemClock};
-use pgb_policy::PolicyConfig;
+use pgb_policy::{PolicyConfig, TargetResolver};
 use pgb_proxy::config::{BackendTarget, TlsConfig};
 use pgb_proxy::{ProxyConfig, Recorder, ThreadedSink, serve_connection};
 use tokio::net::TcpListener;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Resolve the proxy's BYO **primary** backend target (SPEC §0.5) from the loaded
+/// `policy.yaml` + an environment reader, with the precedence **env override >
+/// policy.yaml `primary:` target > FAIL-CLOSED**. There is NO throwaway-cluster
+/// default — a proxy with no resolvable host/port refuses to start (no silent
+/// `54321`).
+///
+/// `getenv` is taken as a closure (not a direct `std::env` read) so this is **pure
+/// and unit-testable** — the component-wiring test drives it with a BYO policy +
+/// a fake env, asserting it never falls back to `54321`.
+fn resolve_backend_target(
+    policy: &PolicyConfig,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<pgb_policy::ResolvedTarget, pgb_policy::TargetResolutionError> {
+    TargetResolver {
+        policy_target: policy.primary.as_ref(),
+        host_override: getenv("PGB_BACKEND_HOST"),
+        port_override: getenv("PGB_BACKEND_PORT"),
+        db_override: getenv("PGB_BACKEND_DB"),
+        role_override: getenv("PGB_BACKEND_ROLE"),
+        default_database: "postgres",
+        default_role: "pgb_agent",
+        host_env_key: "PGB_BACKEND_HOST",
+        port_env_key: "PGB_BACKEND_PORT",
+        policy_hint: "policy.yaml `primary:` (the BYO primary target, SPEC §0.5)",
+    }
+    .resolve()
 }
 
 /// Read a required secret from the environment. Fail-closed: there are **no**
@@ -122,15 +154,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy = PolicyConfig::load_from_yaml(&std::fs::read_to_string(&policy_path)?)?;
     let budget = ProxyConfig::budget_for(&policy, &policy_role)?;
 
+    // BYO primary target (SPEC §0.5): env override > policy.yaml `primary:` target >
+    // FAIL-CLOSED. There is NO throwaway-cluster default — a proxy with no target
+    // refuses to start (no silent `54321`).
+    let backend_target = resolve_backend_target(&policy, |k| std::env::var(k).ok())?;
+
     let cfg = Arc::new(ProxyConfig {
         listen,
         tls,
         require_tls,
         backend: BackendTarget {
-            host: env_or("PGB_BACKEND_HOST", "127.0.0.1"),
-            port: env_or("PGB_BACKEND_PORT", "54321").parse()?,
-            database: env_or("PGB_BACKEND_DB", "postgres"),
-            role: env_or("PGB_BACKEND_ROLE", "pgb_agent"),
+            host: backend_target.host,
+            port: backend_target.port,
+            database: backend_target.database,
+            role: backend_target.role,
             // Secrets: no literal defaults in the binary (fail-closed).
             password: env_secret("PGB_BACKEND_PASSWORD")?,
         },
@@ -306,5 +343,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("pgb-proxy: session {session_id} ({peer}) ended: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid `policy.yaml` carrying a BYO `primary:` target.
+    fn byo_policy() -> PolicyConfig {
+        let yaml = r#"
+version: 1
+roles:
+  analytics:
+    autonomy: L2
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+primary:
+  host: byo.db.internal
+  port: 6543
+  database: appdb
+  role: pgb_agent
+"#;
+        PolicyConfig::load_from_yaml(yaml).unwrap()
+    }
+
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// HEADLINE (RED #2): the proxy resolves its backend target from the BYO
+    /// `policy.yaml` primary target — NOT the removed `54321` default — when no
+    /// env override is set.
+    #[test]
+    fn resolves_backend_from_byo_policy_target_not_54321() {
+        let policy = byo_policy();
+        let target = resolve_backend_target(&policy, fake_env(&[])).unwrap();
+        assert_eq!(target.host, "byo.db.internal");
+        assert_eq!(target.port, 6543);
+        assert_eq!(target.database, "appdb");
+        assert_eq!(target.role, "pgb_agent");
+        assert_ne!(target.port, 54321, "must NOT fall back to the throwaway 54321");
+    }
+
+    /// The env override wins over the policy target (the existing ITs / up.sh path).
+    #[test]
+    fn env_override_wins_over_policy_target() {
+        let policy = byo_policy();
+        let target = resolve_backend_target(
+            &policy,
+            fake_env(&[("PGB_BACKEND_HOST", "127.0.0.1"), ("PGB_BACKEND_PORT", "54399")]),
+        )
+        .unwrap();
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, 54399);
+    }
+
+    /// FAIL-CLOSED: with NO policy primary target AND no env override, resolution
+    /// errors — the proxy refuses to start rather than silently default to 54321.
+    #[test]
+    fn fails_closed_with_no_policy_target_and_no_env() {
+        let yaml = r#"
+version: 1
+roles:
+  analytics:
+    autonomy: L2
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let policy = PolicyConfig::load_from_yaml(yaml).unwrap();
+        let err = resolve_backend_target(&policy, fake_env(&[])).unwrap_err();
+        assert_eq!(err.field, "host");
+        assert!(!err.to_string().contains("54321"));
     }
 }
