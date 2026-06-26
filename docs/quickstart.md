@@ -1,44 +1,250 @@
 # pg_bumpers — Quickstart
 
-Get a local checkout building, bring up the dev substrate, and run the env-gated
-integration suite against **real PostgreSQL** — any supported major (**14–18**;
-spec v0.8.1 §0.5). CI runs the full safety suite against every major in that range.
+**The first-run path is "point pg_bumpers at YOUR existing PostgreSQL."** You bring
+your own production database (any supported major, **14–18**; spec v0.8.1 §0.5);
+pg_bumpers never asks you to spin one up. This page LEADS with that BYO flow
+(§[Get started — BYO](#get-started--point-pg_bumpers-at-your-existing-postgresql-byo)),
+then — far below, and clearly labelled **CI/dev/test fixtures only** — covers the
+throwaway local stack / docker-compose / `up.sh` substrate the project uses for its
+own tests, the benchmark, and the env-gated integration suite.
 
-> **Source of truth:** [`docs/spec/SPEC.md`](spec/SPEC.md) (v0.8). The dev-substrate
-> deviation (docker → local PG 18) is logged in
+> **The throwaway stack is a fixture, not a shipped artifact.** The
+> `deploy/local-stack.sh` / `deploy/docker-compose.yml` / `deploy/up.sh` clusters are a
+> deterministic CI/dev/test substrate — **never** the onboarding flow. A real user
+> follows the BYO steps below; they do **not** spin up a throwaway cluster.
+
+> **Source of truth:** [`docs/spec/SPEC.md`](spec/SPEC.md) (v0.8); the BYO onboarding is
+> §0.5. The dev-substrate deviation (docker → local PG) is logged in
 > [`docs/spec/SPEC.amendments.md`](spec/SPEC.amendments.md) → *"S0 integration substrate"*.
-> License: Apache-2.0.
+> License: Apache-2.0. The README mirrors this BYO flow as the project's headline
+> quickstart.
 
 ## What works today (status)
 
 This is an MVP under active construction. Honest status as of this writing:
 
-- **Merged & green on PG 18:** S0 (skeleton, the native-role WALL, `core`/contracts,
-  the fidelity gate), S1 (`pgwire`, `audit`, `proxy`), S2 (clone dry-run + governance).
-- **In progress:** S3 (guarded apply + typed-inverse).
-- **Upcoming / fast-follow:** S4 (warden, MCP wiring, policy wiring, audit-anchor,
-  read-gates, CLI approval), S5 (benchmark + the marquee MCP-bypass repro), and the
-  LLM gating engine. In the MVP the `RiskEngine` is a **stub returning `Allow`** —
-  the deterministic floor (WALL + budgets + timeouts + bounded/reversible writes) is
-  the guarantee, not any model.
+- **Works now:** the BYO-first onboarding (`policy.yaml` DSN targets + the canonical
+  role hardening + the `pgb-cli doctor` fail-closed preflight); the native-role WALL +
+  proxy-only network path; the enforcing proxy (read-only, byte/row cutoff,
+  `statement_timeout`, anti-statement-stacking, audit); clone dry-run blast-radius
+  preview; guarded apply with typed-inverse + operator approval; the live warden; the
+  tamper-evident, externally-anchored audit chain; and the MCP tool surface.
+- **Deferred / fast-follow:** the LLM gating engine (in the MVP the `RiskEngine` is a
+  **stub returning `Allow`** — the deterministic floor is the guarantee, not any model);
+  DDL / multi-statement / multi-DB; an operator approval UI; a managed clone provider.
 
 ### What the guarantee is — and is not
 
 - **Writes:** bounded + reversible by construction — zero catastrophic data-loss false
-  negatives. The guard is the **affected-PK-set checksum**, recomputed inside the apply
-  txn, not a row count.
+  negatives. The floor is three orthogonal pins (not a checksum): **bounded** by the
+  human-approved absolute **`WriteCap`** (`max_rows` + `max_wal_bytes`, enforced inside
+  the apply txn from the `pg_stat_xact_*` deltas + a WAL-byte measure) + the
+  `pg_stat_xact_*` reconciliation + a `statement_timeout`; **reversible** via the
+  apply-time pre-image capture (`FOR UPDATE` + `RETURNING`) + row/column coverage guards;
+  and **row-identity** foreclosed by the self-determined-predicate gate (the approved
+  `WHERE` references only the immutable primary key + literals). Structural/irreversible
+  ops (`DROP`, `TRUNCATE`, DDL) are refused outright.
 - **Reads:** **bounded disclosure** — a per-role byte/row budget, then a hard cutoff,
   plus best-effort detection. Not zero, never "impossible." The audit chain is
   **tamper-evident**, not tamper-proof.
 
 ---
 
-## 1. Prerequisites
+## Get started — point pg_bumpers at YOUR existing PostgreSQL (BYO)
+
+This is the real onboarding flow. You declare where your database lives in
+`policy.yaml`, apply the canonical role hardening to it, verify with one command, then
+launch the daemons + connect your agent — all against **your** DSNs. No throwaway
+cluster required. (This mirrors the README's headline quickstart.)
+
+### Prerequisites (BYO)
+
+| Tool | Version | Notes |
+|------|---------|-------|
+| Rust | **1.90.0** | Pinned by [`rust-toolchain.toml`](../rust-toolchain.toml). `rustup` auto-selects it. |
+| PostgreSQL | **14–18** | Your existing database — the proxy + native-role WALL are version-agnostic. You also need a `psql` client to apply the hardening SQL. |
+| `cargo-deny` | latest | License/advisory gate (dev only): `cargo install cargo-deny`. |
+
+Build the binaries once (the daemons + the CLI + the MCP server):
+
+```sh
+git clone https://github.com/NikolayS/pg_bumpers.git
+cd pg_bumpers
+cargo build --locked -p pgb-proxy -p pgb-applyd -p pgb-warden -p pgb-cli -p pgb-mcp
+```
+
+### 1. Declare your DSN targets in `policy.yaml`
+
+`policy.yaml` is **authoritative** for the connection *targets* — the host/port/
+database/role of (a) your primary, (b) an optional read replica, and (c) the audit
+`_meta` location. Credentials stay **out** of the file (resolved from your secret
+store / env); a target is *credential-less* (host/port/db/role + an optional
+`secret_ref`). The `PGB_BACKEND_*` / `PGB_PROXY_*` / `PGB_META_DSN` env vars are
+**overrides** layered on top (precedence: env override → `policy.yaml` target →
+**fail-closed**; there is **no** throwaway-cluster default). See
+[`crates/policy/policy.example.yaml`](../crates/policy/policy.example.yaml):
+
+```yaml
+# policy.yaml — point at YOUR database (no literal passwords in this file)
+primary:
+  host: db.internal          # your existing primary
+  port: 5432                 # your real port — pg_bumpers never touches a throwaway cluster
+  database: app
+  role: pgb_agent            # the hardened WALL role (step 2)
+  secret_ref: "kms://pg-bumpers/primary-pw/v1"   # OPTIONAL forward-compat placeholder; see step 4
+replica:                     # OPTIONAL read replica (reads route here under §12)
+  target: { host: replica.internal, port: 5432, database: app, role: pgb_agent }
+audit:
+  target:                    # the credential-less `_meta` DSN location (audit chain)
+    host: db.internal
+    port: 5432
+    database: app_meta
+    role: pgb_audit_writer
+```
+
+> Host/database/role/secret_ref values are validated **fail-closed** on load: a value
+> carrying whitespace, `=`, a quote, a backslash, or a control char is **rejected**
+> (those would inject extra libpq DSN keywords — e.g. a TLS-disabling `sslmode=disable`).
+
+### 2. Apply the role hardening (+ your own GRANTs) to your database
+
+Apply the **canonical, version-agnostic** role hardening — it creates and hardens the
+read WALL role `pgb_agent` (NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant
+anywhere) and the DML-only apply role `pgb_applier`, and revokes every inherited/default
+privilege:
+
+```sh
+psql "host=db.internal port=5432 dbname=app" -f deploy/sql/10_hardened_role.sql
+```
+
+Then grant the agent/applier **only your own** allow-listed relations (the WALL is
+default-deny on all data until you do — that is the point):
+
+```sql
+-- the agent's READ whitelist (SELECT only; never INSERT/UPDATE/DELETE):
+GRANT SELECT ON app.your_read_table TO pgb_agent;
+-- the applier's WRITE surface (DML only; never DDL; ownership stays unchanged):
+GRANT SELECT, INSERT, UPDATE, DELETE ON app.your_write_table TO pgb_applier;
+```
+
+> `deploy/sql/10_hardened_role.sql` is the **canonical hardening** a BYO user applies —
+> it no longer seeds any demo schema. The demo tables live in the fixture-only
+> `deploy/sql/20_demo_seed.sql` (CI/dev/test only; you do **not** apply it). Also set up
+> the `_meta` audit chain in your audit DB
+> ([`crates/audit/sql/10_audit_meta.sql`](../crates/audit/sql/10_audit_meta.sql)) and
+> restrict the agent role to the proxy host in `pg_hba.conf` (see [`deploy/hba/`](../deploy/hba/)).
+
+### 3. Verify with `pgb-cli doctor` (fail-closed preflight)
+
+Before you point an agent at the database, run the **fail-closed preflight**. The doctor
+connects with a **catalog-readable role** (set `PGB_BACKEND_ROLE` to it — e.g.
+`postgres`, an admin/monitoring role; it reads `pg_roles` + grant catalogs, which the
+member-of-nothing `pgb_agent` cannot) and verifies the primary (+ optional replica +
+`_meta`) are reachable, that `pgb_agent` is WALL-hardened, that `pgb_applier` is DML-only,
+the pg_hba origin boundary (best-effort), and the `_meta` audit chain:
+
+```sh
+PGB_POLICY_PATH=policy.yaml \
+PGB_BACKEND_ROLE=postgres \
+PGB_DOCTOR_PASSWORD=…       \
+  cargo run -p pgb-cli -- doctor
+```
+
+```text
+pgb-cli doctor — BYO preflight (SPEC §0.5):
+  [            PASS] primary_reachable: connected to the primary at db.internal:5432/app as `postgres`
+  [            PASS] pgb_agent_not_superuser: `pgb_agent` is NOSUPERUSER
+  [            PASS] agent_member_of_nothing: `pgb_agent` is a member of no roles
+  [            PASS] agent_no_write_grant: `pgb_agent` holds NO write grant on any user table
+  [            PASS] applier_no_ddl: `pgb_applier` has NO CREATE on the application schema (cannot DDL)
+  …
+doctor: PREFLIGHT PASSED — the deterministic floor is in place; safe to point an agent at this database.
+```
+
+It **exits non-zero on any failure** (a superuser agent, a missing role, a stray write
+grant, an unreachable target) — fail-closed: do not connect an agent until every check
+passes. (`PGB_BACKEND_ROLE` overrides only the role the doctor *connects* as; it always
+CHECKS `pgb_agent` / `pgb_applier` by their conventional names.)
+
+### 4. Launch the daemons against your DSNs
+
+Each daemon resolves its connection target from your `policy.yaml` (env override
+allowed); none of them defaults to a throwaway cluster. **The password comes from the
+conventional env var** (this version does **not** resolve `secret_ref` — see the note
+below): the proxy/applyd primary password from `PGB_BACKEND_PASSWORD`, the `_meta`
+password from `PGB_META_PASSWORD`, sourced from your secret store / env:
+
+```sh
+# the inline read enforcement endpoint (the agent's ONLY network path):
+PGB_POLICY_PATH=policy.yaml PGB_BACKEND_PASSWORD=… PGB_AGENT_PASSWORD=… \
+PGB_META_DSN='host=db.internal port=5432 dbname=app_meta user=pgb_audit_writer password=…' \
+PGB_AUDIT_SIGNING_KEY=… PGB_ANCHOR_PATH=/var/lib/pgb/anchor.worm \
+  cargo run -p pgb-proxy
+
+# the write-path daemon (owner-only Unix socket; the write credential lives here):
+PGB_POLICY_PATH=policy.yaml PGB_BACKEND_PASSWORD=… PGB_APPROVER_PUBKEY=… \
+PGB_META_DSN=… PGB_AUDIT_SIGNING_KEY=… PGB_ANCHOR_PATH=… PGB_APPLYD_SOCKET=/run/pgb/applyd.sock \
+  cargo run -p pgb-applyd
+
+# the out-of-band watchdog (kills runaway agent sessions; audits every action):
+PGB_POLICY_PATH=policy.yaml PGB_WARDEN_ADMIN_PASSWORD=… PGB_AUDIT_WRITER_PASSWORD=… \
+  cargo run -p pgb-warden
+```
+
+> **`secret_ref` is a forward-compatibility placeholder.** In this version the daemons
+> do **not** resolve `secret_ref` from any secret store — the password MUST come from the
+> conventional env var (`PGB_BACKEND_PASSWORD` for the primary/applyd, `PGB_META_PASSWORD`
+> for `_meta`, `PGB_DOCTOR_PASSWORD` for the doctor, etc.). `secret_ref` is parsed and
+> kept credential-less in `policy.yaml` so a future release can wire a resolver without a
+> schema change; today it is documentation only.
+
+> Production posture: enable **TLS** on the proxy (`PGB_PROXY_TLS_CERT` /
+> `PGB_PROXY_TLS_KEY`; required whenever TLS material is configured — no silent cleartext
+> downgrade) and source every secret from your secret store, not literals.
+
+### 5. Connect your agent (the `claude mcp add` form, against your DSNs)
+
+The agent-facing MCP server is the native Rust **`pgb-mcp`** (crate `crates/mcp`). Point
+it at the **proxy** (not the raw database) and the `_meta` reader:
+
+```sh
+claude mcp add pg-bumpers \
+  --env PGB_PROXY_HOST=127.0.0.1 \
+  --env PGB_PROXY_PORT=6432 \
+  --env PGB_PROXY_DB=app \
+  --env PGB_PROXY_USER=pgb_agent \
+  --env PGB_PROXY_PASSWORD=… \
+  --env PGB_PROXY_REQUIRE_TLS=true \
+  --env PGB_PROXY_TLS_CA=/etc/pgb/proxy-ca.pem \
+  --env PGB_APPLYD_SOCKET=/run/pgb/applyd.sock \
+  --env PGB_POLICY_PATH=policy.yaml \
+  --env PGB_META_PASSWORD=… \
+  -- /path/to/target/release/pgb-mcp
+```
+
+Claude Code now has the pg_bumpers tools, all flowing through the deterministic floor: a
+`DROP TABLE` is **refused**, a no-`WHERE` `DELETE` is **bounded + held for approval**,
+runaway reads are **killed**, and every action lands on the tamper-evident `_meta` chain
+you can `pgb-cli verify`.
+
+---
+
+# CI / dev / test fixtures (NOT the onboarding flow)
+
+> **Everything below this line is a throwaway fixture**, not how you onboard. The
+> `local-stack.sh` / `docker-compose.yml` / `up.sh` clusters and the env-gated
+> integration suites are the project's own deterministic CI/dev/test substrate — they
+> spin throwaway Postgres clusters on dedicated high ports (never `5432`). Real users
+> follow the **BYO** flow above; this section is for contributors and CI.
+
+---
+
+## Fixture prerequisites (contributors/CI)
 
 | Tool | Version | Notes |
 |------|---------|-------|
 | Rust | **1.90.0** | Pinned by [`rust-toolchain.toml`](../rust-toolchain.toml) (rustfmt + clippy). `rustup` auto-selects it. |
-| PostgreSQL | **14–18** | Client + server binaries (`initdb`, `pg_ctl`, `pg_basebackup`, `psql`, `pg_isready`). |
+| PostgreSQL | **14–18** | Client + server binaries (`initdb`, `pg_ctl`, `pg_basebackup`, `psql`, `pg_isready`) — to stand up the **throwaway** fixture clusters. |
 | `cargo-deny` | latest | License/advisory gate: `cargo install cargo-deny`. |
 
 ### Install PostgreSQL 14–18 (macOS, Homebrew)
@@ -67,7 +273,7 @@ brew install postgresql          # latest stable; or `postgresql@17`, `postgresq
 
 ---
 
-## 2. Clone + build
+## Fixture: clone + the fast DB-free build/test loop
 
 ```sh
 git clone https://github.com/NikolayS/pg_bumpers.git
@@ -89,13 +295,14 @@ the build is Rust-only).
 
 ---
 
-## 3. The local dev stack
+## Fixture: the local dev stack (`local-stack.sh`)
 
 `deploy/local-stack.sh` is the **live dev/CI substrate** here: isolated, throwaway PG
 clusters (any supported major, 14–18) under a git-ignored `./.localstack/`, built from
 the keg-only Homebrew binaries
-(no Docker). It models the same shape as the shipped compose: a streaming-replication
-**primary**, a streaming **replica**, and a separate append-only **`_meta`** audit DB.
+(no Docker). It models the same shape as the docker-compose fixture: a streaming-
+replication **primary**, a streaming **replica**, and a separate append-only **`_meta`**
+audit DB.
 
 ```sh
 deploy/local-stack.sh up      # initdb + start primary + meta; pg_basebackup + stream replica
@@ -136,7 +343,7 @@ $PGBIN/psql -X "host=localhost port=54323 user=postgres dbname=_meta"      # met
 
 ---
 
-## 4. Running the env-gated integration tests
+## Fixture: running the env-gated integration tests
 
 Integration tests are gated by **`PG_BUMPERS_IT`** so the default `cargo test` and CI
 stay fast and DB-free:
@@ -234,10 +441,13 @@ PG_BUMPERS_AUDIT_PGURL="host=127.0.0.1 port=54321 user=postgres dbname=postgres"
 
 ### 4d. The fidelity gate — `spikes/fidelity` (issue #8)
 
-The throwaway S0 spike that red-tests the two riskiest assumptions against real PG 18:
-clone↔prod PK-set prediction fidelity (any drift is caught by the `pgb_core` checksum)
-and typed-inverse restore (with the documented honest gaps: sequences / trigger
-side-effects / NOTIFY are *not* restored). It creates databases on an admin cluster;
+The throwaway S0 spike that red-tests the two riskiest assumptions against real PG:
+clone↔prod PK-set prediction fidelity (the dry-run blast-radius preview the apply then
+bounds with the `WriteCap` + `pg_stat_xact_*` reconciliation; the affected-PK-set
+checksum was dropped in EPIC #91, so identity is foreclosed by the self-determined-
+predicate gate, not a checksum) and typed-inverse restore (with the documented honest
+gaps: sequences / trigger side-effects / NOTIFY are *not* restored). It creates
+databases on an admin cluster;
 its default DSN is `127.0.0.1:55431`, so override it onto the local-stack primary:
 
 ```sh
@@ -251,14 +461,19 @@ PG_BUMPERS_PGURL="host=127.0.0.1 port=54321 user=postgres dbname=postgres" \
 
 ---
 
-## 5. The shipped artifact — docker-compose
+## The docker-compose fixture (CI/dev/test only — NOT how you onboard)
+
+> **This compose stack is a CI/dev/test fixture, not a shipped artifact for real users.**
+> A real user follows the **[BYO flow](#get-started--point-pg_bumpers-at-your-existing-postgresql-byo)**
+> against their own database; this throwaway stack just gives contributors and CI a
+> self-contained substrate to watch the floor work end-to-end.
 
 `deploy/docker-compose.yml` (image `postgres:${PG_MAJOR:-16}`, any supported major
-14–18) is the **shipped artifact** for real users and for CI on a docker-healthy
-machine: `primary` + `meta` always on, `replica`
+14–18) is the throwaway CI/dev/test compose: `primary` + `meta` always on, `replica`
 behind the `replica` profile, `dblab` behind the `dblab` profile (a documented
 placeholder; a real Database Lab Engine is OPTIONAL per §12). The
-hardened-role WALL SQL drops in via `deploy/init/` on first boot.
+hardened-role WALL SQL drops in via `deploy/init/` on first boot (the fixture also
+applies the demo seed `deploy/sql/20_demo_seed.sql`; a BYO deployment does not).
 
 > **Live container runs are blocked in this dev environment** — `docker pull` hangs at
 > zero blob bytes (host-level daemon networking fault; see the amendments log). Here the
@@ -299,7 +514,7 @@ mode), see [`deploy/README.md`](../deploy/README.md).
 
 ---
 
-## 6. Before you push
+## Before you push (contributors)
 
 Run the full CI loop green locally (mirrors `.github/workflows/ci.yml`):
 

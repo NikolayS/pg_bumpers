@@ -45,8 +45,19 @@
 //!     dial (optional; without it the write tools return a recoverable
 //!     `APPLYD_UNAVAILABLE` block). NEVER a TCP port.
 //!   - `PGB_APPLYD_TIMEOUT_MS` — per-call applyd round-trip timeout (default 30000).
+//!   - `PGB_POLICY_PATH`     — path to `policy.yaml` (optional). When set, its
+//!     `audit:` `target:` BYO `_meta` DSN target (SPEC §0.5) supplies the
+//!     `get_audit` reader location when `PGB_META_DSN` is unset (env override >
+//!     policy `audit.target` > optional). The mcp talks to the proxy (NOT the
+//!     primary DB directly), so the primary target is never used here.
 //!   - `PGB_META_DSN`        — the `_meta` reader DSN for `get_audit` (optional;
-//!     without it `get_audit` returns a recoverable `AUDIT_UNAVAILABLE` block).
+//!     **overrides** any `policy.yaml` `audit.target`). Without it AND without a
+//!     `policy.yaml` audit target, `get_audit` returns a recoverable
+//!     `AUDIT_UNAVAILABLE` block (the `_meta` reader is optional, not fail-closed).
+//!   - `PGB_META_PASSWORD`   — the password the credential-less `policy.yaml`
+//!     `audit.target` DSN connects with (the policy file never carries a literal
+//!     password). Only consulted when the `_meta` DSN is resolved from the policy
+//!     target rather than `PGB_META_DSN`.
 
 use std::process::ExitCode;
 
@@ -54,6 +65,7 @@ use pgb_mcp::{
     ApplydClient, ApplydConfig, AuditConfig, AuditReader, PgBumpersMcp, ProxyConfig,
     ProxyTransport, TlsMode,
 };
+use pgb_policy::PolicyConfig;
 use rmcp::{ServiceExt, transport::stdio};
 
 /// Read an env var, falling back to `default` when unset or empty.
@@ -74,6 +86,60 @@ fn env_bool(key: &str) -> Option<bool> {
             _ => None,
         },
         Err(_) => None,
+    }
+}
+
+/// Resolve the optional `_meta` reader DSN for `get_audit` (SPEC §0.5 BYO), with
+/// the precedence **`PGB_META_DSN` env override > `policy.yaml` `audit.target` >
+/// None**. The mcp talks to the proxy for reads/writes, so the only DB DSN it ever
+/// resolves directly is this `_meta` *reader* — and it stays **optional** (a
+/// missing `_meta` reader yields a recoverable `AUDIT_UNAVAILABLE` block, not a
+/// fail-closed startup error; the `_meta` chain's tamper-evidence is owned by the
+/// proxy/applyd writers, not this read-only viewer).
+///
+/// When resolved from the credential-less `policy.yaml` `audit.target`, the
+/// password is layered in from `PGB_META_PASSWORD` (the policy file never carries
+/// a literal password — SPEC §0.5 "no literal passwords in files"). If that
+/// password is absent the credential-less DSN is still returned (a local-trust /
+/// peer-auth `_meta` connects without one); the literal secret is never in policy.
+///
+/// `getenv` is taken as a closure (not a direct `std::env` read) so this is
+/// **pure + unit-testable** — the BYO-wiring test drives it with a BYO policy + a
+/// fake env and asserts the env override wins and that the policy target is used
+/// without any throwaway-cluster default.
+fn resolve_meta_dsn(
+    policy: Option<&PolicyConfig>,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    // 1. The explicit env DSN override wins (the existing ITs / up.sh path).
+    if let Some(dsn) = getenv("PGB_META_DSN").filter(|s| !s.is_empty()) {
+        return Some(dsn);
+    }
+    // 2. Else the BYO `policy.yaml` `audit.target` (credential-less) + the
+    //    out-of-band `PGB_META_PASSWORD`.
+    let target = policy?.audit.target.as_ref()?;
+    let base = target.to_credential_less_dsn();
+    match getenv("PGB_META_PASSWORD").filter(|s| !s.is_empty()) {
+        Some(pw) => Some(format!("{base} password={pw}")),
+        None => Some(base),
+    }
+}
+
+/// Load the optional `policy.yaml` named by `PGB_POLICY_PATH`. Absent ⇒ `Ok(None)`
+/// (the mcp's policy is optional — it only sources the `_meta` reader target from
+/// it). A present-but-unreadable / invalid policy is a hard error (fail-closed on a
+/// config the operator explicitly pointed at).
+fn load_policy() -> Result<Option<PolicyConfig>, String> {
+    match std::env::var("PGB_POLICY_PATH") {
+        Err(_) => Ok(None),
+        Ok(path) if path.is_empty() => Ok(None),
+        Ok(path) => {
+            let yaml = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read PGB_POLICY_PATH `{path}` (fail-closed): {e}"))?;
+            let cfg = PolicyConfig::load_from_yaml(&yaml)
+                .map_err(|e| format!("invalid policy.yaml `{path}` (fail-closed): {e}"))?;
+            Ok(Some(cfg))
+        }
     }
 }
 
@@ -120,6 +186,11 @@ fn build_server() -> Result<PgBumpersMcp, String> {
     let role = env_or("PGB_ROLE", "pgb_agent");
     let session_id = env_or("PGB_SESSION_ID", format!("mcp-{}", std::process::id()));
 
+    // Optional BYO `policy.yaml` (SPEC §0.5): the mcp sources its `_meta` reader
+    // target from it (env override). Absent ⇒ no policy; a present-but-invalid one
+    // is fail-closed.
+    let policy = load_policy()?;
+
     let proxy_cfg = ProxyConfig {
         host: env_or("PGB_PROXY_HOST", "127.0.0.1"),
         port: env_or("PGB_PROXY_PORT", "6432")
@@ -160,11 +231,12 @@ fn build_server() -> Result<PgBumpersMcp, String> {
         }));
     }
 
-    // `get_audit` reads the `_meta` audit tail through a reader DSN. Optional: if
-    // unset, `get_audit` returns a recoverable AUDIT_UNAVAILABLE block.
-    if let Ok(dsn) = std::env::var("PGB_META_DSN")
-        && !dsn.is_empty()
-    {
+    // `get_audit` reads the `_meta` audit tail through a reader DSN, resolved with
+    // the §0.5 BYO precedence: `PGB_META_DSN` env override > `policy.yaml`
+    // `audit.target` (credential-less + `PGB_META_PASSWORD`) > None. Optional: if
+    // neither source provides it, `get_audit` returns a recoverable
+    // AUDIT_UNAVAILABLE block (the `_meta` viewer is read-only; not fail-closed).
+    if let Some(dsn) = resolve_meta_dsn(policy.as_ref(), |k| std::env::var(k).ok()) {
         server = server.with_audit(AuditReader::new(AuditConfig { dsn }));
     }
     Ok(server)
@@ -201,4 +273,98 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A BYO `policy.yaml` carrying an `audit:` `target:` `_meta` DSN target
+    /// (credential-less; no literal password).
+    fn byo_policy_with_meta_target() -> PolicyConfig {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+audit:
+  target:
+    host: meta.db.internal
+    port: 5432
+    database: app_meta
+    role: pgb_audit_writer
+"#;
+        PolicyConfig::load_from_yaml(yaml).unwrap()
+    }
+
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// BYO-wiring (RED #2, mcp): with NO `PGB_META_DSN` env, the `_meta` reader DSN
+    /// resolves from the BYO `policy.yaml` `audit.target` — NOT any throwaway
+    /// (54321) default — layering in the out-of-band `PGB_META_PASSWORD`.
+    #[test]
+    fn resolves_meta_dsn_from_byo_policy_audit_target_not_54321() {
+        let policy = byo_policy_with_meta_target();
+        let dsn = resolve_meta_dsn(Some(&policy), fake_env(&[("PGB_META_PASSWORD", "metapw")]))
+            .expect("a policy audit target must resolve a _meta DSN");
+        assert!(dsn.contains("host=meta.db.internal"), "{dsn}");
+        assert!(dsn.contains("dbname=app_meta"), "{dsn}");
+        assert!(dsn.contains("user=pgb_audit_writer"), "{dsn}");
+        assert!(dsn.contains("password=metapw"), "{dsn}");
+        assert!(!dsn.contains("54321"), "no throwaway 54321 default: {dsn}");
+    }
+
+    /// The credential-less policy target resolves even without a password (a
+    /// local-trust `_meta`); the literal secret is never in the policy file.
+    #[test]
+    fn resolves_meta_dsn_from_policy_target_without_password() {
+        let policy = byo_policy_with_meta_target();
+        let dsn = resolve_meta_dsn(Some(&policy), fake_env(&[])).expect("resolves credential-less");
+        assert!(dsn.contains("host=meta.db.internal"), "{dsn}");
+        assert!(!dsn.contains("password="), "no literal password: {dsn}");
+    }
+
+    /// The explicit `PGB_META_DSN` env override wins over the policy target.
+    #[test]
+    fn meta_dsn_env_override_wins_over_policy_target() {
+        let policy = byo_policy_with_meta_target();
+        let dsn = resolve_meta_dsn(
+            Some(&policy),
+            fake_env(&[(
+                "PGB_META_DSN",
+                "host=override.host port=5999 dbname=ov user=r password=p",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            dsn,
+            "host=override.host port=5999 dbname=ov user=r password=p"
+        );
+    }
+
+    /// With NEITHER an env DSN NOR a policy audit target, the `_meta` reader is
+    /// simply absent (None) — the read-only viewer is OPTIONAL, so `get_audit`
+    /// returns a recoverable AUDIT_UNAVAILABLE rather than a fail-closed startup
+    /// error. (The `_meta` chain's tamper-evidence is owned by the writers.)
+    #[test]
+    fn meta_dsn_absent_when_no_env_and_no_policy_target() {
+        assert!(resolve_meta_dsn(None, fake_env(&[])).is_none());
+        // A policy with no audit target is also None.
+        let yaml = "version: 1\nroles:\n  app:\n    autonomy: L0\n    budget:\n      \
+                    max_bytes: 1\n      max_rows: 1\n      per_window: { window_secs: 1, \
+                    max_bytes: 1, max_rows: 1 }\n";
+        let policy = PolicyConfig::load_from_yaml(yaml).unwrap();
+        assert!(resolve_meta_dsn(Some(&policy), fake_env(&[])).is_none());
+    }
 }

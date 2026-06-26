@@ -197,6 +197,12 @@ jobs:
       - name: IT — native-role warden runaway-kill (warden_it)
         run: cargo test -p pgb-warden --test warden_it --locked -- --nocapture --test-threads=1
 
+      # The BYO preflight (issue #103): proves `pgb-cli doctor` exits 0 against a
+      # hardened cluster and FAIL-CLOSED (non-zero) against an un-hardened (SUPERUSER)
+      # agent role. Self-provisioning (initdb's its own throwaway cluster on :54363).
+      - name: IT — pgb-cli doctor BYO preflight (fail-closed vs hardened)
+        run: cargo test -p pgb-cli --test doctor_it --locked -- --nocapture --test-threads=1
+
       - name: IT — dbsafe-bench gate has teeth (gate_it, direct-to-DB WALL bypass)
         run: cargo test -p dbsafe-bench --test gate_it --locked -- --nocapture --test-threads=1
 

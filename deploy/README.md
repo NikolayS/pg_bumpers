@@ -1,22 +1,35 @@
-# `deploy/` — local dev/test stack & deployment assets
+# `deploy/` — CI/dev/test fixtures & the canonical deployment assets
 
-> **One command to a connected demo:** `deploy/up.sh` launches the FULL assembled
-> stack — `pgb-proxy` (the agent read endpoint, in front of Postgres), `pgb-applyd`
-> (the write-path socket), and `pgb-warden` (the live watchdog) — and prints a
-> ready-to-paste `claude mcp add` line. Connect a real Claude Code, then watch a
-> `DROP TABLE` get REFUSED, a no-`WHERE` `UPDATE` get bounded + approval-gated, and
-> the audit chain verify. Tear it all down with `deploy/down.sh`. See
-> [Path C](#path-c--upsh--the-one-command-runnable-demo) below. The MCP read path
-> genuinely traverses `pgb-proxy` (extended-protocol-only, WALL-enforced) — not raw
-> Postgres.
+> **These are CI/dev/test FIXTURES, not the onboarding flow (SPEC §0.5).** The
+> first-run path for real users is **bring-your-own Postgres** — point pg_bumpers at
+> your existing database via `policy.yaml` DSN targets, apply
+> [`sql/10_hardened_role.sql`](sql/10_hardened_role.sql), verify with `pgb-cli
+> doctor`, and launch the daemons against your DSNs (see the **README's BYO
+> quickstart**). Everything below — `docker-compose.yml`, `local-stack.sh`, `up.sh` —
+> is a **throwaway** substrate for our own integration tests and the benchmark. It is
+> NOT a "shipped artifact for real users"; it never replaces your own database.
 
-The dev/test substrate for pg_bumpers (SPEC §3, §7, §12). There are **three paths**:
+> **One command to a connected demo (fixture):** `deploy/up.sh` launches the FULL
+> assembled stack — `pgb-proxy` (the agent read endpoint, in front of Postgres),
+> `pgb-applyd` (the write-path socket), and `pgb-warden` (the live watchdog) — against
+> a *throwaway* cluster and prints a ready-to-paste `claude mcp add` line. Connect a
+> real Claude Code, then watch a `DROP TABLE` get REFUSED, a no-`WHERE` `UPDATE` get
+> bounded + approval-gated, and the audit chain verify. Tear it all down with
+> `deploy/down.sh`. See [Path C](#path-c--upsh--the-one-command-runnable-demo). The
+> MCP read path genuinely traverses `pgb-proxy` (extended-protocol-only,
+> WALL-enforced) — not raw Postgres.
 
-1. **`docker-compose.yml`** — the **shipped artifact** for real users (and CI on a
-   docker-healthy machine). Postgres **18**, primary + optional replica + `_meta`
-   audit DB + a DBLab placeholder, behind compose **profiles**.
-2. **`local-stack.sh`** — the **live dev/CI substrate used here**. It builds the same
-   topology out of local Postgres 18 clusters (`initdb` / `pg_basebackup` / `pg_ctl`),
+The CI/dev/test substrate for pg_bumpers (SPEC §3, §7, §12) — **three fixture
+paths**, all throwaway, none of them the user onboarding flow (that is BYO, above):
+
+1. **`docker-compose.yml`** — the **CI/dev fixture** for a docker-healthy machine (a
+   reproducible throwaway, NOT a shipped artifact for real users — real users BYO
+   their own database, SPEC §0.5). Postgres (any supported major 14–18), primary +
+   optional replica + `_meta` audit DB + a DBLab placeholder, behind compose
+   **profiles**. Its init mounts `init/10_hardened_role.sql` (the canonical hardening)
+   **and** `init/20_demo_seed.sql` (the FIXTURE-ONLY demo schema).
+2. **`local-stack.sh`** — the **live dev/CI fixture used here**. It builds the same
+   topology out of local Postgres clusters (`initdb` / `pg_basebackup` / `pg_ctl`),
    no Docker. This exists because `docker pull` is non-functional in the build
    environment (host-level daemon networking fault). See
    [`docs/spec/SPEC.amendments.md`](../docs/spec/SPEC.amendments.md) → *"S0 integration
@@ -27,9 +40,16 @@ streaming **replica** (off by default → proves the bare-primary baseline, SPEC
 and a separate append-only **`_meta`** audit DB (SPEC §4). (Path C — the one-command
 `up.sh` demo — co-locates the `_meta` chain on the **primary** instead; see below.)
 
+The **canonical, version-agnostic** role hardening a BYO user applies to their OWN
+database is [`sql/10_hardened_role.sql`](sql/10_hardened_role.sql) — it hardens
+`pgb_agent` + `pgb_applier` and grants **nothing** application-specific (the user
+grants their own relations). The demo schema (`allowed_read` / `secret_data`) is
+split out into the fixture-only [`sql/20_demo_seed.sql`](sql/20_demo_seed.sql), which
+ONLY the fixtures (`up.sh`, docker-compose, `wall_matrix.sh`) apply.
+
 ---
 
-## Path A — docker-compose (shipped artifact, for users)
+## Path A — docker-compose (CI/dev fixture; throwaway, NOT a user artifact)
 
 Image: `postgres:${PG_MAJOR:-16}` (any supported major 14–18; override with
 `PG_MAJOR`). Services: `primary` + `meta` (always on), `replica` (profile
@@ -148,10 +168,14 @@ ports are actually free**, then fails loudly if any are still bound:
 
 ---
 
-## Path C — `up.sh` — the one-command runnable demo
+## Path C — `up.sh` — the one-command runnable demo (CI/dev/test fixture)
+
+> **A throwaway demo fixture, not the onboarding flow.** Real users BYO their own
+> database (README quickstart); `up.sh` spins a *throwaway* cluster so you can watch
+> the floor work without a database of your own.
 
 `deploy/up.sh` is the launcher that makes pg_bumpers **actually connectable to a real
-Claude Code**. It:
+Claude Code** against a throwaway cluster. It:
 
 1. builds the binaries + the MCP shell (skip with `--no-build`);
 2. brings up the hardened throwaway Postgres via `local-stack.sh up` (primary `54321`,
@@ -267,12 +291,13 @@ proxy** — and refuses any agent connection that doesn't originate from the pro
 
 | Artifact | What it is |
 |----------|------------|
-| `sql/10_hardened_role.sql` | **Canonical, idempotent** hardened-role migration: creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles + PUBLIC EXECUTE, **revokes TEMP on the database + the in-DB large-object write built-ins** (so there is **no write grant ANYWHERE**), sets a **best-effort** role-level `search_path` pin (see note below), grants **SELECT-whitelist only**, default-deny everywhere. It also creates the **constrained, DML-only applier role `pgb_applier`** (S5 #77 — the role `pgb-applyd` connects as): LOGIN, NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on `public`, owns nothing → **cannot DDL**; granted **SELECT/INSERT/UPDATE/DELETE on the application table(s) only** (defense-in-depth under the §4 application-layer apply floor — running applyd as the superuser is discouraged). |
-| `init/10_hardened_role.sql` | Byte-for-byte **synced copy** of the canonical SQL, picked up by the docker entrypoint (`/docker-entrypoint-initdb.d`, runs after `00_README.sql`). `sql/check-init-sync.sh` guards against drift. |
+| `sql/10_hardened_role.sql` | **Canonical, version-agnostic, BYO-applicable** hardened-role migration (a real deployment applies THIS to its own database): creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles + PUBLIC EXECUTE, **revokes TEMP on the database + the in-DB large-object write built-ins** (so there is **no write grant ANYWHERE**), sets a **best-effort** role-level `search_path` pin (see note below), and is **default-deny on ALL data** until the user grants their own allow-listed relations. It also creates the **constrained, DML-only applier role `pgb_applier`** (S5 #77 — the role `pgb-applyd` connects as): LOGIN, NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on `public`, owns nothing → **cannot DDL**. Issue #103 split the demo seed OUT of this file — it now grants **nothing** application-specific. |
+| `sql/20_demo_seed.sql` | **FIXTURE-ONLY** demo seed (CI/dev/test ONLY — a real BYO deployment does NOT apply it): the `allowed_read` / `secret_data` demo tables + the matching `pgb_agent` SELECT / `pgb_applier` DML grants, so the role-hardening matrix has a positive (granted) + negative (denied) read pair to assert against. Requires `10_hardened_role.sql` to have run first (it needs the roles). |
+| `init/10_hardened_role.sql` · `init/20_demo_seed.sql` | Byte-for-byte **synced copies** of the two canonical SQL files, picked up by the docker entrypoint (`/docker-entrypoint-initdb.d`, alphabetical: `00_README.sql` → `10_` → `20_`). `sql/check-init-sync.sh` guards both against drift. |
 | `hba/pg_hba.agent-boundary.conf.template` | **Layer 0** `pg_hba` rules: agent role permitted **only from the proxy host's CIDR**; every other origin `reject`ed. |
 | `hba/render-hba.sh` | Generator that substitutes the template's placeholders (`--proxy-cidr 10.0.0.5/32 …`). Append its output to `$PGDATA/pg_hba.conf` **above** any catch-all. |
 | `hba/NETWORK-POLICY.md` | The network-policy companion (firewall / security-group / k8s NetworkPolicy half of the boundary) + how the local test models "proxy host vs. elsewhere". |
-| `test/wall_matrix.sh` | The **role-hardening test matrix** (env-gated `PG_BUMPERS_IT=1`): spins a dedicated throwaway PG cluster (any supported major, 14-18) on **54331**, applies the SQL + the boundary `pg_hba`, then asserts **one row per matrix item** by *attempting* each denied action as the agent and proving it fails (+ whitelisted SELECT succeeds, member-of-nothing, boundary refused/allowed). |
+| `test/wall_matrix.sh` | The **role-hardening test matrix** (env-gated `PG_BUMPERS_IT=1`): spins a dedicated throwaway PG cluster (any supported major, 14-18) on **54331**, applies `10_hardened_role.sql` **+ the fixture `20_demo_seed.sql`** + the boundary `pg_hba`, then asserts **one row per matrix item** by *attempting* each denied action as the agent and proving it fails (+ whitelisted SELECT succeeds, member-of-nothing, boundary refused/allowed). |
 
 Wired in: `local-stack.sh` applies `sql/10_hardened_role.sql` against the primary on every
 `up` (idempotent); the docker compose picks up `init/10_hardened_role.sql` on first boot.

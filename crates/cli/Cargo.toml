@@ -38,11 +38,20 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # replacement for the removed `node -e` keypair generation in deploy/up.sh. Same
 # crate/version applyd uses to DECODE PGB_APPROVER_PUBKEY (keeps the tree single-version).
 hex = "0.4"
+# `pgb-cli doctor` (issue #103) opens REAL connections to the BYO primary / replica /
+# `_meta` to verify reachability + WALL hardening + the applier DML-only surface + the
+# pg_hba boundary. The synchronous `postgres` client (same crate/version the audit `_meta`
+# sink + the cross-component IT use — keeps the tree single-version).
+postgres = "0.19"
 
 [dev-dependencies]
 # The S5 cross-component IT (issue #64) drives a REAL proxy reject (via the proxy
 # `Recorder`) and a CLI approve onto ONE shared `_meta` chain, then anchors +
 # verifies it. The proxy is a dev-dependency only (no cycle: proxy never depends
-# on cli). `postgres` sets up the throwaway `_meta` fixture (env-gated PG18).
+# on cli). (`postgres` is a MAIN dependency above — `pgb-cli doctor` connects to a
+# real DB — so the ITs reuse it without re-listing it here.)
 pgb-proxy = { path = "../proxy" }
-postgres = "0.19"
+# The env-gated `doctor_it` (issue #103) stands up a throwaway PG cluster (any
+# supported major 14-18) via the ONE shared PG-bin resolver, applies the hardened
+# role SQL, and runs the `pgb-cli doctor` binary against hardened vs un-hardened.
+pgb-test-support = { path = "../test-support" }

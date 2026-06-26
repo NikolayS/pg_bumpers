@@ -20,9 +20,11 @@ use pgb_policy::RoleBudget;
 /// the hardened WALL role.
 #[derive(Debug, Clone)]
 pub struct BackendTarget {
-    /// Backend host (e.g. `127.0.0.1`).
+    /// Backend host — the BYO primary (SPEC §0.5). Resolved env override >
+    /// `policy.yaml` `primary:` target > fail-closed; no throwaway-cluster default.
     pub host: String,
-    /// Backend port (the local-stack primary is 54321; **never** 5432).
+    /// Backend port — the BYO primary port. **Never** 5432 unless that is the
+    /// user's own database; there is no hardcoded `54321` default.
     pub port: u16,
     /// Database name to connect to.
     pub database: String,

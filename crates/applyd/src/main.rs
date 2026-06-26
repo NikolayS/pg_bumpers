@@ -16,12 +16,16 @@
 //! - `PGB_APPROVER_PUBKEY` — the approver's Ed25519 verifying key, hex (32 bytes).
 //!   The apply-time trust root the §4 floor verifies grants against. **Required.**
 //! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` /
-//!   `PGB_BACKEND_ROLE` / `PGB_BACKEND_PASSWORD` — the PRIMARY the resident apply
-//!   `Client` connects to (defaults `127.0.0.1` / `54321` / `postgres` /
-//!   `pgb_applier`; **never 5432**). `PGB_BACKEND_ROLE` defaults to the constrained,
-//!   DML-ONLY applier role `pgb_applier` (S5 #77) — NOT the read-only WALL role
-//!   `pgb_agent`, and NOT the superuser. It is defense-in-depth at the DB level under
-//!   the application-layer §4 apply floor; running applyd as superuser is discouraged.
+//!   `PGB_BACKEND_ROLE` / `PGB_BACKEND_PASSWORD` — the BYO PRIMARY (SPEC §0.5) the
+//!   resident apply `Client` connects to. host/port/db/role are **overrides** over
+//!   the `policy.yaml` `primary:` target; precedence is **env override >
+//!   policy.yaml `primary:` target > FAIL-CLOSED** (no throwaway-cluster default —
+//!   no silent `54321`; **never 5432** unless that is the user's own database).
+//!   `PGB_BACKEND_ROLE` falls back to the policy target's role, then the
+//!   constrained, DML-ONLY applier role `pgb_applier` (S5 #77) — NOT the read-only
+//!   WALL role `pgb_agent`, and NOT the superuser. It is defense-in-depth at the DB
+//!   level under the application-layer §4 apply floor; running applyd as superuser
+//!   is discouraged. The password is the only required secret (no literal default).
 //! - `PGB_META_DSN` / `PGB_AUDIT_SIGNING_KEY` / `PGB_ANCHOR_PATH` /
 //!   `PGB_ANCHOR_INTERVAL_MS` — the shared `_meta` audit chain (same as the proxy).
 //!
@@ -58,6 +62,35 @@ type Svc = Service<RecordingWebhookSender, InMemoryNonceStore, InMemoryNonceStor
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Resolve applyd's BYO **primary** target (SPEC §0.5) from the loaded `policy.yaml`
+/// plus an environment reader, with the precedence: an **env override** wins, else
+/// the `policy.yaml` `primary:` target, else **FAIL-CLOSED**. The applier connects
+/// as the constrained, DML-only `pgb_applier` role by default (S5 #77). There is NO
+/// throwaway-cluster default — applyd with no resolvable host/port refuses to start
+/// (no silent `54321`).
+///
+/// `getenv` is a closure (not a direct `std::env` read) so this is **pure and
+/// unit-testable** — the component-wiring test drives it with a BYO policy + a fake
+/// env and asserts it never falls back to `54321`.
+fn resolve_backend_target(
+    policy: &PolicyConfig,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<pgb_policy::ResolvedTarget, pgb_policy::TargetResolutionError> {
+    pgb_policy::TargetResolver {
+        policy_target: policy.primary.as_ref(),
+        host_override: getenv("PGB_BACKEND_HOST"),
+        port_override: getenv("PGB_BACKEND_PORT"),
+        db_override: getenv("PGB_BACKEND_DB"),
+        role_override: getenv("PGB_BACKEND_ROLE"),
+        default_database: "postgres",
+        default_role: "pgb_applier",
+        host_env_key: "PGB_BACKEND_HOST",
+        port_env_key: "PGB_BACKEND_PORT",
+        policy_hint: "policy.yaml `primary:` (the BYO primary target, SPEC §0.5)",
+    }
+    .resolve()
 }
 
 /// A required secret/config with no default literal (fail-closed).
@@ -132,12 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CANNOT DDL (NOSUPERUSER, no CREATE on the schema, owns no objects), so a bug in the
     // apply path cannot do arbitrary DDL. (Running applyd as the Postgres SUPERUSER — the
     // pre-#77 workaround for `pgb_agent` being read-only — is what this default avoids.)
+    // BYO primary target (SPEC §0.5): env override > policy.yaml `primary:` target >
+    // FAIL-CLOSED. The applier role default is `pgb_applier` (S5 #77). No
+    // throwaway-cluster default — no silent `54321`.
+    let backend_target = resolve_backend_target(&policy, |k| std::env::var(k).ok())?;
     let backend_dsn = format!(
-        "host={} port={} dbname={} user={} password={}",
-        env_or("PGB_BACKEND_HOST", "127.0.0.1"),
-        env_or("PGB_BACKEND_PORT", "54321"),
-        env_or("PGB_BACKEND_DB", "postgres"),
-        env_or("PGB_BACKEND_ROLE", "pgb_applier"),
+        "{} password={}",
+        backend_target.to_credential_less_dsn(),
         env_secret("PGB_BACKEND_PASSWORD")?,
     );
     let apply_client = Client::connect(&backend_dsn, NoTls)
@@ -437,4 +471,121 @@ fn parse_signing_key(hex_str: &str) -> Result<ed25519_dalek::SigningKey, String>
         .try_into()
         .map_err(|_| "signing key must be 32 bytes (64 hex chars)".to_string())?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid `policy.yaml` carrying a BYO `primary:` target.
+    fn byo_policy() -> PolicyConfig {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+primary:
+  host: byo.db.internal
+  port: 6543
+  database: appdb
+  role: pgb_agent
+"#;
+        PolicyConfig::load_from_yaml(yaml).unwrap()
+    }
+
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// HEADLINE (RED #2, applyd): with NO env override, the applier resolves its
+    /// backend target from the BYO `policy.yaml` `primary:` target — NOT the
+    /// removed `54321` default. The connect ROLE defaults to the constrained,
+    /// DML-only `pgb_applier` when neither env nor policy names one, but here the
+    /// policy target names `pgb_agent` for the host/port/db; applyd then connects
+    /// as the policy target's role (the operator points applyd at the applier role).
+    #[test]
+    fn resolves_backend_from_byo_policy_target_not_54321() {
+        let policy = byo_policy();
+        let target = resolve_backend_target(&policy, fake_env(&[])).unwrap();
+        assert_eq!(target.host, "byo.db.internal");
+        assert_eq!(target.port, 6543);
+        assert_eq!(target.database, "appdb");
+        assert_ne!(
+            target.port, 54321,
+            "must NOT fall back to the throwaway 54321"
+        );
+        // The credential-less DSN carries no literal password.
+        let dsn = target.to_credential_less_dsn();
+        assert!(!dsn.contains("password"), "{dsn}");
+    }
+
+    /// The applier role default is `pgb_applier` when neither env nor a policy
+    /// target names a role (S5 #77 — the constrained DML-only write role).
+    #[test]
+    fn applier_role_defaults_to_pgb_applier_when_unnamed() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let policy = PolicyConfig::load_from_yaml(yaml).unwrap();
+        let target = resolve_backend_target(
+            &policy,
+            fake_env(&[("PGB_BACKEND_HOST", "h"), ("PGB_BACKEND_PORT", "6000")]),
+        )
+        .unwrap();
+        assert_eq!(target.role, "pgb_applier");
+    }
+
+    /// The env override wins over the policy target (the existing ITs / up.sh path).
+    #[test]
+    fn env_override_wins_over_policy_target() {
+        let policy = byo_policy();
+        let target = resolve_backend_target(
+            &policy,
+            fake_env(&[
+                ("PGB_BACKEND_HOST", "127.0.0.1"),
+                ("PGB_BACKEND_PORT", "54399"),
+                ("PGB_BACKEND_ROLE", "pgb_applier"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, 54399);
+        assert_eq!(target.role, "pgb_applier");
+    }
+
+    /// FAIL-CLOSED: with NO policy primary target AND no env override, resolution
+    /// errors — applyd refuses to start rather than silently default to 54321.
+    #[test]
+    fn fails_closed_with_no_policy_target_and_no_env() {
+        let yaml = r#"
+version: 1
+roles:
+  app:
+    autonomy: L1
+    budget:
+      max_bytes: 1000
+      max_rows: 100
+      per_window: { window_secs: 60, max_bytes: 10000, max_rows: 1000 }
+"#;
+        let policy = PolicyConfig::load_from_yaml(yaml).unwrap();
+        let err = resolve_backend_target(&policy, fake_env(&[])).unwrap_err();
+        assert_eq!(err.field(), "host");
+        assert!(!err.to_string().contains("54321"));
+    }
 }

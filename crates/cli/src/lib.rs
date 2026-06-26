@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod doctor;
 pub mod flow;
 pub mod principal;
 pub mod refuse;
@@ -36,6 +37,7 @@ pub mod request;
 pub mod verify;
 pub mod webhook;
 
+pub use doctor::{CheckResult, CheckStatus, DoctorReport, HbaRule, RoleAttrs};
 pub use flow::{ApprovalFlow, ApprovalOutcome, ApproveError, ElevationError, ElevationOutcome};
 pub use principal::{ApprovalAuthority, AuthorityError, Principal, PrincipalKind};
 pub use refuse::{ElevationEligibility, REFUSED_CODE, gate_for_elevation};

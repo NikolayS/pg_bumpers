@@ -16,7 +16,7 @@
 //! the `_meta` audit append are proven against real PG18 in the env-gated
 //! integration test (`tests/warden_it.rs`). The config assembly + DSN building +
 //! fail-closed policy load are unit-tested in the library
-//! ([`WardenSettings::from_env`](pgb_warden::WardenSettings),
+//! ([`WardenSettings::resolve`](pgb_warden::WardenSettings),
 //! [`load_thresholds_fail_closed`](pgb_warden::load_thresholds_fail_closed)).
 //! This `main()` is the thin shell that opens the live connections and drives
 //! the loop.
@@ -24,9 +24,15 @@
 //! ## Configuration (12-factor; fail-closed)
 //! - `PGB_POLICY_PATH` — path to `policy.yaml` (the `warden:` section is parsed +
 //!   validated; a **present-but-invalid** section makes the binary refuse to
-//!   start with a non-zero exit — fail-closed, SPEC §4). **Required.**
-//! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` — the PG18 primary
-//!   to watch (defaults `127.0.0.1` / `54321` / `postgres` — **never** 5432).
+//!   start with a non-zero exit — fail-closed, SPEC §4). The same document's
+//!   `primary:` BYO target (SPEC §0.5) supplies the watched host/port/db when the
+//!   `PGB_BACKEND_*` env overrides are unset. **Required.**
+//! - `PGB_BACKEND_HOST` / `PGB_BACKEND_PORT` / `PGB_BACKEND_DB` — the BYO primary
+//!   (SPEC §0.5) to watch. **Overrides** over the `policy.yaml` `primary:` target;
+//!   precedence is **env override > policy.yaml `primary:` target > FAIL-CLOSED**.
+//!   There is **no** throwaway-cluster default — with neither source the warden
+//!   refuses to start (no silent `54321`). **Never** 5432 unless that is the
+//!   user's own database.
 //! - `PGB_WARDEN_ADMIN_ROLE` / `PGB_WARDEN_ADMIN_PASSWORD` — the admin role the
 //!   warden polls + terminates as (password **required**, no literal default).
 //! - `PGB_AUDIT_DB` — the `_meta` database holding the audit chain
@@ -49,6 +55,8 @@ use pgb_audit::pg::PgSink;
 #[cfg(feature = "pg")]
 use pgb_core::{Clock, SystemClock};
 #[cfg(feature = "pg")]
+use pgb_policy::PolicyConfig;
+#[cfg(feature = "pg")]
 use pgb_warden::{
     PgActivitySource, PgKiller, WardenLoop, WardenSettings, load_thresholds_fail_closed, run_loop,
 };
@@ -64,9 +72,20 @@ fn run() -> Result<(), String> {
     })?;
     let thresholds = load_thresholds_fail_closed(&policy_path)?;
 
-    // 2. Resolve connection settings from the environment (defaults + the two
-    //    required secrets), then open the live admin + writer connections.
-    let settings = WardenSettings::from_env(|k| std::env::var(k).ok())?;
+    // The same policy.yaml carries the BYO `primary:` target (SPEC §0.5): the
+    // watched host/port/db when the `PGB_BACKEND_*` env overrides are unset. Load
+    // the full PolicyConfig (fail-closed) so the warden watches the user's DB, not
+    // a throwaway-cluster default.
+    let policy = PolicyConfig::load_from_yaml(
+        &std::fs::read_to_string(&policy_path)
+            .map_err(|e| format!("cannot read policy.yaml `{policy_path}` (fail-closed): {e}"))?,
+    )
+    .map_err(|e| format!("invalid policy.yaml `{policy_path}` (fail-closed): {e}"))?;
+
+    // 2. Resolve connection settings: env override > policy.yaml `primary:` target >
+    //    FAIL-CLOSED (no throwaway-cluster `54321` default), plus the two required
+    //    secrets. Then open the live admin + writer connections.
+    let settings = WardenSettings::resolve(policy.primary.as_ref(), |k| std::env::var(k).ok())?;
     let source = PgActivitySource::connect(&settings.observe_dsn())?;
     let killer = PgKiller::connect(&settings.observe_dsn())?;
 

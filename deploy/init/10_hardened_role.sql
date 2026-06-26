@@ -13,6 +13,17 @@
 -- It is fully IDEMPOTENT: safe to run repeatedly (the dev substrate sources it on every
 -- `up`). Re-running re-asserts the hardened state (defends against config drift).
 --
+-- BRING-YOUR-OWN POSTGRES (SPEC §0.5): this file is the CANONICAL, version-agnostic role
+-- HARDENING ONLY — it creates + hardens `pgb_agent` (read WALL) and `pgb_applier` (DML-
+-- only apply role) and revokes every default/inherited privilege, but it NO LONGER seeds
+-- any demo schema or grants any application tables. A BYO user applies THIS file against
+-- their existing database (PG 14-18), then grants the agent/applier ONLY their own
+-- allow-listed relations (the §6 GRANT pattern, see below). The dev/test/CI fixtures (the
+-- one-command `up.sh`, the docker-compose stack, `wall_matrix.sh`) additionally apply the
+-- companion FIXTURE-ONLY seed `deploy/sql/20_demo_seed.sql` (the `allowed_read` /
+-- `secret_data` demo tables + their grants) so the matrix has a positive+negative read
+-- pair to assert against. A real deployment does NOT apply `20_demo_seed.sql`.
+--
 -- The role is the fixed name `pgb_agent` and is scoped to the connected database (the
 -- dev substrate applies it against `postgres`). To re-target, change the name here OR run
 -- this file against the intended database; identifiers are kept as plain literals (not
@@ -346,75 +357,50 @@ RESET client_min_messages;
 COMMIT;
 
 -- =====================================================================================
--- 6. The SELECT-WHITELIST (explicit grants only; default-deny everywhere else).
---    This is the ONLY positive grant surface. A demo schema + two tables model the
---    whitelist: public.allowed_read is granted SELECT; public.secret_data is NOT (so a
---    raw agent SELECT on it must fail — the matrix's positive+negative read pair).
---    Real deployments replace these with their own allow-listed relations/columns.
+-- 6. The SELECT-WHITELIST — APPLIED BY THE USER, NOT BY THIS CANONICAL FILE (SPEC §0.5).
+--    This file no longer seeds any demo schema or grants any application table: the WALL
+--    above is default-deny on ALL data, so the ONLY way back in is an EXPLICIT grant the
+--    user makes for THEIR OWN allow-listed relations. A BYO user runs, against their DB,
+--    something like the pattern below (substituting their real schema-qualified tables):
+--
+--        -- the agent's READ whitelist (SELECT only; never INSERT/UPDATE/DELETE):
+--        GRANT SELECT ON <schema>.<your_read_table> TO pgb_agent;
+--        -- the applier's WRITE surface (DML only; never DDL; owner stays unchanged):
+--        GRANT SELECT, INSERT, UPDATE, DELETE ON <schema>.<your_write_table> TO pgb_applier;
+--
+--    Keep it minimal: grant the agent SELECT on exactly the relations it must read, and
+--    the applier DML on exactly the relations a bounded-reversible apply may touch. Do NOT
+--    transfer ownership (so neither role can ALTER/DROP). Everything else stays default-
+--    deny. Run `pgb-cli doctor` afterwards to verify the WALL + grants fail-closed.
+--
+--    The dev/test/CI FIXTURES apply the companion `deploy/sql/20_demo_seed.sql` (the
+--    `allowed_read` / `secret_data` demo tables + the matching grants) so the role-
+--    hardening matrix (`deploy/test/wall_matrix.sh`) has a positive (granted) + negative
+--    (denied) read pair to assert against. A real deployment does NOT apply that seed.
 -- =====================================================================================
-BEGIN;
-
-CREATE TABLE IF NOT EXISTS public.allowed_read (
-    id    integer PRIMARY KEY,
-    label text NOT NULL
-);
-INSERT INTO public.allowed_read (id, label) VALUES
-    (1, 'whitelisted row one'),
-    (2, 'whitelisted row two')
-ON CONFLICT (id) DO NOTHING;
-
--- A NON-whitelisted table: the agent must NOT be able to SELECT this (default-deny).
-CREATE TABLE IF NOT EXISTS public.secret_data (
-    id     integer PRIMARY KEY,
-    secret text NOT NULL
-);
-INSERT INTO public.secret_data (id, secret) VALUES
-    (1, 'TOP SECRET — must never reach the agent role')
-ON CONFLICT (id) DO NOTHING;
-
--- THE WHITELIST: explicit SELECT on the one allowed relation. No INSERT/UPDATE/DELETE
--- anywhere (no write grant). secret_data is intentionally NOT granted.
-GRANT SELECT ON public.allowed_read TO pgb_agent;
-
--- Re-assert default-deny on the secret table for the agent (no-op if never granted;
--- defends against drift where a prior run / operator granted it).
-REVOKE ALL ON public.secret_data FROM pgb_agent;
-
--- THE APPLIER'S DML SURFACE (S5 #77): the constrained write role gets SELECT/INSERT/
--- UPDATE/DELETE on the application table(s) the bounded-reversible apply may touch — and
--- NOTHING that lets it DDL. (The apply needs SELECT for the FOR-UPDATE pre-image capture,
--- INSERT/UPDATE/DELETE for the forward op + the typed-inverse revert.) Real deployments
--- replace `public.allowed_read` with their own writable application relations and grant
--- the applier DML on exactly those. NO ownership is transferred (owner = postgres), so
--- the applier still cannot ALTER/DROP these tables — only mutate their ROWS.
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.allowed_read TO pgb_applier;
--- The applier must NOT read/write the secret (default-deny; drift defense).
-REVOKE ALL ON public.secret_data FROM pgb_applier;
-
-COMMIT;
 
 -- =====================================================================================
 -- Done. The agent role is now: LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing,
 -- NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, PUBLIC EXECUTE revoked, NO write grant
 -- ANYWHERE (incl. TEMP on the database + the in-DB large-object write built-ins, both
--- revoked from PUBLIC above), SELECT only on the explicit whitelist, default-deny
--- everywhere else. dblink/fdw/COPY-PROGRAM/lo_import/lo_export/pg_read_file denied
--- structurally (superuser/predefined-role gated).
+-- revoked from PUBLIC above), default-deny on ALL data until the user grants their own
+-- allow-listed relations (§6 above). dblink/fdw/COPY-PROGRAM/lo_import/lo_export/
+-- pg_read_file denied structurally (superuser/predefined-role gated).
 --
 -- search_path: the role-level pin above is BEST-EFFORT defense-in-depth ONLY — a
 -- non-superuser CAN change its own role GUCs, so the agent can mutate/RESET its path.
 -- The AUTHORITATIVE pin is the PROXY (S1). The WALL's guarantee does NOT rely on
 -- search_path: with explicit fully-qualified SELECT grants as the only read surface and
 -- no CREATE/no write anywhere, no search_path the agent chooses can widen access or plant
--- a trojan. deploy/test/wall_matrix.sh asserts every deny by attempting it as the agent,
--- AND asserts the search_path invariant (agent mutates path + RESET ALL → STILL cannot
--- read non-whitelisted data or write anywhere).
+-- a trojan. deploy/test/wall_matrix.sh (which applies 20_demo_seed.sql for its fixtures)
+-- asserts every deny by attempting it as the agent, AND asserts the search_path invariant
+-- (agent mutates path + RESET ALL → STILL cannot read non-whitelisted data or write).
 --
 -- pgb_applier (S5 #77): the constrained write-path role applyd connects as. LOGIN,
 -- NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on public, owns
 -- no objects -> it CANNOT DDL (no CREATE/ALTER/DROP). It is granted DML ONLY (SELECT/
--- INSERT/UPDATE/DELETE) on the application table(s) above -- the defense-in-depth floor
--- under the §4 application-layer apply guards (which remain the primary control). The
--- applyd IT proves both halves: a guarded write COMMITS as pgb_applier AND a DDL attempt
--- as pgb_applier is rejected with `permission denied`.
+-- INSERT/UPDATE/DELETE) on the application table(s) the USER grants it -- the defense-in-
+-- depth floor under the §4 application-layer apply guards (which remain the primary
+-- control). The applyd IT proves both halves: a guarded write COMMITS as pgb_applier AND
+-- a DDL attempt as pgb_applier is rejected with `permission denied`.
 -- =====================================================================================

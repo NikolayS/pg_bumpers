@@ -77,6 +77,8 @@ fn policy() -> pgb_policy::PolicyConfig {
     PolicyConfig {
         version: 1,
         roles,
+        // No BYO primary target in this service unit fixture (SPEC §0.5).
+        primary: None,
         replica: Default::default(),
         clone: CloneConfig {
             provider: CloneProvider::None,

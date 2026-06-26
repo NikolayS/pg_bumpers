@@ -57,6 +57,17 @@ fn hardened_role_sql_path() -> PathBuf {
         .join("deploy/sql/10_hardened_role.sql")
 }
 
+/// The FIXTURE-ONLY demo seed `deploy/sql/20_demo_seed.sql` — the `allowed_read` /
+/// `secret_data` demo tables + their grants. Issue #103 split this OUT of the
+/// canonical hardening, so this gate IT (a fixture) applies it explicitly to get the
+/// whitelisted-read / denied-read pair it asserts against.
+fn demo_seed_sql_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("deploy/sql/20_demo_seed.sql")
+}
+
 /// A throwaway Postgres primary on a dedicated port; `Drop` tears it down.
 struct Cluster {
     datadir: PathBuf,
@@ -250,10 +261,12 @@ fn direct_to_db_bypass_is_denied_by_the_wall() {
 
     let cluster = Cluster::start();
 
-    // Apply the SHIPPED hardened-role SQL (the WALL). It creates its OWN demo
-    // whitelist: `public.allowed_read` (granted SELECT) + `public.secret_data`
-    // (NOT granted) — exactly the positive/negative read pair we assert against.
+    // Apply the SHIPPED hardened-role SQL (the WALL), then the FIXTURE-ONLY demo
+    // seed (issue #103 split it out of the hardening): the seed creates the demo
+    // whitelist `public.allowed_read` (granted SELECT) + `public.secret_data` (NOT
+    // granted) — exactly the positive/negative read pair we assert against.
     cluster.psql_file(DBNAME, &hardened_role_sql_path());
+    cluster.psql_file(DBNAME, &demo_seed_sql_path());
 
     let dsn = cluster.agent_dsn();
 
@@ -327,8 +340,10 @@ fn proxy_classifier_block_agrees_with_the_server_for_writes() {
     use pgb_proxy::{Enforcement, GateDecision};
 
     let cluster = Cluster::start();
-    // The shipped WALL SQL creates the whitelisted `public.allowed_read` itself.
+    // The WALL hardening + the FIXTURE-ONLY demo seed (issue #103): the seed creates
+    // the whitelisted `public.allowed_read` this test reads/writes against.
     cluster.psql_file(DBNAME, &hardened_role_sql_path());
+    cluster.psql_file(DBNAME, &demo_seed_sql_path());
     let dsn = cluster.agent_dsn();
     let gate = Enforcement::new();
 

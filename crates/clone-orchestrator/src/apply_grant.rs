@@ -439,6 +439,8 @@ mod tests {
         PolicyConfig {
             version: 1,
             roles,
+            // No BYO primary target in this clone/apply unit fixture (SPEC §0.5).
+            primary: None,
             replica: Default::default(),
             clone: CloneConfig { provider },
             pitr: PolicyPitr {

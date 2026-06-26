@@ -25,6 +25,7 @@
 
 use pgb_audit::{Decision, NewEntry, Principal as AuditPrincipal, Sink};
 use pgb_core::Clock;
+use pgb_policy::{DsnTarget, TargetResolutionError, TargetResolver};
 
 use crate::poller::{ActivitySource, Killer, TickOutcome, WardenLoop};
 use crate::thresholds::{ThresholdError, WardenThresholds};
@@ -207,18 +208,29 @@ pub struct WardenSettings {
 }
 
 impl WardenSettings {
-    /// Resolve settings from an environment reader (`getenv("KEY") -> Option`).
+    /// Resolve settings from the BYO `policy.yaml` `primary:` target + an
+    /// environment reader (`getenv("KEY") -> Option`), with the §0.5 precedence
+    /// **env override > policy.yaml `primary:` target > FAIL-CLOSED**.
     ///
-    /// Taking the reader as a closure keeps this **pure + unit-testable** (no
-    /// process env, no DB) so the binary's configuration logic is covered:
-    ///   * non-secret knobs have conservative defaults (host `127.0.0.1`, port
-    ///     `54321` — the local-stack primary, **never** 5432; the `_meta` db
-    ///     `postgres`; the writer role `pgb_audit_writer`);
+    /// Taking the policy target + the env reader as plain arguments (no process
+    /// env, no DB) keeps this **pure + unit-testable** so the binary's
+    /// configuration logic is covered:
+    ///   * `host`/`port` resolve through the shared [`TargetResolver`] — there is
+    ///     **NO** throwaway-cluster default (no hardcoded `54321`): with neither
+    ///     an env override nor a policy `primary:` target the warden refuses to
+    ///     start (fail-closed). **Never** 5432 unless that is the user's own DB;
+    ///   * `backend_db` falls back to the policy target's database, then the
+    ///     conventional `postgres`; `admin_role`/`audit_db`/`writer_role` keep
+    ///     their conservative defaults (the warden polls as an admin role and
+    ///     appends the chain as the audit-WRITER role, never the audited agent);
     ///   * the two **secrets** (`PGB_WARDEN_ADMIN_PASSWORD` /
     ///     `PGB_AUDIT_WRITER_PASSWORD`) have **no** default — a missing one is a
     ///     fail-closed error, never an empty password (the warden ships no
     ///     credential literals, mirroring the proxy's posture).
-    pub fn from_env(getenv: impl Fn(&str) -> Option<String>) -> Result<WardenSettings, String> {
+    pub fn resolve(
+        policy_primary: Option<&DsnTarget>,
+        getenv: impl Fn(&str) -> Option<String>,
+    ) -> Result<WardenSettings, String> {
         let or = |key: &str, default: &str| getenv(key).unwrap_or_else(|| default.to_string());
         let required = |key: &str| {
             getenv(key).ok_or_else(|| {
@@ -228,10 +240,30 @@ impl WardenSettings {
                 )
             })
         };
+        // The BYO primary target (SPEC §0.5): env override > policy.yaml `primary:`
+        // target > FAIL-CLOSED. No throwaway-cluster default (no silent `54321`).
+        // The warden's poll/admin role is NOT the connect role on the target, so the
+        // resolver's role fallback is unused here (admin_role is resolved separately);
+        // `default_role` is set to the conventional admin `postgres` for completeness.
+        let target = TargetResolver {
+            policy_target: policy_primary,
+            host_override: getenv("PGB_BACKEND_HOST"),
+            port_override: getenv("PGB_BACKEND_PORT"),
+            db_override: getenv("PGB_BACKEND_DB"),
+            role_override: None,
+            default_database: "postgres",
+            default_role: "postgres",
+            host_env_key: "PGB_BACKEND_HOST",
+            port_env_key: "PGB_BACKEND_PORT",
+            policy_hint: "policy.yaml `primary:` (the BYO primary target the warden watches, \
+                          SPEC §0.5)",
+        }
+        .resolve()
+        .map_err(|e: TargetResolutionError| e.to_string())?;
         Ok(WardenSettings {
-            host: or("PGB_BACKEND_HOST", "127.0.0.1"),
-            port: or("PGB_BACKEND_PORT", "54321"), // local-stack primary; NEVER 5432
-            backend_db: or("PGB_BACKEND_DB", "postgres"),
+            host: target.host,
+            port: target.port.to_string(),
+            backend_db: target.database,
             audit_db: or("PGB_AUDIT_DB", "postgres"),
             admin_role: or("PGB_WARDEN_ADMIN_ROLE", "postgres"),
             admin_password: required("PGB_WARDEN_ADMIN_PASSWORD")?,
@@ -692,48 +724,86 @@ mod tests {
         }
     }
 
+    /// A minimal BYO `primary:` target for the resolver tests.
+    fn primary_target(host: &str, port: u16, db: &str) -> DsnTarget {
+        DsnTarget {
+            host: host.to_string(),
+            port,
+            database: db.to_string(),
+            role: "pgb_agent".to_string(),
+            secret_ref: None,
+        }
+    }
+
+    /// HEADLINE (RED #2, warden): with NO env override, the warden resolves its
+    /// watched host/port from the BYO `policy.yaml` `primary:` target — NOT the
+    /// removed `54321` default.
     #[test]
-    fn settings_from_env_applies_defaults_and_builds_dsns() {
-        // Only the two required secrets are set; everything else takes the
-        // conservative defaults (port 54321 — the local-stack primary, NEVER 5432).
-        let s = WardenSettings::from_env(fake_env(&[
-            ("PGB_WARDEN_ADMIN_PASSWORD", "admin_pw"),
-            ("PGB_AUDIT_WRITER_PASSWORD", "writer_pw"),
-        ]))
+    fn settings_resolve_from_byo_policy_target_not_54321() {
+        let primary = primary_target("byo.db.internal", 6543, "appdb");
+        let s = WardenSettings::resolve(
+            Some(&primary),
+            fake_env(&[
+                ("PGB_WARDEN_ADMIN_PASSWORD", "admin_pw"),
+                ("PGB_AUDIT_WRITER_PASSWORD", "writer_pw"),
+            ]),
+        )
         .unwrap();
-        assert_eq!(s.host, "127.0.0.1");
-        assert_eq!(
-            s.port, "54321",
-            "default is the local-stack primary, never 5432"
-        );
+        assert_eq!(s.host, "byo.db.internal");
+        assert_eq!(s.port, "6543");
+        assert_ne!(s.port, "54321", "must NOT fall back to the throwaway 54321");
+        // backend_db falls back to the policy target's database.
+        assert_eq!(s.backend_db, "appdb");
         assert_eq!(s.admin_role, "postgres");
         assert_eq!(s.writer_role, "pgb_audit_writer");
         assert_eq!(
             s.observe_dsn(),
-            "host=127.0.0.1 port=54321 dbname=postgres user=postgres password=admin_pw"
+            "host=byo.db.internal port=6543 dbname=appdb user=postgres password=admin_pw"
         );
         assert_eq!(
             s.writer_dsn(),
-            "host=127.0.0.1 port=54321 dbname=postgres user=pgb_audit_writer password=writer_pw"
+            "host=byo.db.internal port=6543 dbname=postgres user=pgb_audit_writer password=writer_pw"
         );
     }
 
+    /// FAIL-CLOSED: with NEITHER a policy `primary:` target NOR an env override,
+    /// resolution errors — the warden refuses to start rather than silently
+    /// default the watched host/port to the throwaway 54321 cluster.
     #[test]
-    fn settings_from_env_honors_overrides() {
-        let s = WardenSettings::from_env(fake_env(&[
-            ("PGB_BACKEND_HOST", "db.internal"),
-            ("PGB_BACKEND_PORT", "54399"),
-            ("PGB_BACKEND_DB", "appdb"),
-            ("PGB_AUDIT_DB", "meta"),
-            ("PGB_WARDEN_ADMIN_ROLE", "warden_admin"),
-            ("PGB_WARDEN_ADMIN_PASSWORD", "a"),
-            ("PGB_AUDIT_WRITER_ROLE", "auditw"),
-            ("PGB_AUDIT_WRITER_PASSWORD", "w"),
-        ]))
+    fn settings_resolve_fails_closed_with_no_policy_target_and_no_env() {
+        let err = WardenSettings::resolve(
+            None,
+            fake_env(&[
+                ("PGB_WARDEN_ADMIN_PASSWORD", "admin_pw"),
+                ("PGB_AUDIT_WRITER_PASSWORD", "writer_pw"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("NO throwaway-cluster default"), "{err}");
+        assert!(!err.contains("54321"), "no 54321 anywhere: {err}");
+    }
+
+    #[test]
+    fn settings_resolve_env_override_wins_over_policy_target() {
+        // The env override beats the policy target (the existing ITs / up.sh path).
+        let primary = primary_target("byo.db.internal", 6543, "appdb");
+        let s = WardenSettings::resolve(
+            Some(&primary),
+            fake_env(&[
+                ("PGB_BACKEND_HOST", "db.internal"),
+                ("PGB_BACKEND_PORT", "54399"),
+                ("PGB_BACKEND_DB", "appdb2"),
+                ("PGB_AUDIT_DB", "meta"),
+                ("PGB_WARDEN_ADMIN_ROLE", "warden_admin"),
+                ("PGB_WARDEN_ADMIN_PASSWORD", "a"),
+                ("PGB_AUDIT_WRITER_ROLE", "auditw"),
+                ("PGB_AUDIT_WRITER_PASSWORD", "w"),
+            ]),
+        )
         .unwrap();
         assert_eq!(
             s.observe_dsn(),
-            "host=db.internal port=54399 dbname=appdb user=warden_admin password=a"
+            "host=db.internal port=54399 dbname=appdb2 user=warden_admin password=a"
         );
         assert_eq!(
             s.writer_dsn(),
@@ -742,18 +812,26 @@ mod tests {
     }
 
     #[test]
-    fn settings_from_env_fail_closed_on_missing_admin_secret() {
+    fn settings_resolve_fail_closed_on_missing_admin_secret() {
         // No `PGB_WARDEN_ADMIN_PASSWORD` → refuse (no empty-password fallback).
-        let err = WardenSettings::from_env(fake_env(&[("PGB_AUDIT_WRITER_PASSWORD", "writer_pw")]))
-            .unwrap_err();
+        let primary = primary_target("h", 6543, "db");
+        let err = WardenSettings::resolve(
+            Some(&primary),
+            fake_env(&[("PGB_AUDIT_WRITER_PASSWORD", "writer_pw")]),
+        )
+        .unwrap_err();
         assert!(err.contains("PGB_WARDEN_ADMIN_PASSWORD"), "{err}");
         assert!(err.contains("no credential literals"), "{err}");
     }
 
     #[test]
-    fn settings_from_env_fail_closed_on_missing_writer_secret() {
-        let err = WardenSettings::from_env(fake_env(&[("PGB_WARDEN_ADMIN_PASSWORD", "admin_pw")]))
-            .unwrap_err();
+    fn settings_resolve_fail_closed_on_missing_writer_secret() {
+        let primary = primary_target("h", 6543, "db");
+        let err = WardenSettings::resolve(
+            Some(&primary),
+            fake_env(&[("PGB_WARDEN_ADMIN_PASSWORD", "admin_pw")]),
+        )
+        .unwrap_err();
         assert!(err.contains("PGB_AUDIT_WRITER_PASSWORD"), "{err}");
     }
 

@@ -53,6 +53,10 @@ PGBIN="${PG_BUMPERS_PG_BIN:-${PGBIN:-/opt/homebrew/opt/postgresql/bin}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SQL_FILE="$DEPLOY_DIR/sql/10_hardened_role.sql"
+# The FIXTURE-ONLY demo seed (issue #103 split it out of the canonical hardening): the
+# allowed_read / secret_data demo tables + grants the matrix's positive+negative read pair
+# asserts against. A real BYO deployment does NOT apply this; the matrix (a fixture) does.
+DEMO_SEED_FILE="$DEPLOY_DIR/sql/20_demo_seed.sql"
 HBA_RENDER="$DEPLOY_DIR/hba/render-hba.sh"
 
 # Dedicated test port + temp data dir. 54331 ∉ {54321,54322,54323,5432}.
@@ -164,13 +168,21 @@ log "cluster up; PG $(SU 'SHOW server_version' | tr -d '\n')"
 #           so the deny assertions below FAIL (proving the matrix has teeth).
 # --------------------------------------------------------------------------------------
 if [ "$MODE" = "green" ]; then
-  log "GREEN: applying deploy/sql/10_hardened_role.sql"
+  log "GREEN: applying deploy/sql/10_hardened_role.sql + the fixture demo seed (20_demo_seed.sql)"
+  # 1) the canonical role HARDENING (creates + hardens pgb_agent + pgb_applier).
   "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
     -v ON_ERROR_STOP=1 -q -f "$SQL_FILE" >/dev/null
-  # Idempotency check: apply a SECOND time — must still succeed without error.
+  # 2) the FIXTURE-ONLY demo seed (the allowed_read / secret_data positive+negative read
+  #    pair + grants). Issue #103 split this OUT of the canonical hardening, so the matrix
+  #    (a fixture) applies it explicitly; a real BYO deployment never does.
+  "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
+    -v ON_ERROR_STOP=1 -q -f "$DEMO_SEED_FILE" >/dev/null
+  # Idempotency check: apply BOTH a SECOND time — must still succeed without error.
   "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
     -v ON_ERROR_STOP=1 -q -f "$SQL_FILE" >/dev/null
-  log "GREEN: migration applied twice (idempotent)"
+  "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
+    -v ON_ERROR_STOP=1 -q -f "$DEMO_SEED_FILE" >/dev/null
+  log "GREEN: migration + demo seed applied twice (idempotent)"
 else
   log "RED: creating a BARE, UN-hardened agent role with broad grants"
   SU "DROP ROLE IF EXISTS $AGENT_ROLE;" >/dev/null || true
