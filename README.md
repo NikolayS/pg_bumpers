@@ -450,7 +450,7 @@ write path add enforcement and the agent-facing API.
 | Layer | What it does |
 |---|---|
 | **Network boundary** | `pg_hba` permits the agent role **only from the proxy host**; every other origin is rejected. |
-| **WALL — native role** | `pgb_agent` is NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant anywhere · SELECT-whitelist only. A raw client *physically can't* write or read denied data. |
+| **WALL — native role** | `pgb_agent` is NOSUPERUSER · NOINHERIT · member-of-nothing · no DML write grant · default-deny on data · SELECT-whitelist only. A raw client *physically can't* read denied data or write app tables. (The agent-only default leaves `PUBLIC`-default `TEMP`/`lo_*` write surfaces at the DB level — see [`KNOWN_BYPASSES.md`](KNOWN_BYPASSES.md) B-lo — gated by the network boundary + proxy floor, or closed at the DB level by the opt-in [`21_public_lockdown.sql`](deploy/sql/21_public_lockdown.sql) on a dedicated DB.) |
 | **Proxy + warden** | `pgb-proxy` is the agent's only endpoint: extended-protocol-only (kills statement-stacking), read-only gate, byte/row mid-stream cutoff, `statement_timeout`, hash-chained audit. `pgb-warden` is an out-of-band watchdog that kills runaway agent sessions. |
 | **Write-safety + MCP** | `pgb-applyd` owns the `propose → dry_run → approve → apply` lifecycle behind an owner-only socket; the MCP server is the agent-facing tool surface (cooperative, *not* a security boundary). |
 
