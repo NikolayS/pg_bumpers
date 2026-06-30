@@ -34,20 +34,34 @@ fn pgbin() -> String {
         .into_owned()
 }
 
-/// Path to the canonical hardened-role SQL (the role hardening only; #103 split the
-/// demo seed into 20_demo_seed.sql — the doctor checks hardening, not the seed).
-fn hardened_role_sql() -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/sql/10_hardened_role.sql"
-    );
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    // Strip psql meta-commands the -f path tolerates but the simple_query path here
-    // does not (\set ON_ERROR_STOP).
+/// Read a `deploy/sql/*.sql` file, stripping the psql meta-commands the `-f` path
+/// tolerates but the `simple_query`/`batch_execute` path here does not (`\set`).
+fn deploy_sql(name: &str) -> String {
+    let path = format!("{}/../../deploy/sql/{name}", env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     raw.lines()
         .filter(|l| !l.trim_start().starts_with("\\set"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The canonical AGENT-ROLE-ONLY hardening (the role hardening only; #103 split the
+/// demo seed into 20_demo_seed.sql; #108 split the strict PUBLIC lockdown into
+/// 21_public_lockdown.sql — the doctor checks hardening, not the seed).
+fn hardened_role_sql() -> String {
+    deploy_sql("10_hardened_role.sql")
+}
+
+/// The OPT-IN strict PUBLIC lockdown (#108). The agent-only default (10_hardened_role.sql)
+/// NEVER mutates PUBLIC, so on PG14 — where PUBLIC still has CREATE on schema public by
+/// default — the applier inherits CREATE-on-public via PUBLIC and the doctor's
+/// `applier_no_ddl` check correctly fails-closed. The fully-contained posture a dedicated
+/// deployment runs is agent-only + this lockdown; the doctor IT (a throwaway DEDICATED test
+/// cluster) applies BOTH, matching the fixture path (local-stack.sh / wall_matrix.sh). A
+/// real BYO user on a shared DB does not apply the lockdown — and the doctor would honestly
+/// flag the PG14 applier-CREATE residual for them to remediate.
+fn public_lockdown_sql() -> String {
+    deploy_sql("21_public_lockdown.sql")
 }
 
 // --------------------------------------------------------------------------
@@ -158,11 +172,18 @@ fn doctor_fails_closed_then_passes_when_hardened() {
     let (_cluster, admin_dsn) = ThrowawayCluster::up();
     let mut admin = Client::connect(&admin_dsn, NoTls).expect("admin connect");
 
-    // GREEN: apply the canonical role hardening (creates + hardens pgb_agent +
-    // pgb_applier). After this the doctor must PASS (exit 0).
+    // GREEN: apply the canonical AGENT-ROLE-ONLY hardening (creates + hardens pgb_agent +
+    // pgb_applier), THEN the opt-in strict PUBLIC lockdown. This throwaway cluster is a
+    // DEDICATED test DB, so it runs the FULL hardened posture a dedicated deployment uses
+    // (agent-only default + lockdown) — the lockdown is what denies the applier CREATE-on-
+    // public on PG14, where PUBLIC still grants it by default and the agent-only file alone
+    // cannot subtract a PUBLIC grant (issue #108). After both the doctor must PASS (exit 0).
     admin
         .batch_execute(&hardened_role_sql())
         .expect("apply 10_hardened_role.sql");
+    admin
+        .batch_execute(&public_lockdown_sql())
+        .expect("apply 21_public_lockdown.sql");
     let (passed, out) = run_doctor(_cluster.port);
     assert!(
         passed,
