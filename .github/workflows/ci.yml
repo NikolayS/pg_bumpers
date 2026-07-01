@@ -120,8 +120,9 @@ jobs:
     env:
       # The ONE cross-IT/CI PG bin-dir variable (issues #44, #102). PGDG installs
       # PostgreSQL ${{ matrix.pg }} here on Ubuntu; every IT resolver honors this
-      # first. Renamed from PG_BRAKES_PG18_BIN (hard rename, no alias) now that
-      # the substrate is version-agnostic across the supported range.
+      # first. Renamed from the former product-name-spelled `…_PG18_BIN` var (#102)
+      # (hard rename, no alias) now that the substrate is version-agnostic across
+      # the supported range.
       PG_BRAKES_PG_BIN: /usr/lib/postgresql/${{ matrix.pg }}/bin
       # The major as an env var so run: steps never interpolate ${{ … }} into a
       # shell command (defense-in-depth against workflow injection, even though

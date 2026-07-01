@@ -363,9 +363,17 @@ EOF
   # the stack stays queryable; the boundary template/generator ship in
   # deploy/hba/ and the harness proves the boundary on its own cluster.
   # =====================================================================
-  log "applying hardened-role WALL SQL (deploy/sql/10_hardened_role.sql)"
+  log "applying AGENT-ONLY hardened-role WALL SQL (deploy/sql/10_hardened_role.sql)"
   "$PGBIN/psql" -X -h "$LISTEN" -p "$PRIMARY_PORT" -U postgres -d postgres \
     -v ON_ERROR_STOP=1 -q -f "$SCRIPT_DIR/sql/10_hardened_role.sql" >/dev/null
+  # FIXTURE ONLY (issue #108): this local-stack primary is a THROWAWAY/dedicated DB, so we
+  # ALSO apply the opt-in strict PUBLIC lockdown (the `… FROM PUBLIC` revokes) so the strict
+  # DB-level posture stays exercised end-to-end. A real BYO user applies ONLY the agent-only
+  # 10_hardened_role.sql (safe) and opts into the lockdown ONLY for a dedicated DB after a
+  # clone rehearsal (see KNOWN_DANGERS.md D1).
+  log "applying OPT-IN strict PUBLIC lockdown (deploy/sql/21_public_lockdown.sql — fixture only)"
+  "$PGBIN/psql" -X -h "$LISTEN" -p "$PRIMARY_PORT" -U postgres -d postgres \
+    -v ON_ERROR_STOP=1 -q -f "$SCRIPT_DIR/sql/21_public_lockdown.sql" >/dev/null
 
   # Minimal baseline marker table so the stack is queryable end-to-end and the
   # smoke harness has a deterministic row to replicate.

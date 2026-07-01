@@ -57,6 +57,24 @@ fn hardened_role_sql_path() -> PathBuf {
         .join("deploy/sql/10_hardened_role.sql")
 }
 
+/// The OPT-IN strict PUBLIC lockdown `deploy/sql/21_public_lockdown.sql` (#108). The
+/// agent-only default (10_hardened_role.sql) NEVER mutates PUBLIC, so on PG14 — where
+/// PUBLIC still has CREATE on schema public by default — the agent inherits CREATE-on-
+/// public via PUBLIC and a DIRECT-to-DB `CREATE TABLE` is NOT denied at the DB level by
+/// the agent-only file alone. This gate models the DIRECT-to-DB bypass (no proxy), i.e.
+/// the full DB-level WALL of the DETERMINISTIC FLOOR; on a DEDICATED throwaway test DB
+/// that posture is agent-only + this lockdown (the lockdown's `REVOKE CREATE … FROM
+/// PUBLIC` is what denies the direct CREATE on PG14). On a real SHARED BYO DB that CREATE
+/// residual is instead covered by the §3 network boundary + the proxy floor (separately
+/// tested) — see KNOWN_BYPASSES B-lo / SPEC.amendments A-M2. The gate applies BOTH so the
+/// DB-level deny holds on EVERY supported major (PG15+ already lacks the PUBLIC default).
+fn public_lockdown_sql_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("deploy/sql/21_public_lockdown.sql")
+}
+
 /// The FIXTURE-ONLY demo seed `deploy/sql/20_demo_seed.sql` — the `allowed_read` /
 /// `secret_data` demo tables + their grants. Issue #103 split this OUT of the
 /// canonical hardening, so this gate IT (a fixture) applies it explicitly to get the
@@ -261,11 +279,16 @@ fn direct_to_db_bypass_is_denied_by_the_wall() {
 
     let cluster = Cluster::start();
 
-    // Apply the SHIPPED hardened-role SQL (the WALL), then the FIXTURE-ONLY demo
-    // seed (issue #103 split it out of the hardening): the seed creates the demo
-    // whitelist `public.allowed_read` (granted SELECT) + `public.secret_data` (NOT
-    // granted) — exactly the positive/negative read pair we assert against.
+    // Apply the SHIPPED agent-only hardened-role SQL (the WALL), THEN the opt-in strict
+    // PUBLIC lockdown (issue #108 — needed so the DIRECT-to-DB `CREATE TABLE` bypass is
+    // denied at the DB level on PG14 too, where PUBLIC still grants CREATE-on-public and
+    // the agent-only file alone cannot subtract it; this throwaway is a DEDICATED test DB,
+    // so it runs the full hardened posture — see public_lockdown_sql_path docs). Then the
+    // FIXTURE-ONLY demo seed (issue #103 split it out of the hardening): the seed creates
+    // the demo whitelist `public.allowed_read` (granted SELECT) + `public.secret_data`
+    // (NOT granted) — exactly the positive/negative read pair we assert against.
     cluster.psql_file(DBNAME, &hardened_role_sql_path());
+    cluster.psql_file(DBNAME, &public_lockdown_sql_path());
     cluster.psql_file(DBNAME, &demo_seed_sql_path());
 
     let dsn = cluster.agent_dsn();
@@ -370,4 +393,107 @@ fn proxy_classifier_block_agrees_with_the_server_for_writes() {
     );
 
     eprintln!("[gate_it] proxy classifier ↔ server agreement (write blocked, read allowed) — PASS");
+}
+
+/// The realistic **through-proxy catastrophic-FN guarantee** (M2a #114/#115). The
+/// direct-to-DB bypass test above applies the OPT-IN lockdown to deny the write class at
+/// the DB level (the *dedicated* posture). But the BYO **default** is agent-only — it does
+/// NOT globally revoke PUBLIC, so at the DB level the agent RETAINS PUBLIC's function-EXECUTE
+/// / `lo_*` write built-ins (KNOWN_BYPASSES B-lo). Their realistic containment is the M2a
+/// fail-closed read classifier IN FRONT of the DB: a `SELECT lo_create()`, `SELECT
+/// writing_fn()`, `SELECT nextval()`, a custom-operator or qualified-cast write — every
+/// member of the catastrophic-FN class — classifies `NotRead` → the proxy floor BLOCKs it,
+/// so it never reaches the DB. This test proves that guarantee on the **agent-only default
+/// with NO lockdown**, and sharpens the point by confirming the SAME `SELECT lo_create()` is
+/// NOT denied direct-to-DB on that default (a real DB-level residual) — i.e. the classifier
+/// is the load-bearing through-proxy gate, not the DB grant. (Direct-to-DB is otherwise
+/// gated by the §3 network boundary; the lockdown, tested above, closes it at the DB level.)
+#[test]
+fn proxy_classifier_blocks_the_catastrophic_fn_class_on_the_agent_only_default() {
+    if !it_enabled() {
+        eprintln!("[skip] through-proxy catastrophic-FN IT: set {IT_ENV}=1 to run");
+        return;
+    }
+    use pgb_proxy::{Enforcement, GateDecision};
+
+    let cluster = Cluster::start();
+    // AGENT-ONLY DEFAULT: apply the shipped 10_hardened_role.sql + the demo seed, but NOT the
+    // opt-in 21_public_lockdown.sql — this is exactly the SAFE BYO default posture (PUBLIC's
+    // EXECUTE / lo_* defaults remain at the DB level). A write function in `public` stands in
+    // for the "user SECURITY DEFINER write fn reachable via PUBLIC EXECUTE" surface.
+    cluster.psql_file(DBNAME, &hardened_role_sql_path());
+    cluster.psql_file(DBNAME, &demo_seed_sql_path());
+    cluster.psql_db(
+        DBNAME,
+        "CREATE OR REPLACE FUNCTION public.pgb_secdef_write() RETURNS void \
+         LANGUAGE sql SECURITY DEFINER AS $$ \
+         INSERT INTO public.secret_data(id,secret) VALUES (1000,'via secdef') \
+         ON CONFLICT DO NOTHING $$;",
+    );
+    let dsn = cluster.agent_dsn();
+    let gate = Enforcement::new();
+
+    // The catastrophic-FN class the M2a classifier fail-closes on — each MUST be BLOCKed at
+    // the proxy floor (NotRead), so it never reaches the backend, EVEN THOUGH the agent-only
+    // default leaves the underlying PUBLIC grants in place.
+    let blocked_through_proxy: &[(&str, &str)] = &[
+        (
+            "lo_create (in-DB large-object write built-in)",
+            "SELECT lo_create(0)",
+        ),
+        (
+            "lo_from_bytea (large-object write)",
+            "SELECT lo_from_bytea(0, '\\x00'::bytea)",
+        ),
+        (
+            "nextval (sequence side-effect)",
+            "SELECT nextval('some_seq')",
+        ),
+        (
+            "qualified user write fn via PUBLIC EXECUTE",
+            "SELECT public.pgb_secdef_write()",
+        ),
+        (
+            "write fn hidden as a function ARGUMENT",
+            "SELECT abs(lo_create(0))",
+        ),
+    ];
+    for (label, sql) in blocked_through_proxy {
+        assert!(
+            matches!(gate.gate_sql(sql), GateDecision::Block { .. }),
+            "the M2a classifier must BLOCK the catastrophic-FN `{label}` through the proxy: `{sql}`"
+        );
+    }
+    eprintln!(
+        "[gate_it] through-proxy: classifier BLOCKs {} catastrophic-FN statements on the agent-only default",
+        blocked_through_proxy.len()
+    );
+
+    // Sharpen the point: the SAME `SELECT lo_create()` is NOT denied DIRECT-TO-DB on the
+    // agent-only default (PUBLIC still grants EXECUTE — no lockdown here). This is the honest
+    // B-lo residual: the classifier, not the DB grant, is what contains it through the proxy.
+    // (We clean up any large object the direct call creates so the throwaway stays tidy.)
+    match agent_try(&dsn, "SELECT lo_unlink(lo_create(0))") {
+        Ok(()) => eprintln!(
+            "[gate_it] direct-to-DB on the agent-only default: `SELECT lo_create()` is NOT denied \
+             (documented B-lo residual — the M2a classifier is the load-bearing through-proxy gate)"
+        ),
+        Err(msg) => panic!(
+            "expected the agent-only default to LEAVE PUBLIC's lo_create EXECUTE at the DB level \
+             (the B-lo residual the classifier contains through the proxy), but the direct call \
+             was denied: {msg} — if the default now revokes it, update KNOWN_BYPASSES B-lo / this test"
+        ),
+    }
+
+    // FP guard: a legitimate allowlisted read stays Read through the classifier AND succeeds
+    // for the agent — the fail-closed function gate did not over-block the read path.
+    let read = "SELECT count(*) FROM public.allowed_read";
+    assert!(
+        matches!(gate.gate_sql(read), GateDecision::Allow { .. }),
+        "the classifier must still ALLOW an allowlisted read (`count`)"
+    );
+    agent_try(&dsn, read)
+        .expect("the allowlisted read must succeed for the agent (no false-positive)");
+
+    eprintln!("[gate_it] through-proxy catastrophic-FN guarantee on the agent-only default — PASS");
 }

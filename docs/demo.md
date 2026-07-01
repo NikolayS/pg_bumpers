@@ -316,12 +316,17 @@ The cap is inclusive: streaming *exactly* the cap is fine; the next row trips it
 ### `statement_timeout`: the runaway backstop
 
 The proxy injects `SET statement_timeout` on the backend session
-(`session.rs::connect_backend`). This catches what the *advisory* classifier
-can't: the classifier honestly does **not** flag `SELECT pg_sleep(30)` — it's a
-`SELECT`, so it classifies as a read (documented in
-`enforce.rs::classifier_blind_spot_pg_sleep_classifies_as_read`). The
-**un-foolable backstop** is the timeout: `proxy_it.rs` runs the proxy with a 1 s
-`statement_timeout` and proves `SELECT pg_sleep(5)` is **canceled**.
+(`session.rs::connect_backend`). Since **M2a (#114/#115)** the read-only
+classifier is a **fail-closed allowlist gate**, so `SELECT pg_sleep(30)` no longer
+classifies as a read — `pg_sleep` is not on the read-safe allowlist, so the
+statement is `NotRead` → **Blocked at the read-only floor** before it reaches the
+backend (proven in `enforce.rs::function_call_writes_are_blocked_at_the_floor_gate`,
+which asserts `SELECT pg_sleep(30)` is `Block`ed, and end-to-end in `proxy_it.rs`,
+where `SELECT pg_sleep(5)` through the proxy returns a `read-only`-gate block, not a
+timeout). The `statement_timeout` remains the **un-foolable DoS backstop** for
+anything that *does* slip past the classifier — a genuinely slow *allowlisted* read
+is still bounded by the injected timeout, so DoS-by-runtime is capped regardless of
+classification.
 
 ### TLS is required (no silent downgrade)
 

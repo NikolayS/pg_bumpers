@@ -111,10 +111,12 @@ audit:
 
 ### 2. Apply the role hardening (+ your own GRANTs) to your database
 
-Apply the **canonical, version-agnostic** role hardening to your database — it
-creates and hardens the read WALL role `pgb_agent` (NOSUPERUSER · NOINHERIT ·
-member-of-nothing · no write grant anywhere) and the DML-only apply role
-`pgb_applier`, and revokes every inherited/default privilege:
+Apply the **canonical, version-agnostic, AGENT-ROLE-ONLY** role hardening to your
+database. It creates and hardens the read WALL role `pgb_agent` (NOSUPERUSER ·
+NOINHERIT · member-of-nothing · no DML grant · default-deny on data) and the DML-only
+apply role `pgb_applier`, and revokes every inherited/default privilege **from those two
+roles only**. It **NEVER mutates `PUBLIC`**, so it is **safe to apply to an existing
+application database** (issue #108 — see [`KNOWN_DANGERS.md`](KNOWN_DANGERS.md) D1):
 
 ```sh
 psql "host=db.internal port=5432 dbname=app" -f deploy/sql/10_hardened_role.sql
@@ -130,13 +132,26 @@ GRANT SELECT ON app.your_read_table TO pgb_agent;
 GRANT SELECT, INSERT, UPDATE, DELETE ON app.your_write_table TO pgb_applier;
 ```
 
-> `deploy/sql/10_hardened_role.sql` is the **canonical hardening** a BYO user
-> applies — it no longer seeds any demo schema. The demo tables live in the
-> fixture-only `deploy/sql/20_demo_seed.sql` (CI/dev/test only; you do **not** apply
-> it). Also set up the `_meta` audit chain in your audit DB
-> ([`crates/audit/sql/10_audit_meta.sql`](crates/audit/sql/10_audit_meta.sql)) and
-> restrict the agent role to the proxy host in `pg_hba.conf` (see
-> [`deploy/hba/`](deploy/hba/)).
+> **`deploy/sql/10_hardened_role.sql` is the agent-only default — safe on a shared DB.**
+> It no longer seeds any demo schema (the demo tables live in the fixture-only
+> `deploy/sql/20_demo_seed.sql`; CI/dev/test only). Also set up the `_meta` audit chain in
+> your audit DB ([`crates/audit/sql/10_audit_meta.sql`](crates/audit/sql/10_audit_meta.sql))
+> and **restrict the agent role to the proxy host in `pg_hba.conf`** (see
+> [`deploy/hba/`](deploy/hba/)) — this network boundary is **load-bearing** on the agent-only
+> default: it plus the proxy read-only floor is what contains the agent.
+>
+> **Optional, DEDICATED DBs only — the strict `PUBLIC` lockdown.** On a shared DB the agent
+> keeps `PUBLIC`'s default `EXECUTE`/`TEMP`/large-object-write surfaces at the DB level. That
+> write class is contained **through the proxy** (the realistic agent path) by the fail-closed
+> read classifier — a `SELECT lo_create()`/`lowrite()`/any non-allowlisted or qualified
+> function / custom operator / qualified cast classifies `NotRead` and is Blocked at the proxy
+> floor — and **direct-to-DB** by the network boundary above (not a DB revoke — see
+> [`KNOWN_BYPASSES.md`](KNOWN_BYPASSES.md) B-lo). If your database is **dedicated to
+> pg_brakes** (greenfield/throwaway) you MAY add the DB-level belt-and-suspenders by
+> applying [`deploy/sql/21_public_lockdown.sql`](deploy/sql/21_public_lockdown.sql) — but
+> ⚠️ it revokes `… FROM PUBLIC` and **can break an existing application**, so do this ONLY
+> on a dedicated DB or after rehearsing on a thin clone (M3 rehearsal coming). Do **not**
+> apply it to a shared application DB. See [`KNOWN_DANGERS.md`](KNOWN_DANGERS.md) D1.
 
 ### 3. Verify with `pgb-cli doctor` (fail-closed preflight)
 
@@ -438,7 +453,7 @@ write path add enforcement and the agent-facing API.
 | Layer | What it does |
 |---|---|
 | **Network boundary** | `pg_hba` permits the agent role **only from the proxy host**; every other origin is rejected. |
-| **WALL — native role** | `pgb_agent` is NOSUPERUSER · NOINHERIT · member-of-nothing · no write grant anywhere · SELECT-whitelist only. A raw client *physically can't* write or read denied data. |
+| **WALL — native role** | `pgb_agent` is NOSUPERUSER · NOINHERIT · member-of-nothing · no DML write grant · default-deny on data · SELECT-whitelist only. A raw client *physically can't* read denied data or write app tables. (The agent-only default leaves `PUBLIC`-default `TEMP`/`lo_*`/function-`EXECUTE` write surfaces at the DB level — see [`KNOWN_BYPASSES.md`](KNOWN_BYPASSES.md) B-lo — contained **through the proxy** by the fail-closed read classifier (`SELECT lo_create()`/write-fn/qualified-cast → `NotRead`, Blocked) and **direct-to-DB** by the network boundary, or closed at the DB level by the opt-in [`21_public_lockdown.sql`](deploy/sql/21_public_lockdown.sql) on a dedicated DB.) |
 | **Proxy + warden** | `pgb-proxy` is the agent's only endpoint: extended-protocol-only (kills statement-stacking), read-only gate, byte/row mid-stream cutoff, `statement_timeout`, hash-chained audit. `pgb-warden` is an out-of-band watchdog that kills runaway agent sessions. |
 | **Write-safety + MCP** | `pgb-applyd` owns the `propose → dry_run → approve → apply` lifecycle behind an owner-only socket; the MCP server is the agent-facing tool surface (cooperative, *not* a security boundary). |
 

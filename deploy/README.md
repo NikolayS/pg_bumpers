@@ -26,8 +26,10 @@ paths**, all throwaway, none of them the user onboarding flow (that is BYO, abov
    reproducible throwaway, NOT a shipped artifact for real users — real users BYO
    their own database, SPEC §0.5). Postgres (any supported major 14–18), primary +
    optional replica + `_meta` audit DB + a DBLab placeholder, behind compose
-   **profiles**. Its init mounts `init/10_hardened_role.sql` (the canonical hardening)
-   **and** `init/20_demo_seed.sql` (the FIXTURE-ONLY demo schema).
+   **profiles**. Its init mounts `init/10_hardened_role.sql` (the agent-only canonical
+   hardening), `init/21_public_lockdown.sql` (the opt-in strict `PUBLIC` lockdown — the
+   docker primary is itself a throwaway fixture, so it applies it), **and**
+   `init/20_demo_seed.sql` (the FIXTURE-ONLY demo schema).
 2. **`local-stack.sh`** — the **live dev/CI fixture used here**. It builds the same
    topology out of local Postgres clusters (`initdb` / `pg_basebackup` / `pg_ctl`),
    no Docker. This exists because `docker pull` is non-functional in the build
@@ -40,12 +42,16 @@ streaming **replica** (off by default → proves the bare-primary baseline, SPEC
 and a separate append-only **`_meta`** audit DB (SPEC §4). (Path C — the one-command
 `up.sh` demo — co-locates the `_meta` chain on the **primary** instead; see below.)
 
-The **canonical, version-agnostic** role hardening a BYO user applies to their OWN
-database is [`sql/10_hardened_role.sql`](sql/10_hardened_role.sql) — it hardens
-`pgb_agent` + `pgb_applier` and grants **nothing** application-specific (the user
-grants their own relations). The demo schema (`allowed_read` / `secret_data`) is
-split out into the fixture-only [`sql/20_demo_seed.sql`](sql/20_demo_seed.sql), which
-ONLY the fixtures (`up.sh`, docker-compose, `wall_matrix.sh`) apply.
+The **canonical, version-agnostic, AGENT-ROLE-ONLY** role hardening a BYO user applies to
+their OWN database is [`sql/10_hardened_role.sql`](sql/10_hardened_role.sql) — it hardens
+`pgb_agent` + `pgb_applier`, **NEVER mutates `PUBLIC`** (issue #108 — safe on an existing
+DB), and grants **nothing** application-specific (the user grants their own relations). The
+strict `… FROM PUBLIC` lockdown is split out into the **opt-in**
+[`sql/21_public_lockdown.sql`](sql/21_public_lockdown.sql) (⚠️ dedicated/greenfield DB ONLY —
+the fixtures apply it; a BYO user does NOT unless their DB is dedicated). The demo schema
+(`allowed_read` / `secret_data`) is split out into the fixture-only
+[`sql/20_demo_seed.sql`](sql/20_demo_seed.sql), which ONLY the fixtures (`up.sh`,
+docker-compose, `wall_matrix.sh`) apply.
 
 ---
 
@@ -291,16 +297,21 @@ proxy** — and refuses any agent connection that doesn't originate from the pro
 
 | Artifact | What it is |
 |----------|------------|
-| `sql/10_hardened_role.sql` | **Canonical, version-agnostic, BYO-applicable** hardened-role migration (a real deployment applies THIS to its own database): creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles + PUBLIC EXECUTE, **revokes TEMP on the database + the in-DB large-object write built-ins** (so there is **no write grant ANYWHERE**), sets a **best-effort** role-level `search_path` pin (see note below), and is **default-deny on ALL data** until the user grants their own allow-listed relations. It also creates the **constrained, DML-only applier role `pgb_applier`** (S5 #77 — the role `pgb-applyd` connects as): LOGIN, NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on `public`, owns nothing → **cannot DDL**. Issue #103 split the demo seed OUT of this file — it now grants **nothing** application-specific. |
+| `sql/10_hardened_role.sql` | **Canonical, version-agnostic, BYO-applicable, AGENT-ROLE-ONLY** hardened-role migration (a real deployment applies THIS to its own database — it **NEVER mutates `PUBLIC`**, so it is **safe on an existing DB**; issue #108): creates `pgb_agent` (LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS), revokes all `pg_*` predefined roles **from the agent**, revokes EXECUTE on existing `public` functions + CREATE on `public` **from the agent**, sets a **best-effort** role-level `search_path` pin (see note below), and is **default-deny on ALL data** until the user grants their own allow-listed relations. It also creates the **constrained, DML-only applier role `pgb_applier`** (S5 #77 — the role `pgb-applyd` connects as): LOGIN, NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on `public`, owns nothing → **cannot DDL**. Issue #103 split the demo seed OUT of this file; issue #108 split the strict `… FROM PUBLIC` lockdown OUT into `sql/21_public_lockdown.sql`. |
+| `sql/21_public_lockdown.sql` | **OPT-IN strict `PUBLIC` lockdown** (issue #108; greenfield/dedicated-DB ONLY — ⚠️ it revokes `… FROM PUBLIC` and **can break an existing application**): the `REVOKE EXECUTE ON ALL FUNCTIONS … FROM PUBLIC` + `ALTER DEFAULT PRIVILEGES … FROM PUBLIC`, `REVOKE CREATE ON SCHEMA public FROM PUBLIC`, `REVOKE TEMPORARY … FROM PUBLIC`, and the `lo_* … FROM PUBLIC` revokes — the DB-level belt-and-suspenders on top of the agent-only default. The **fixture** (`local-stack.sh`, `up.sh`, `wall_matrix.sh`) applies it so the strict posture stays tested; a **BYO user applies it ONLY on a dedicated DB** (after a clone rehearsal — KNOWN_DANGERS.md D1). |
 | `sql/20_demo_seed.sql` | **FIXTURE-ONLY** demo seed (CI/dev/test ONLY — a real BYO deployment does NOT apply it): the `allowed_read` / `secret_data` demo tables + the matching `pgb_agent` SELECT / `pgb_applier` DML grants, so the role-hardening matrix has a positive (granted) + negative (denied) read pair to assert against. Requires `10_hardened_role.sql` to have run first (it needs the roles). |
-| `init/10_hardened_role.sql` · `init/20_demo_seed.sql` | Byte-for-byte **synced copies** of the two canonical SQL files, picked up by the docker entrypoint (`/docker-entrypoint-initdb.d`, alphabetical: `00_README.sql` → `10_` → `20_`). `sql/check-init-sync.sh` guards both against drift. |
+| `init/10_hardened_role.sql` · `init/20_demo_seed.sql` · `init/21_public_lockdown.sql` | Byte-for-byte **synced copies** of the three canonical SQL files, picked up by the docker entrypoint (`/docker-entrypoint-initdb.d`, alphabetical: `00_README.sql` → `10_` → `20_` → `21_`). The docker primary is itself a throwaway fixture, so it applies the lockdown too. `sql/check-init-sync.sh` guards all three against drift **and** asserts `10_hardened_role.sql` carries NO `… FROM PUBLIC` statement (issue #108). |
 | `hba/pg_hba.agent-boundary.conf.template` | **Layer 0** `pg_hba` rules: agent role permitted **only from the proxy host's CIDR**; every other origin `reject`ed. |
 | `hba/render-hba.sh` | Generator that substitutes the template's placeholders (`--proxy-cidr 10.0.0.5/32 …`). Append its output to `$PGDATA/pg_hba.conf` **above** any catch-all. |
 | `hba/NETWORK-POLICY.md` | The network-policy companion (firewall / security-group / k8s NetworkPolicy half of the boundary) + how the local test models "proxy host vs. elsewhere". |
-| `test/wall_matrix.sh` | The **role-hardening test matrix** (env-gated `PG_BRAKES_IT=1`): spins a dedicated throwaway PG cluster (any supported major, 14-18) on **54331**, applies `10_hardened_role.sql` **+ the fixture `20_demo_seed.sql`** + the boundary `pg_hba`, then asserts **one row per matrix item** by *attempting* each denied action as the agent and proving it fails (+ whitelisted SELECT succeeds, member-of-nothing, boundary refused/allowed). |
+| `test/wall_matrix.sh` | The **role-hardening test matrix** (env-gated `PG_BRAKES_IT=1`): spins a dedicated throwaway PG cluster (any supported major, 14-18) on **54331** and runs **two phases** (issue #108). **PHASE 1** applies the agent-only `10_hardened_role.sql` **+ the fixture `20_demo_seed.sql`** + the boundary `pg_hba`, then proves the agent stays contained WITHOUT any `… FROM PUBLIC` revoke (attempting each denied action as the agent) AND that `PUBLIC` still HAS its `EXECUTE`/`TEMP`/`lo_*` defaults (the default did not globally revoke). **PHASE 2** applies the opt-in `21_public_lockdown.sql` and proves the `PUBLIC`-globally-revoked rows in their own context. (+ whitelisted SELECT succeeds, member-of-nothing, boundary refused/allowed.) |
 
-Wired in: `local-stack.sh` applies `sql/10_hardened_role.sql` against the primary on every
-`up` (idempotent); the docker compose picks up `init/10_hardened_role.sql` on first boot.
+Wired in: `local-stack.sh` applies `sql/10_hardened_role.sql` **and the opt-in
+`sql/21_public_lockdown.sql`** against the (throwaway) primary on every `up` (idempotent);
+`up.sh` applies the lockdown to its throwaway demo DB too; the docker compose picks up
+`init/10_hardened_role.sql` → `init/21_public_lockdown.sql` on first boot (the docker primary
+is itself a fixture). A real BYO user applies ONLY `sql/10_hardened_role.sql` (agent-only,
+safe) and opts into the lockdown only on a dedicated DB.
 
 ```sh
 # GREEN — every matrix row passes against the live backend (exit 0):
@@ -342,18 +353,34 @@ deploy/hba/render-hba.sh --agent-role pgb_agent --proxy-cidr 10.0.0.5/32 >> "$PG
 > is a fresh origination the proxy re-pins, so no agent-chosen path survives into a new session
 > — proven by `crates/proxy/tests/proxy_it.rs::proxy_pins_search_path_on_every_brokered_session`
 > (env-gated IT against the live backend). The WALL's real guarantee does **not** depend on `search_path`: reads
-> are via fully-qualified **explicit SELECT grants** only, and the agent can neither CREATE
-> schemas/objects (so no trojan-shadowing) nor write anywhere — therefore **no `search_path`
-> the agent chooses can widen its read surface or escalate**. The matrix proves this
-> **invariant** directly (section I): it shows the agent CAN mutate its path + `RESET ALL`
-> (documented PG behavior) yet **STILL** cannot read non-whitelisted data or write anywhere.
+> are via fully-qualified **explicit SELECT grants** only, and the agent has **no DML write grant**
+> on any relation (default-deny on data) — therefore **no `search_path` the agent chooses can
+> widen its read surface or reach data it lacks a grant on**. (This is the GRANT-based
+> read/DML surface; it does NOT claim "no write/CREATE anywhere" — the agent-only default
+> leaves `PUBLIC`'s `TEMP`/`lo_*`/(PG14) CREATE defaults at the DB level, contained by the
+> proxy classifier through-proxy + the network boundary direct-to-DB, per the next note.) The
+> matrix proves this **invariant** directly (section I): it shows the agent CAN mutate its path
+> + `RESET ALL` (documented PG behavior) yet **STILL** cannot read non-whitelisted DATA or
+> perform grant-gated DML.
 
-> **"No write grant ANYWHERE" — now enforced.** PostgreSQL grants two write paths to PUBLIC
-> by default: `TEMPORARY` on the database (`CREATE TEMP TABLE … INSERT`) and EXECUTE on the
-> in-DB large-object write built-ins (`lo_create`/`lowrite`/`lo_from_bytea`/`lo_put`/…). The
-> migration now **REVOKEs both** (from PUBLIC and the agent), and the matrix asserts
-> `CREATE TEMP TABLE` and `lo_create`/`lowrite`/`lo_from_bytea`/`lo_put` are **DENIED**. The
-> server-file LO paths (`lo_import`/`lo_export`) remain `[NO-GRANT]`-gated as above.
+> **`PUBLIC`-default write paths — agent-only default vs. opt-in lockdown (issue #108).**
+> PostgreSQL grants two write paths to `PUBLIC` by default: `TEMPORARY` on the database
+> (`CREATE TEMP TABLE … INSERT`) and EXECUTE on the in-DB large-object write built-ins
+> (`lo_create`/`lowrite`/`lo_from_bytea`/`lo_put`/…). **Verified on real PG 14-18, NEITHER can
+> be denied by an agent-scoped revoke** — they flow through the `PUBLIC` grant, and a per-role
+> `REVOKE … FROM pgb_agent` cannot subtract a `PUBLIC` grant. So on the **agent-only default**
+> they remain a **documented residual** (the agent CAN `CREATE TEMP TABLE` and write a large
+> object at the DB level), contained NOT by a DB revoke but, split by path: **through the proxy**
+> (the realistic agent path) by the **M2a fail-closed read classifier** (#114/#115 — `SELECT
+> lo_create()`/`lowrite()`/any non-allowlisted or qualified function classifies `NotRead` →
+> Blocked, and `CREATE TEMP TABLE` is DDL → `NotRead`), and **direct-to-DB** by the **§3 network
+> boundary** —
+> the matrix PHASE 1 asserts these as residuals (and asserts `PUBLIC` still HAS the defaults).
+> The **opt-in `21_public_lockdown.sql`** revokes them `… FROM PUBLIC`; the matrix PHASE 2 then
+> asserts `CREATE TEMP TABLE` and `lo_create`/`lowrite`/`lo_from_bytea`/`lo_put` are **DENIED**
+> at the DB level. (Same for PG14's `CREATE`-on-`public` `PUBLIC` default; PG15+ already lacks
+> it.) The server-file LO paths (`lo_import`/`lo_export`) remain `[NO-GRANT]`-gated as above.
+> See `KNOWN_BYPASSES.md` (B-lo) and `docs/spec/SPEC.amendments.md` (A-M2).
 
 > **Boundary has an independent RED path.** Beyond `--red` (which un-hardens the ROLE only),
 > the harness runs an inline **BOUNDARY-RED** self-test: it swaps in a deliberately-permissive

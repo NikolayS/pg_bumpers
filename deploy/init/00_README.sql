@@ -13,10 +13,17 @@
 -- role-hardening matrix; SPEC §3 layer 1) is in this directory as
 -- deploy/init/10_hardened_role.sql and is picked up automatically by this
 -- entrypoint mount (files run alphabetically — this 00_ file runs first, then
--- 10_hardened_role.sql). That file is a byte-for-byte SYNCED COPY of the
--- canonical deploy/sql/10_hardened_role.sql (the docker entrypoint mounts only
--- deploy/init/, so the WALL SQL is duplicated here; a symlink would dangle
--- inside the container). deploy/sql/check-init-sync.sh guards against drift.
+-- 10_hardened_role.sql, then 20_demo_seed.sql, then 21_public_lockdown.sql).
+-- 10_hardened_role.sql is the AGENT-ROLE-ONLY default and NEVER mutates PUBLIC
+-- (issue #108). 21_public_lockdown.sql is the OPT-IN strict PUBLIC lockdown
+-- (the `… FROM PUBLIC` revokes) — it is applied here because the docker primary
+-- is itself a THROWAWAY FIXTURE (a real BYO user applies only 10_hardened_role.sql,
+-- and opts into the lockdown ONLY on a dedicated DB; see KNOWN_DANGERS.md D1).
+-- Each of those is a byte-for-byte SYNCED COPY of its canonical deploy/sql/
+-- counterpart (the docker entrypoint mounts only deploy/init/, so the WALL SQL is
+-- duplicated here; a symlink would dangle inside the container).
+-- deploy/sql/check-init-sync.sh guards all three against drift AND asserts
+-- 10_hardened_role.sql carries NO `… FROM PUBLIC` statement (issue #108).
 --
 -- The Layer 0 pg_hba NETWORK BOUNDARY (agent role permitted only from the proxy
 -- host) is a deploy-time pg_hba concern, not an initdb-SQL concern. Its template

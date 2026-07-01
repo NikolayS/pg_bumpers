@@ -161,7 +161,19 @@ passthrough + TLS").
 
 ### Un-foolable enforcement actually proven (issue #22, against live PG18)
 
-The classifier is **advisory and foolable** (e.g. `pg_sleep` classifies as a read). The
+The classifier is **advisory and foolable** (e.g. `pg_sleep` classifies as a read).
+
+> **Superseded by A-M2a (#114/#115) — the classifier is now a fail-closed allowlist:**
+> as of M2a (#114 function-call gate + #115 operator/cast/lock classes) a `SELECT` is
+> `Read` **only if every function it references is on the curated read-safe allowlist**,
+> so `pg_sleep`/`nextval`/`setval`/`lo_*`/`pg_read_file` classify `NotRead` → **Blocked at
+> the proxy floor** — the "advisory and foolable / `pg_sleep` classifies as a read"
+> statement above describes the *pre-M2a* (issue-#22 era) behavior and is retained here as
+> historical record. The `statement_timeout` + byte/row cutoff remain the un-foolable
+> backstops *behind* the classifier (for anything that slips past it), not the sole
+> defense against `pg_sleep`.
+
+The
 proxy therefore relies on the un-foolable backstops, all exercised in the env-gated
 `crates/proxy/tests/proxy_it.rs` against the local-stack WALL role: extended-protocol-only
 (the marquee `COMMIT; DROP SCHEMA public CASCADE` simple-query **BLOCKED**, schema intact),
@@ -1421,3 +1433,96 @@ is the authoritative pointer to the current (Rust) reality.
   dev stack stands up (throwaway PG18 on a high port; NEVER :5432) and `pgb-mcp` is driven live
   end-to-end (`initialize` → `tools/list` = 9 tools → a read through `pgb-proxy` → a bounded,
   operator-approved write through `pgb-applyd` read back from PG18 → `get_audit`).
+
+---
+
+## A-M2 (#108) — default BYO hardening is AGENT-ROLE-ONLY; the strict `PUBLIC` lockdown is an explicit opt-in
+
+**SPEC sections touched:** §3 (layer 1 WALL — the native-role hardening), §4 ("Network/
+roles — do FIRST"), §5 (role-hardening matrix), §0.5 (bring-your-own Postgres). No change
+to the deterministic floor (§11.1) or the bounded+reversible guarantee (§12.1).
+
+**Issue:** #108 (M2 — the real fix for the `REVOKE … FROM PUBLIC` production outage,
+KNOWN_DANGERS.md D1).
+
+### Deviation
+
+The shipped role-hardening migration `deploy/sql/10_hardened_role.sql` used to REVOKE
+privileges **`FROM PUBLIC`** in schema `public` (function `EXECUTE` blanket + the future-
+function `ALTER DEFAULT PRIVILEGES`, `CREATE` on the schema, `TEMPORARY` on the database,
+and the in-DB large-object write built-ins `lo_*`). Those statements mutate the privilege
+model for **every role in the database, not just `pgb_agent`** — applied to a live
+application primary they stripped implicit `PUBLIC` grants the application relied on and
+broke it (D1). The SPEC's intent (§3/§5) is that the *agent* be physically unable to
+read/write/escalate even as a raw client; it does **not** require globally mutating
+`PUBLIC`. **The default BYO hardening is now AGENT-ROLE-ONLY: it constrains `pgb_agent`/
+`pgb_applier` and NEVER touches `PUBLIC`.** The strict `PUBLIC` lockdown moves to a
+separate, explicitly opt-in file `deploy/sql/21_public_lockdown.sql` (greenfield/
+dedicated-DB ONLY; the dev/test/CI fixture applies it so the strict posture stays tested,
+a BYO user does not).
+
+### Honest tradeoff (the residual on a SHARED BYO DB)
+
+With ONLY the agent-only default applied, the agent — as a member of `PUBLIC` — **retains,
+at the DB level, three `PUBLIC`-default surfaces that CANNOT be denied by an agent-scoped
+revoke** (verified on real PG 14-18; a per-role `REVOKE … FROM pgb_agent` cannot subtract a
+privilege granted to `PUBLIC`):
+
+1. **Function `EXECUTE`** on functions created in `public` *after* apply (the language
+   default grants `EXECUTE` to `PUBLIC`). The agent-only file revokes `EXECUTE` from the
+   agent only on functions that exist at apply time.
+2. **`TEMPORARY` on the database** — `CREATE TEMP TABLE` (a session-local write + disk-DoS
+   vector). `has_database_privilege('pgb_agent', …, 'TEMP')` stays TRUE after the agent-
+   scoped revoke because it flows through `PUBLIC`.
+3. **The in-DB large-object WRITE built-ins** (`lo_create`/`lowrite`/`lo_from_bytea`/
+   `lo_put`/`lo_truncate*`/`lo_unlink`) — there is no agent-scoped revoke for these; they
+   are reachable only via the `PUBLIC`-default `EXECUTE`.
+
+   Additionally, **on PG14 only**, `PUBLIC` still has `CREATE` on schema `public` by default
+   (PG15+ removed it), so on PG14 the agent can also create objects in `public` on the
+   agent-only default. PG15+ already denies this.
+
+On a shared BYO DB these residuals are gated **NOT by a DB-level revoke** but by the layers
+that already carry the agent's containment in the SPEC model, split by path:
+
+- **Through the proxy (the realistic agent path):** the **M2a fail-closed read classifier**
+  (`pgb_pgwire::classify`, #114 + #115) is the un-foolable gate. A `SELECT` is `Read` **only
+  if every function it references is on the curated read-safe allowlist**; ANY non-allowlisted
+  function, a schema-qualified/custom operator, a qualified/`CONVERT`/`TypedString` cast, or a
+  `FOR UPDATE`/`FOR SHARE` lock makes the whole statement **NotRead → Blocked at the proxy
+  floor** (with cost/byte/timeout budgets + audit). So `SELECT lo_create(0)` / `SELECT
+  lowrite(…)` / `SELECT some_write_fn()` / `SELECT a OPERATOR(public.wop) b` /
+  `SELECT x::public.evil` are all Blocked, and `CREATE TEMP TABLE` / `CREATE TABLE public.x`
+  are DDL — already NotRead structurally. **This is what makes removing the DB-level `… FROM
+  PUBLIC` revoke from the default SAFE for the through-proxy path** — the write class above
+  cannot execute through the proxy even though the `PUBLIC` grants still exist at the DB.
+- **Direct-to-DB (agent bypassing the proxy):** prevented by the **§3 Layer-0 network
+  boundary** (pg_hba lets `pgb_agent` connect ONLY from the proxy host — the agent cannot make
+  a direct libpq connection to reach these surfaces). This boundary is now **load-bearing** for
+  the DB-level residuals in the BYO default and must be documented/enforced as such. The
+  `… FROM PUBLIC` revokes were always *defense-in-depth* for this boundary-prevented
+  direct-connect case; the founder decision (#108) is that a global blast radius that can take
+  down a production DB is **not an acceptable default cost** for that extra belt.
+
+The strict opt-in `21_public_lockdown.sql` restores the DB-level belt-and-suspenders for a
+**dedicated** DB (clone-rehearsed per D1), fully closing even the direct-to-DB residuals
+(including the PG14 direct-`CREATE` and the bare-cast B9 residual).
+
+The agent's **load-bearing containments are UNCHANGED** and still proven by the WALL matrix
+on the agent-only default across PG 14-18: NOSUPERUSER/NOINHERIT, member-of-nothing, no DML
+grant (default-deny on data), no predefined-role membership, no `BYPASSRLS`, no replication,
+no `COPY … PROGRAM`/`pg_read_file`/`lo_import`/`lo_export` (superuser/predefined-role gated),
+cannot `CREATE EXTENSION` (dblink/fdw), and the search_path invariant. None of those depend
+on a `… FROM PUBLIC` revoke. See KNOWN_BYPASSES.md (B-lo) for the residual surface entry.
+
+### Evidence (red→green)
+
+- **RED:** `deploy/sql/check-init-sync.sh` gains a FROM-PUBLIC split guard — with the old
+  `10_hardened_role.sql` (which has `… FROM PUBLIC` statements) the guard FAILS. The WALL
+  matrix's section C-PUBLIC-UNTOUCHED would FLIP to FAIL if the default globally revoked.
+- **GREEN:** `check-init-sync.sh` passes (default has NO `… FROM PUBLIC`; the opt-in file
+  carries them). `deploy/test/wall_matrix.sh` is GREEN on **PG 14, 15, 18** (69/69 rows):
+  PHASE 1 proves the agent stays contained on the agent-only default AND that `PUBLIC` still
+  HAS its `EXECUTE`/`TEMP`/`lo_create` defaults; PHASE 2 applies `21_public_lockdown.sql` and
+  proves the `PUBLIC`-globally-revoked rows in their own context. RED mode still exits non-
+  zero (18 deny rows fail on an un-hardened role → the matrix has teeth).

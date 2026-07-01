@@ -1,11 +1,32 @@
 -- pg_brakes — Layer 1 WALL: the hardened native agent role (idempotent).
 -- =====================================================================================
--- ⚠️  DANGER — DO NOT run this as-is on an EXISTING production database.
--- It REVOKEs privileges FROM PUBLIC (function EXECUTE, CREATE/TEMP on schema public, lo_*),
--- which mutates EVERY role's privileges, not just pgb_agent. On a live application database
--- this can break anything relying on the implicit PUBLIC grant. Safe on a greenfield/throwaway
--- DB only. For an existing DB: rehearse on a clone + smoke-test first, or apply only the
--- agent-role-specific REVOKEs and skip the "… FROM PUBLIC" statements. See KNOWN_DANGERS.md (D1).
+-- ✅ DEFAULT BYO HARDENING = AGENT-ROLE-ONLY (issue #108, M2). This file constrains the
+-- agent/applier roles ONLY and NEVER mutates PUBLIC — it is SAFE to apply to an existing
+-- BYO database (it touches no other role's privileges). The earlier version revoked
+-- privileges FROM PUBLIC (function EXECUTE, CREATE/TEMP on schema public, lo_*), which
+-- mutated EVERY role and took down a live application DB (see KNOWN_DANGERS.md D1). Those
+-- "… FROM PUBLIC" statements have been MOVED OUT to the explicit, opt-in companion
+-- deploy/sql/21_public_lockdown.sql (greenfield/dedicated-DB ONLY — it can break an
+-- existing app). A BYO user applies THIS file (agent-only) + grants their own relations
+-- (§6); the dev/test/CI fixture additionally applies 21_public_lockdown.sql so the strict
+-- DB-level posture stays tested.
+--
+-- HONEST TRADEOFF (docs/spec/SPEC.amendments.md A-M2): on a SHARED BYO DB the agent
+-- retains PUBLIC's default function-EXECUTE, TEMP, and in-DB large-object write built-ins
+-- at the DB level (this file no longer revokes them globally). The agent's containment
+-- then rests on its AGENT-SPECIFIC controls (member-of-nothing, NOSUPERUSER/NOINHERIT, no
+-- write grant, default-deny on data) PLUS two orthogonal layers, split by path:
+--   • THROUGH THE PROXY (the realistic agent path): the M2a fail-closed read classifier
+--     (crates/pgwire, #114/#115) Blocks the whole PUBLIC-default write class — SELECT
+--     lo_create()/lowrite()/any non-allowlisted or qualified fn, a custom operator, a
+--     qualified/CONVERT/TypedString cast, or a FOR-lock all classify NotRead; CREATE
+--     TEMP/CREATE TABLE public.x are DDL (NotRead). This is the un-foolable gate that
+--     makes dropping the global PUBLIC revoke SAFE for the through-proxy path.
+--   • DIRECT-TO-DB (agent bypassing the proxy): the §3 Layer-0 NETWORK BOUNDARY (pg_hba
+--     lets the agent connect ONLY from the proxy host) — now LOAD-BEARING for the
+--     DB-level residuals in this default.
+-- NOT a global PUBLIC revoke. The strict opt-in 21_public_lockdown.sql restores the
+-- DB-level belt-and-suspenders for dedicated DBs. See KNOWN_BYPASSES.md (B-lo).
 -- =====================================================================================
 -- Source of truth: docs/spec/SPEC.md (v0.8) §3 (layer 1 WALL), §4 ("Network/roles — do
 -- FIRST"), §5 (role-hardening matrix). decisions.md: "Native roles = the security wall,
@@ -22,14 +43,19 @@
 --
 -- BRING-YOUR-OWN POSTGRES (SPEC §0.5): this file is the CANONICAL, version-agnostic role
 -- HARDENING ONLY — it creates + hardens `pgb_agent` (read WALL) and `pgb_applier` (DML-
--- only apply role) and revokes every default/inherited privilege, but it NO LONGER seeds
--- any demo schema or grants any application tables. A BYO user applies THIS file against
--- their existing database (PG 14-18), then grants the agent/applier ONLY their own
--- allow-listed relations (the §6 GRANT pattern, see below). The dev/test/CI fixtures (the
--- one-command `up.sh`, the docker-compose stack, `wall_matrix.sh`) additionally apply the
--- companion FIXTURE-ONLY seed `deploy/sql/20_demo_seed.sql` (the `allowed_read` /
--- `secret_data` demo tables + their grants) so the matrix has a positive+negative read
--- pair to assert against. A real deployment does NOT apply `20_demo_seed.sql`.
+-- only apply role) and revokes every default/inherited privilege FROM THOSE TWO ROLES (it
+-- NEVER mutates PUBLIC — issue #108), but it NO LONGER seeds any demo schema or grants any
+-- application tables. A BYO user applies THIS file against their existing database (PG
+-- 14-18) — SAFE, because it touches only the agent/applier — then grants the agent/applier
+-- ONLY their own allow-listed relations (the §6 GRANT pattern, see below). A user with a
+-- DEDICATED/greenfield DB MAY additionally apply the opt-in deploy/sql/21_public_lockdown.sql
+-- for DB-level belt-and-suspenders (it revokes the dangerous defaults FROM PUBLIC — see its
+-- ⚠️ header; can break an existing app). The dev/test/CI fixtures (the one-command `up.sh`,
+-- the docker-compose stack, `wall_matrix.sh`) additionally apply both the strict
+-- `deploy/sql/21_public_lockdown.sql` (so the strict posture stays tested) AND the
+-- FIXTURE-ONLY seed `deploy/sql/20_demo_seed.sql` (the `allowed_read` / `secret_data` demo
+-- tables + their grants) so the matrix has a positive+negative read pair to assert against.
+-- A real BYO deployment does NOT apply `20_demo_seed.sql`.
 --
 -- The role is the fixed name `pgb_agent` and is scoped to the connected database (the
 -- dev substrate applies it against `postgres`). To re-target, change the name here OR run
@@ -280,14 +306,17 @@ $$;
 -- There is no GRANT REPLICATION; the attribute is the control. Asserted in the matrix.
 
 -- -------------------------------------------------------------------------------------
--- 2. [REVOKE] Default-deny on data: revoke PUBLIC's implicit privileges, then strip any
---    privilege the agent may have picked up. The SELECT-whitelist (§4) is the ONLY way
---    back in. This guarantees "default-deny elsewhere".
+-- 2. [REVOKE] Default-deny on data — AGENT-ONLY (issue #108): strip from the AGENT ROLE any
+--    privilege it may have picked up (CREATE on schema public below; data grants stay default-
+--    deny until the user whitelists). The SELECT-whitelist (§6) is the ONLY way back in. This
+--    guarantees "default-deny elsewhere" for the agent WITHOUT mutating PUBLIC.
 -- -------------------------------------------------------------------------------------
 -- Block the agent from creating objects in (or even using) public except read-whitelist.
--- Note: in PG15+ PUBLIC already lacks CREATE on public; we re-assert for older drift and
--- additionally revoke from the agent role directly.
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+-- AGENT-ONLY (issue #108): we revoke CREATE from the AGENT ROLE directly. The companion
+-- `REVOKE CREATE ON SCHEMA public FROM PUBLIC` lived here but MUTATED EVERY ROLE — it is
+-- moved to the opt-in deploy/sql/21_public_lockdown.sql. (In PG15+ PUBLIC already lacks
+-- CREATE on public anyway, so on a modern DB the PUBLIC revoke is a no-op; on PG14 it is a
+-- real, app-affecting global change — exactly why it is now opt-in.)
 REVOKE CREATE ON SCHEMA public FROM pgb_agent;   -- agent cannot create tables/etc.
 -- Re-grant only CONNECT to this DB + USAGE on the whitelisted schema (read surface).
 -- (CONNECT is granted via the database default to PUBLIC; USAGE on public is the path to
@@ -295,59 +324,70 @@ REVOKE CREATE ON SCHEMA public FROM pgb_agent;   -- agent cannot create tables/e
 GRANT USAGE ON SCHEMA public TO pgb_agent;
 
 -- -------------------------------------------------------------------------------------
--- 3. [REVOKE] PUBLIC EXECUTE on functions — revoke the language default, then grant back
---    NOTHING by default. (PostgreSQL grants EXECUTE to PUBLIC on every newly-created
---    function unless revoked.) Combined with member-of-nothing this denies reachable
---    SECURITY DEFINER / volatile server-side write functions to the agent.
---    We scope the blanket revoke to the application schema(s); pg_catalog built-ins are
---    governed by predefined-role membership (already stripped) and the superuser bit
---    (NOSUPERUSER), which is why pg_read_file/lo_*/etc. are denied even without an
---    explicit REVOKE (the harness proves each by attempting it).
+-- 3. [REVOKE] Function EXECUTE — AGENT-ONLY revoke (issue #108).
+--    PostgreSQL grants EXECUTE to PUBLIC on every newly-created function unless revoked.
+--    The blanket `REVOKE EXECUTE ON ALL FUNCTIONS … FROM PUBLIC` + the matching
+--    `ALTER DEFAULT PRIVILEGES … FROM PUBLIC` MUTATE EVERY ROLE (they strip the implicit
+--    EXECUTE every app role relies on) — that is the function-execute blast radius that
+--    took down a production DB, so both are MOVED to the opt-in 21_public_lockdown.sql.
+--    Here we revoke EXECUTE only from the AGENT ROLE on the functions that exist now.
+--    HONEST RESIDUAL (shared BYO DB): a function created LATER in public is granted
+--    EXECUTE to PUBLIC by default, and the agent — as a PUBLIC member — would inherit it
+--    at the DB level (the agent-only revoke above only covers functions present at apply
+--    time; there is no agent-scoped ALTER DEFAULT PRIVILEGES form, that targets a grantee
+--    not the agent). THROUGH THE PROXY (the realistic path) such a call is Blocked by the
+--    M2a fail-closed read classifier (#114/#115): `SELECT some_fn()` is Read only if EVERY
+--    referenced function is on the read-safe allowlist, so a user/qualified/write function
+--    classifies NotRead → Blocked at the proxy floor. DIRECT-TO-DB it is gated by the §3
+--    network boundary (agent may connect only from the proxy host — now load-bearing). The
+--    strict 21_public_lockdown.sql restores the DB-level deny for dedicated DBs. pg_catalog
+--    built-ins are governed by predefined-role membership (already stripped) + the
+--    superuser bit (NOSUPERUSER), so pg_read_file/lo_import/etc. are denied regardless.
 -- -------------------------------------------------------------------------------------
-REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM pgb_agent;
--- Future functions created in public: default-deny EXECUTE to PUBLIC as well.
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 -- -------------------------------------------------------------------------------------
--- 4. [REVOKE] No write grant ANYWHERE — close the two PUBLIC-default write paths.
---    (a) TEMP on the database: PostgreSQL grants TEMPORARY to PUBLIC by default, which
---        lets the agent CREATE TEMP TABLE … INSERT (session-local, but still a write +
---        disk-consumption DoS vector). REVOKE it from PUBLIC and from the agent so the
---        "no write grant anywhere" claim is TRUE. (CONNECT is left intact so the agent
---        can still log in.)
---    (b) Large-object WRITE built-ins: PostgreSQL grants EXECUTE to PUBLIC by default on
---        the lo_* server-side functions. The READ/file paths (lo_import/lo_export) are
---        already gated on pg_read/write_server_files (denied above), but the IN-DB write
---        path (lo_create/lowrite/lo_from_bytea/lo_put/lo_creat/lo_truncate*/lo_unlink) is
---        reachable via the PUBLIC default and lets the agent write large objects it owns.
---        REVOKE EXECUTE on every lo_* WRITE/mutate built-in from PUBLIC so no in-DB write
---        path remains. (loread/lo_open are reads and are left for completeness of the
---        no-write claim; they cannot widen the read surface beyond LOs the agent created,
---        which it now cannot.)
---    Both are real REVOKEs (the privilege exists by PUBLIC default); the harness proves
---    each by ATTEMPTING the write as the agent and asserting a permission error.
+-- 4. [REVOKE] No write GRANT to the agent — AGENT-ONLY (issue #108).
+--    PostgreSQL hands two write paths to PUBLIC by default: (a) TEMPORARY on the database
+--    (CREATE TEMP TABLE … INSERT — session-local write + disk-DoS vector) and (b) EXECUTE
+--    on the in-DB large-object WRITE built-ins (lo_create/lo_creat/lowrite/lo_from_bytea/
+--    lo_put/lo_truncate*/lo_unlink — write a large object the caller owns). The agent is a
+--    PUBLIC member, so it inherits both via the PUBLIC default.
+--
+--    HONEST PG SEMANTICS (verified on real PG 14-18): NEITHER of these can be denied to the
+--    agent by an AGENT-SCOPED revoke. `has_database_privilege(agent,…, 'TEMP')` stays TRUE
+--    after `REVOKE TEMPORARY … FROM pgb_agent` because the privilege flows through the
+--    PUBLIC grant, and a per-role REVOKE cannot subtract a PUBLIC grant (it only removes a
+--    DIRECT grant the agent never had). Likewise the lo_* built-ins are reachable only via
+--    the PUBLIC-default EXECUTE. The ONLY way to deny EITHER is `REVOKE … FROM PUBLIC`,
+--    which mutates EVERY role — so BOTH the TEMP-from-PUBLIC and the lo_*-from-PUBLIC
+--    revokes are MOVED to the opt-in 21_public_lockdown.sql.
+--
+--    The line below REVOKEs TEMPORARY from the AGENT ROLE directly. It is DRIFT-DEFENSE
+--    ONLY (it strips any DIRECT TEMP grant a careless operator might add to the agent); it
+--    does NOT — and cannot — deny TEMP while PUBLIC retains it. We keep it for hygiene but
+--    are explicit that it is not the denial mechanism.
+--
+--    HONEST RESIDUAL (shared BYO DB): with this agent-only default the agent CAN still
+--    CREATE TEMP TABLE *and* CREATE a large object (lo_create/lowrite/...) at the DB level —
+--    write surfaces the global PUBLIC revoke used to close. Both are now gated NOT by a DB
+--    revoke but, split by path: THROUGH THE PROXY by the M2a fail-closed read classifier
+--    (#114/#115) — `SELECT lo_create()`/`lowrite()`/any non-allowlisted fn classifies
+--    NotRead → Blocked at the proxy floor, and `CREATE TEMP TABLE` is DDL (NotRead too);
+--    DIRECT-TO-DB by the §3 network boundary (the agent can only reach the DB from the proxy
+--    host — now load-bearing). See KNOWN_BYPASSES.md (B-lo) and SPEC.amendments.md (A-M2).
+--    The strict opt-in 21_public_lockdown.sql restores the DB-level TEMP + lo_* deny for
+--    dedicated DBs.
 -- -------------------------------------------------------------------------------------
--- REVOKE TEMP on the CONNECTED database (current_database()); identifiers stay literal-free
--- via format()/EXECUTE so this file needs no psql :vars and re-targets by being run against
--- the intended database (matches the role's "scoped to the connected database" model above).
+-- REVOKE any DIRECT TEMP grant on the CONNECTED database (current_database()) from the
+-- AGENT (drift-defense only — see the note above; identifiers stay literal-free via
+-- format()/EXECUTE so this file needs no psql :vars and re-targets by being run against the
+-- intended database). The TEMP DENIAL is in the opt-in 21_public_lockdown.sql (`… FROM PUBLIC`).
 DO $$
 BEGIN
-  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
   EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM pgb_agent', current_database());
 END
 $$;
-
-SET LOCAL client_min_messages = error;   -- silence any "no privileges could be revoked" notices
-REVOKE EXECUTE ON FUNCTION lo_create(oid)            FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_creat(integer)         FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lowrite(integer, bytea)   FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_from_bytea(oid, bytea) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_put(oid, bigint, bytea) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_truncate(integer, integer)   FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_truncate64(integer, bigint)  FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION lo_unlink(oid)            FROM PUBLIC;
-RESET client_min_messages;
 
 -- -------------------------------------------------------------------------------------
 -- 5. [NO-GRANT] Server-file large objects (lo_import/lo_export) and pg_read_file are
@@ -388,20 +428,37 @@ COMMIT;
 
 -- =====================================================================================
 -- Done. The agent role is now: LOGIN, NOSUPERUSER, NOINHERIT, member-of-nothing,
--- NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, PUBLIC EXECUTE revoked, NO write grant
--- ANYWHERE (incl. TEMP on the database + the in-DB large-object write built-ins, both
--- revoked from PUBLIC above), default-deny on ALL data until the user grants their own
+-- NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, agent EXECUTE on existing public funcs
+-- revoked, no DIRECT write GRANT, default-deny on ALL data until the user grants their own
 -- allow-listed relations (§6 above). dblink/fdw/COPY-PROGRAM/lo_import/lo_export/
 -- pg_read_file denied structurally (superuser/predefined-role gated).
+--
+-- AGENT-ONLY DEFAULT (issue #108): this file mutates NO other role. The strict `… FROM
+-- PUBLIC` revokes (function-EXECUTE blanket + ALTER DEFAULT PRIVILEGES, CREATE on schema
+-- public, TEMP on the database, the lo_* in-DB write built-ins) are MOVED to the opt-in
+-- deploy/sql/21_public_lockdown.sql (greenfield/dedicated-DB ONLY). HONEST RESIDUAL on a
+-- shared BYO DB (verified on real PG 14-18): the agent retains, at the DB level, PUBLIC's
+-- default function-EXECUTE (on funcs created after apply), TEMP on the database (CREATE TEMP
+-- TABLE), and the in-DB large-object write built-ins — none can be denied by an agent-scoped
+-- revoke (they flow through PUBLIC). Those residuals are contained NOT by a global revoke but,
+-- split by path: THROUGH THE PROXY (the realistic agent path) by the M2a fail-closed read
+-- classifier (#114/#115 — SELECT lo_create()/write-fn/non-allowlisted-or-qualified call →
+-- NotRead → Blocked; CREATE TEMP is DDL → NotRead), and DIRECT-TO-DB by the §3 network
+-- boundary (now load-bearing). See KNOWN_BYPASSES.md (B-lo) and
+-- docs/spec/SPEC.amendments.md (A-M2).
 --
 -- search_path: the role-level pin above is BEST-EFFORT defense-in-depth ONLY — a
 -- non-superuser CAN change its own role GUCs, so the agent can mutate/RESET its path.
 -- The AUTHORITATIVE pin is the PROXY (S1). The WALL's guarantee does NOT rely on
 -- search_path: with explicit fully-qualified SELECT grants as the only read surface and
--- no CREATE/no write anywhere, no search_path the agent chooses can widen access or plant
--- a trojan. deploy/test/wall_matrix.sh (which applies 20_demo_seed.sql for its fixtures)
+-- NO DML write grant (default-deny on data), no search_path the agent chooses can widen its
+-- read/DML surface or plant a trojan. (This is the GRANT-based read/DML surface — it does NOT
+-- claim "no write/CREATE anywhere": the agent-only default leaves PUBLIC's TEMP/lo_*/(PG14)
+-- CREATE defaults at the DB level, contained per the residual note above.)
+-- deploy/test/wall_matrix.sh (which applies 20_demo_seed.sql for its fixtures)
 -- asserts every deny by attempting it as the agent, AND asserts the search_path invariant
--- (agent mutates path + RESET ALL → STILL cannot read non-whitelisted data or write).
+-- (agent mutates path + RESET ALL → STILL cannot read non-whitelisted DATA or perform grant-
+-- gated DML).
 --
 -- pgb_applier (S5 #77): the constrained write-path role applyd connects as. LOGIN,
 -- NOSUPERUSER, NOCREATEDB/ROLE, NOREPLICATION, NOBYPASSRLS, no CREATE on public, owns

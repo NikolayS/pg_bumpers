@@ -9,26 +9,49 @@
 # the whitelisted SELECT succeeds, member-of-nothing, and the direct-from-non-proxy
 # connection is refused.
 #
-# Two security claims the reviewer flagged are now covered honestly:
+# TWO-PHASE STRUCTURE (issue #108, M2 — agent-only default vs. opt-in strict lockdown):
+#   * PHASE 1 (the AGENT-ONLY DEFAULT): apply ONLY deploy/sql/10_hardened_role.sql (which
+#     NEVER mutates PUBLIC) + the demo seed. Section C-agent proves the agent stays contained
+#     WITHOUT any `… FROM PUBLIC` revoke (no DML grant, no CREATE on public, TEMP revoked from
+#     the AGENT). Section C-PUBLIC-UNTOUCHED proves the default did NOT globally revoke —
+#     PUBLIC STILL HAS its EXECUTE / TEMP / lo_* defaults after the agent-only file. This is
+#     the load-bearing M2 distinction: "agent denied" (must hold) vs. "PUBLIC globally
+#     revoked" (the default must NOT do).
+#   * PHASE 2 (the OPT-IN STRICT LOCKDOWN): apply deploy/sql/21_public_lockdown.sql (the
+#     `… FROM PUBLIC` revokes) and re-assert the PUBLIC-globally-revoked rows in their own
+#     context — the in-DB large-object write built-ins (lo_create/lowrite/lo_from_bytea/
+#     lo_put) and PUBLIC EXECUTE on public functions are now DENIED to the agent at the DB
+#     level. A real BYO deployment applies ONLY phase 1; the fixture applies both.
+# Two security claims the reviewer flagged are covered honestly:
 #   * search_path INVARIANT (section I): the role-level search_path pin is BEST-EFFORT (a
 #     non-superuser CAN change its own role GUCs — the proxy is the authoritative pin). We
 #     assert the agent CAN mutate/RESET its path (documented PG behavior) AND that after
-#     maximal mutation + RESET ALL it STILL cannot read non-whitelisted data or write — the
-#     WALL's guarantee is the explicit-grant model, not search_path.
-#   * NO write grant ANYWHERE (section C): CREATE TEMP TABLE and the in-DB large-object
-#     write built-ins (lo_create/lowrite/lo_from_bytea/lo_put) are now REVOKED from PUBLIC
-#     and asserted DENIED (they previously SUCCEEDED via PUBLIC defaults).
+#     maximal mutation + RESET ALL it STILL cannot read non-whitelisted DATA (no DML grant)
+#     — the WALL's guarantee is the explicit-grant model, not search_path. (It does NOT claim
+#     "cannot write/CREATE anywhere": on the agent-only default the agent retains PUBLIC's
+#     TEMP/CREATE-on-PG14 defaults at the DB level — see the RESIDUAL rows below.)
+#   * NO DML write GRANT to the AGENT (section C): the agent has no grant on any application
+#     relation, so DML on the seeded tables is denied. But CREATE TEMP TABLE is NOT denied on
+#     the agent-only default — TEMP flows through PUBLIC and a per-role REVOKE cannot subtract
+#     it (section C asserts the agent CAN create a TEMP table as a documented RESIDUAL). The
+#     TEMP + in-DB large-object write built-ins are denied at the DB level only under the
+#     PHASE-2 lockdown (no agent-scoped revoke exists for them). THROUGH THE PROXY that same
+#     write class (SELECT lo_create()/lowrite()/CREATE TEMP) is Blocked by the M2a fail-closed
+#     classifier (#114/#115); DIRECT-TO-DB it is gated by the §3 network boundary.
 # assert_denied now requires a permission/insufficient-privilege error class (a typo or
 # connection error can no longer masquerade as a deny), and an independent BOUNDARY-RED
 # self-test proves the boundary assertion fails when the pg_hba is misconfigured.
 #
 # Two modes (TDD red/green):
-#   GREEN (default):  apply deploy/sql/10_hardened_role.sql → EVERY matrix row must PASS.
+#   GREEN (default):  PHASE 1 apply deploy/sql/10_hardened_role.sql (agent-only) → the
+#                     agent-containment + PUBLIC-untouched rows must PASS; PHASE 2 then apply
+#                     deploy/sql/21_public_lockdown.sql → the PUBLIC-globally-revoked rows
+#                     must PASS. EVERY row must PASS.
 #   RED  (--red):     create a bare, UN-hardened agent role (LOGIN + a couple of broad
 #                     grants a careless operator might give) → the deny assertions FAIL,
 #                     proving the tests have teeth (a freshly-created role CAN do denied
-#                     things). The harness exits NON-ZERO in --red (failures are expected
-#                     and demonstrate the RED state).
+#                     things). RED applies NEITHER file's lockdown; it exits NON-ZERO
+#                     (failures are expected and demonstrate the RED state).
 #
 # SPEC §3 (layers 0-1), §4 ("Network/roles — do FIRST"), §5 (role-hardening matrix +
 # network-boundary negative test). Issue #5. decisions.md "native roles = the security
@@ -53,6 +76,13 @@ PGBIN="${PG_BRAKES_PG_BIN:-${PGBIN:-/opt/homebrew/opt/postgresql/bin}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SQL_FILE="$DEPLOY_DIR/sql/10_hardened_role.sql"
+# The OPT-IN strict PUBLIC lockdown (issue #108 split it out of the agent-only hardening):
+# the `… FROM PUBLIC` revokes (function EXECUTE blanket + ALTER DEFAULT PRIVILEGES, CREATE/
+# TEMP, the lo_* in-DB write built-ins). The DEFAULT BYO posture (10_hardened_role.sql) is
+# AGENT-ROLE-ONLY and does NOT apply this; the FIXTURE (this matrix, the dev stack) DOES, so
+# the strict DB-level posture stays tested — but only AFTER section C-agent has proven the
+# agent stays contained WITHOUT it (see the two-phase structure below).
+LOCKDOWN_FILE="$DEPLOY_DIR/sql/21_public_lockdown.sql"
 # The FIXTURE-ONLY demo seed (issue #103 split it out of the canonical hardening): the
 # allowed_read / secret_data demo tables + grants the matrix's positive+negative read pair
 # asserts against. A real BYO deployment does NOT apply this; the matrix (a fixture) does.
@@ -81,8 +111,9 @@ fi
 for b in initdb pg_ctl psql pg_isready; do
   [ -x "$PGBIN/$b" ] || { echo "[wall] FAIL: missing $PGBIN/$b — set PGBIN to a PostgreSQL 14-18 bin dir" >&2; exit 1; }
 done
-[ -f "$SQL_FILE" ]   || { echo "[wall] FAIL: missing $SQL_FILE" >&2; exit 1; }
-[ -f "$HBA_RENDER" ] || { echo "[wall] FAIL: missing $HBA_RENDER" >&2; exit 1; }
+[ -f "$SQL_FILE" ]      || { echo "[wall] FAIL: missing $SQL_FILE" >&2; exit 1; }
+[ -f "$LOCKDOWN_FILE" ] || { echo "[wall] FAIL: missing $LOCKDOWN_FILE" >&2; exit 1; }
+[ -f "$HBA_RENDER" ]    || { echo "[wall] FAIL: missing $HBA_RENDER" >&2; exit 1; }
 
 # Guard: the docker-init copy of the WALL SQL must match the canonical source we apply.
 bash "$DEPLOY_DIR/sql/check-init-sync.sh" || {
@@ -160,6 +191,11 @@ PGB_AGENT_ROLE="$AGENT_ROLE" PGB_AGENT_DB="$AGENT_DB" \
 
 "$PGBIN/pg_ctl" -D "$DATADIR/data" -l "$DATADIR/log" -o "-p $TEST_PORT" -w -t 30 start >/dev/null
 log "cluster up; PG $(SU 'SHOW server_version' | tr -d '\n')"
+# Server MAJOR version (e.g. 14, 15, 18) — drives the version-aware rows below. PG14 still
+# grants CREATE on schema public to PUBLIC by default; PG15+ removed it (issue #108: that
+# difference means "agent can create in public" is a PG14-only residual on the agent-only
+# default — denied agent-only on PG15+, denied only under the lockdown on PG14).
+PG_MAJOR_SRV="$(SU "SELECT current_setting('server_version_num')::int / 10000")"
 
 # --------------------------------------------------------------------------------------
 # 2. Provision the role under test.
@@ -168,8 +204,17 @@ log "cluster up; PG $(SU 'SHOW server_version' | tr -d '\n')"
 #           so the deny assertions below FAIL (proving the matrix has teeth).
 # --------------------------------------------------------------------------------------
 if [ "$MODE" = "green" ]; then
-  log "GREEN: applying deploy/sql/10_hardened_role.sql + the fixture demo seed (20_demo_seed.sql)"
-  # 1) the canonical role HARDENING (creates + hardens pgb_agent + pgb_applier).
+  # =====================================================================================
+  # PHASE 1 — AGENT-ONLY DEFAULT (issue #108). Apply ONLY the agent-role-only hardening
+  # (10_hardened_role.sql) + the fixture demo seed. NOT the strict 21_public_lockdown.sql
+  # yet: section C-agent + the PUBLIC-untouched checks below must PASS against this default
+  # to prove (a) the agent is STILL contained without the global revoke, and (b) the default
+  # did NOT mutate PUBLIC. The strict lockdown is applied later (PHASE 2) and its own context
+  # re-asserts the PUBLIC-globally-revoked rows. This is the load-bearing M2 distinction.
+  # =====================================================================================
+  log "GREEN PHASE 1: applying AGENT-ONLY deploy/sql/10_hardened_role.sql + fixture demo seed (20_demo_seed.sql) — NOT the lockdown yet"
+  # 1) the canonical AGENT-ONLY role HARDENING (creates + hardens pgb_agent + pgb_applier;
+  #    NEVER mutates PUBLIC).
   "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
     -v ON_ERROR_STOP=1 -q -f "$SQL_FILE" >/dev/null
   # 2) the FIXTURE-ONLY demo seed (the allowed_read / secret_data positive+negative read
@@ -182,7 +227,12 @@ if [ "$MODE" = "green" ]; then
     -v ON_ERROR_STOP=1 -q -f "$SQL_FILE" >/dev/null
   "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
     -v ON_ERROR_STOP=1 -q -f "$DEMO_SEED_FILE" >/dev/null
-  log "GREEN: migration + demo seed applied twice (idempotent)"
+  # Create a SECURITY DEFINER write function NOW (before any lockdown), NOT granted to the
+  # agent. On the agent-only default it is PUBLIC-executable (residual — see section G); the
+  # PHASE-2 lockdown's blanket `REVOKE EXECUTE ON ALL FUNCTIONS … FROM PUBLIC` reliably
+  # strips it (it EXISTS at lockdown time), which G-LOCKDOWN asserts.
+  SU "CREATE OR REPLACE FUNCTION public.pgb_secdef_write() RETURNS void LANGUAGE sql SECURITY DEFINER AS \$\$ INSERT INTO public.secret_data(id,secret) VALUES (1000,'via secdef') ON CONFLICT DO NOTHING \$\$;" >/dev/null
+  log "GREEN PHASE 1: agent-only migration + demo seed applied twice (idempotent); secdef probe fn created"
 else
   log "RED: creating a BARE, UN-hardened agent role with broad grants"
   SU "DROP ROLE IF EXISTS $AGENT_ROLE;" >/dev/null || true
@@ -308,10 +358,13 @@ for PR in pg_read_all_data pg_write_all_data pg_read_all_settings pg_read_all_st
 done
 
 # --------------------------------------------------------------------------------------
-# C. Write denies — NO write grant ANYWHERE (default-deny). Attempt each, expect failure.
-#    Covers table DML/DDL AND the two PUBLIC-default write paths the migration now revokes:
-#    TEMP on the database (CREATE TEMP TABLE) and the in-DB large-object write built-ins
-#    (lo_create/lowrite/lo_from_bytea/lo_put). All must be DENIED with a permission error.
+# C. Write denies that hold on the AGENT-ONLY DEFAULT (issue #108) — NO write GRANT to the
+#    agent. These pass WITHOUT any `… FROM PUBLIC` revoke: they rest on default-deny on data
+#    (no DML grant), no CREATE on schema public (agent-scoped revoke), and TEMPORARY revoked
+#    from the AGENT directly. This is the load-bearing proof the agent stays contained even
+#    though the default no longer mutates PUBLIC. (The in-DB large-object write built-ins are
+#    a PUBLIC-default surface with NO agent-scoped revoke — those denies move to section
+#    C-LOCKDOWN below, which runs only AFTER the opt-in 21_public_lockdown.sql is applied.)
 # --------------------------------------------------------------------------------------
 assert_denied "no INSERT on whitelisted public.allowed_read" \
   "INSERT INTO public.allowed_read (id,label) VALUES (999,'pwn')"
@@ -321,22 +374,71 @@ assert_denied "no DELETE on whitelisted public.allowed_read" \
   "DELETE FROM public.allowed_read WHERE id=1"
 assert_denied "no INSERT on non-whitelisted public.secret_data" \
   "INSERT INTO public.secret_data (id,secret) VALUES (999,'pwn')"
-assert_denied "no CREATE TABLE (no CREATE on schema public)" \
-  "CREATE TABLE public.pgb_pwn (id int)"
-# "no write grant ANYWHERE" — the two PUBLIC-default write paths the migration now revokes.
-# (a) TEMP on the database: CREATE TEMP TABLE must be DENIED (TEMPORARY revoked from PUBLIC).
-assert_denied "no CREATE TEMP TABLE (TEMPORARY revoked from PUBLIC/agent)" \
-  "CREATE TEMP TABLE pgb_pwn_tmp (id int)"
-# (b) In-DB large-object WRITE path: lo_create / lowrite / lo_from_bytea / lo_put DENIED
-#     (EXECUTE revoked from PUBLIC). These previously SUCCEEDED (own-LO write + disk DoS).
-assert_denied "no lo_create (large-object create EXECUTE revoked)" \
-  "SELECT lo_create(0)"
-assert_denied "no lo_from_bytea (large-object create-from-bytea revoked)" \
-  "SELECT lo_from_bytea(0, '\\x00'::bytea)"
-assert_denied "no lowrite (large-object write revoked)" \
-  "SELECT lowrite(lo_open(lo_create(0), 131072), repeat('x',1024)::bytea)"
-assert_denied "no lo_put (large-object write-at-offset revoked)" \
-  "SELECT lo_put(lo_create(0), 0, '\\x00'::bytea)"
+# CREATE TABLE in schema public — VERSION-AWARE (issue #108). On PG15+ PUBLIC lacks CREATE
+# on schema public by default, so the agent (with the agent-only revoke on top) is DENIED —
+# assert the deny. On PG14 PUBLIC STILL has CREATE on public by default and the agent
+# inherits it via PUBLIC (the agent-scoped `REVOKE CREATE … FROM pgb_agent` is a no-op while
+# PUBLIC has it — verified on real PG14), so "agent can create in public" is a DOCUMENTED
+# PG14 RESIDUAL on the agent-only default; its DB-level deny comes only from the lockdown
+# (PHASE 2 asserts it). CREATE TABLE is DDL, so THROUGH THE PROXY it is Blocked structurally
+# by the read-only classifier (M2a #114/#115); DIRECT-TO-DB the PG14 create is gated by the
+# §3 network boundary. (We drop any table the agent manages to create so it does not linger.)
+if [ "$PG_MAJOR_SRV" -ge 15 ]; then
+  assert_denied "no CREATE TABLE in public (PG15+: PUBLIC lacks CREATE on public; agent denied)" \
+    "CREATE TABLE public.pgb_pwn (id int)"
+else
+  assert_allowed "RESIDUAL (agent-only, PG14): agent CAN CREATE TABLE in public — PG14 PUBLIC still has CREATE on schema public; not deniable agent-only (through-proxy: DDL Blocked by the M2a classifier; direct-to-DB: gated by the network boundary; DB-level deny only under the lockdown)" \
+    "CREATE TABLE public.pgb_pwn14 (id int); SELECT 'created-pg14'" "created-pg14"
+  SU "DROP TABLE IF EXISTS public.pgb_pwn14" >/dev/null
+fi
+# CREATE TEMP TABLE: on the AGENT-ONLY default this is a DOCUMENTED RESIDUAL on EVERY major —
+# TEMP flows through the PUBLIC grant and CANNOT be denied by an agent-scoped revoke (verified
+# on real PG 14-18: has_database_privilege(agent,…,'TEMP') stays TRUE after `REVOKE TEMPORARY …
+# FROM pgb_agent`). So the agent CAN create a temp table at the DB level; that write is gated
+# NOT by a DB revoke but, split by path: THROUGH THE PROXY `CREATE TEMP TABLE` is DDL, Blocked
+# structurally by the M2a read-only classifier (#114/#115); DIRECT-TO-DB by the §3 network
+# boundary. We assert it SUCCEEDS here (honest DB-level residual) and assert the DB-level DENY
+# in PHASE 2 after the lockdown revokes TEMP FROM PUBLIC.
+# (See KNOWN_BYPASSES B-lo / SPEC.amendments A-M2.) A single `CREATE TEMP TABLE` statement
+# returns no rows under -tAq (the command tag is suppressed) so we assert SUCCESS by exit code
+# only (empty `want`); the table is session-local and vanishes when this psql session ends.
+assert_allowed "RESIDUAL (agent-only): agent CAN CREATE TEMP TABLE — TEMP is a PUBLIC default, not deniable agent-only (through-proxy: DDL Blocked by the M2a classifier; direct-to-DB: gated by the network boundary; DB-level deny only under the lockdown)" \
+  "CREATE TEMP TABLE pgb_residual_tmp (id int)"
+
+# --------------------------------------------------------------------------------------
+# C-PUBLIC-UNTOUCHED. The AGENT-ONLY default must NOT have globally revoked PUBLIC's
+# defaults (issue #108 — that global mutation is the production-outage blast radius). We
+# assert the OPPOSITE of a deny here: PUBLIC STILL HAS its default privileges after the
+# agent-only file. This distinguishes "agent denied" (must hold, above) from "PUBLIC
+# globally revoked" (the DEFAULT must NOT do — proven here; the strict lockdown does it
+# later, in its own PHASE-2 context). If a future edit re-introduces a FROM-PUBLIC revoke
+# into the default, these rows FLIP to FAIL.
+# --------------------------------------------------------------------------------------
+# PUBLIC still has EXECUTE on a public function created after apply (the language default).
+SU "CREATE OR REPLACE FUNCTION public.pgb_pub_probe() RETURNS int LANGUAGE sql AS \$\$ SELECT 42 \$\$;" >/dev/null
+HAS_PUB_EXEC="$(SU "SELECT has_function_privilege('public','public.pgb_pub_probe()','EXECUTE')")"
+if [ "$HAS_PUB_EXEC" = "t" ]; then
+  okrow "PUBLIC-UNTOUCHED: PUBLIC still has EXECUTE on a public function (agent-only default did NOT globally revoke function EXECUTE)"
+else
+  badrow "PUBLIC-UNTOUCHED: PUBLIC lost EXECUTE on a public function after the agent-only default (it should NOT mutate PUBLIC — issue #108)"
+fi
+# PUBLIC still has TEMPORARY on the database (the agent-only default revoked TEMP from the
+# AGENT only, not from PUBLIC).
+HAS_PUB_TEMP="$(SU "SELECT has_database_privilege('public', current_database(), 'TEMP')")"
+if [ "$HAS_PUB_TEMP" = "t" ]; then
+  okrow "PUBLIC-UNTOUCHED: PUBLIC still has TEMP on the database (agent-only default did NOT revoke TEMP from PUBLIC)"
+else
+  badrow "PUBLIC-UNTOUCHED: PUBLIC lost TEMP on the database after the agent-only default (it should NOT mutate PUBLIC — issue #108)"
+fi
+# PUBLIC still has EXECUTE on an in-DB large-object write built-in (lo_create) — the residual
+# the agent-only default deliberately leaves open on a shared DB (KNOWN_BYPASSES B-lo).
+HAS_PUB_LO="$(SU "SELECT has_function_privilege('public','lo_create(oid)','EXECUTE')")"
+if [ "$HAS_PUB_LO" = "t" ]; then
+  okrow "PUBLIC-UNTOUCHED: PUBLIC still has EXECUTE on lo_create (agent-only default leaves the lo_* PUBLIC default — documented residual; through-proxy SELECT lo_create() is Blocked by the M2a classifier, direct-to-DB gated by the network boundary)"
+else
+  badrow "PUBLIC-UNTOUCHED: PUBLIC lost EXECUTE on lo_create after the agent-only default (it should NOT mutate PUBLIC — issue #108)"
+fi
+SU "DROP FUNCTION IF EXISTS public.pgb_pub_probe();" >/dev/null
 
 # --------------------------------------------------------------------------------------
 # D. SELECT-whitelist — positive + negative read pair.
@@ -382,17 +484,24 @@ assert_denied "agent cannot CREATE EXTENSION postgres_fdw (egress)" \
   "CREATE EXTENSION IF NOT EXISTS postgres_fdw"
 
 # --------------------------------------------------------------------------------------
-# G. PUBLIC EXECUTE revoked — a SECURITY DEFINER / volatile server-side write function
-#    must NOT be reachable by the agent via the PUBLIC default. Create one as superuser
-#    (NOT granted to the agent), then attempt to call it as the agent → must be denied.
+# G. PUBLIC EXECUTE residual on the AGENT-ONLY default (issue #108). A SECURITY DEFINER
+#    function created in public (here pgb_secdef_write, created in PHASE 1 above and NOT
+#    granted to the agent) IS reachable by the agent via the PUBLIC default — the agent-only
+#    default does NOT revoke function EXECUTE from PUBLIC. We assert it SUCCEEDS here (honest
+#    residual), then prove the DB-level DENY in section G-LOCKDOWN below (after the lockdown's
+#    blanket `REVOKE EXECUTE ON ALL FUNCTIONS … FROM PUBLIC` strips it). On a shared BYO DB
+#    the agent's containment against such a function rests, split by path, NOT on a DB revoke:
+#    THROUGH THE PROXY (the realistic agent path) the M2a fail-closed read classifier
+#    (#114/#115) Blocks the very call — `SELECT public.pgb_secdef_write()` references a
+#    NON-allowlisted (and schema-qualified) function, so the SELECT classifies NotRead and the
+#    proxy floor rejects it BEFORE it reaches the DB (the classifier gates the CALL by name; it
+#    does not need to see the INSERT inside the SECURITY DEFINER body). DIRECT-TO-DB it is gated
+#    by the §3 network boundary. See SPEC.amendments.md A-M2 / KNOWN_BYPASSES.md B-lo. (The
+#    write the function performs is a no-op ON CONFLICT, so asserting it succeeds here — at the
+#    DB level, bypassing the proxy — does not corrupt the secret_data fixture.)
 # --------------------------------------------------------------------------------------
-SU "CREATE OR REPLACE FUNCTION public.pgb_secdef_write() RETURNS void LANGUAGE sql SECURITY DEFINER AS \$\$ INSERT INTO public.secret_data(id,secret) VALUES (1000,'via secdef') ON CONFLICT DO NOTHING \$\$;" >/dev/null
-if [ "$MODE" = "green" ]; then
-  # In GREEN the migration revoked PUBLIC EXECUTE on public funcs + default-privileges.
-  SU "REVOKE EXECUTE ON FUNCTION public.pgb_secdef_write() FROM PUBLIC;" >/dev/null
-fi
-assert_denied "PUBLIC EXECUTE revoked (cannot call SECURITY DEFINER write fn)" \
-  "SELECT public.pgb_secdef_write()"
+assert_allowed "RESIDUAL (agent-only, DIRECT-TO-DB): agent CAN call a PUBLIC-executable SECURITY DEFINER fn — function EXECUTE is a PUBLIC default, not deniable agent-only (through-proxy the M2a classifier Blocks this SELECT: non-allowlisted/qualified fn → NotRead; direct-to-DB gated by the network boundary; DB-level deny only under the lockdown)" \
+  "SELECT public.pgb_secdef_write(); SELECT 'secdef-called'" "secdef-called"
 
 # --------------------------------------------------------------------------------------
 # I. search_path INVARIANT — the security guarantee does NOT depend on the role-level pin.
@@ -400,9 +509,14 @@ assert_denied "PUBLIC EXECUTE revoked (cannot call SECURITY DEFINER write fn)" \
 #    RESET its search_path (documented PG behavior — we assert it SUCCEEDS, not pretend it
 #    fails). The WALL's real guarantee is the explicit-grant model: after MAXIMAL mutation
 #    (hostile pg_temp-first path) AND a full `RESET ALL` that wipes the pin entirely, the
-#    agent STILL cannot read non-whitelisted data or write anywhere. We prove the invariant
-#    two ways: (1) within a single session that sets a hostile path then attempts the deny;
-#    (2) by persisting `ALTER ROLE self … / RESET ALL` and re-connecting a FRESH session.
+#    agent STILL cannot read non-whitelisted DATA or perform grant-gated DML (no grant). This
+#    is scoped to the GRANT-based read/DML surface — it does NOT claim "no write/CREATE
+#    anywhere": on the agent-only default the agent retains PUBLIC's TEMP / lo_* / (PG14)
+#    CREATE-on-public defaults at the DB level (the RESIDUAL rows in section C assert those;
+#    their DB-level deny is asserted only after the PHASE-2 lockdown, and through the proxy
+#    they are Blocked by the M2a classifier). We prove the invariant two ways: (1) within a
+#    single session that sets a hostile path then attempts the deny; (2) by persisting
+#    `ALTER ROLE self … / RESET ALL` and re-connecting a FRESH session.
 # --------------------------------------------------------------------------------------
 echo
 log "===== SEARCH_PATH INVARIANT (role-level pin is best-effort; guarantee is grant-model) ====="
@@ -416,11 +530,10 @@ assert_allowed "agent CAN ALTER ROLE self SET search_path (documented PG behavio
 #       mutated (pg_temp-first) path, yet the agent STILL cannot read the non-whitelisted table.
 assert_denied "INVARIANT: after self-ALTER search_path (pg_temp-first), STILL cannot read non-whitelisted secret_data" \
   "SELECT secret FROM public.secret_data LIMIT 1"
-# …and STILL cannot write anywhere (TEMP + lo write also still denied under the hostile path).
-assert_denied "INVARIANT: after self-ALTER search_path, STILL cannot CREATE TEMP TABLE" \
-  "CREATE TEMP TABLE pgb_pwn_tmp2 (id int)"
-assert_denied "INVARIANT: after self-ALTER search_path, STILL cannot lo_create (write)" \
-  "SELECT lo_create(0)"
+# …and STILL cannot read non-whitelisted data regardless of the hostile path (the load-
+# bearing search_path invariant: access is grant-based, not path-based). (CREATE TEMP TABLE
+# and lo_create are PUBLIC-default residuals on the agent-only default — they are not denied
+# here; their DB-level deny is asserted in section C-LOCKDOWN after the PUBLIC lockdown.)
 
 # I.3 — RESET ALL wipes the pin entirely; the next session falls back to the cluster default
 #       ("$user", public) — re-introducing the very $user element the pin removed. Assert the
@@ -439,10 +552,9 @@ assert_denied "INVARIANT: after RESET ALL (pin wiped, cluster-default path), STI
   "SELECT secret FROM public.secret_data LIMIT 1"
 assert_denied "INVARIANT: after RESET ALL, STILL cannot write (INSERT into whitelisted allowed_read)" \
   "INSERT INTO public.allowed_read (id,label) VALUES (998,'pwn')"
-assert_denied "INVARIANT: after RESET ALL, STILL cannot CREATE TEMP TABLE" \
-  "CREATE TEMP TABLE pgb_pwn_tmp3 (id int)"
-assert_denied "INVARIANT: after RESET ALL, STILL cannot lo_create (write)" \
-  "SELECT lo_create(0)"
+# (CREATE TEMP TABLE / lo_create remain PUBLIC-default residuals on the agent-only default —
+# their DB-level deny is asserted in section C-LOCKDOWN, not here. The search_path invariant
+# is about the GRANT-based read/DML surface, which the asserts above cover.)
 # The whitelisted read STILL works (access is grant-based, search_path-independent).
 assert_allowed "INVARIANT: whitelisted SELECT still works regardless of search_path mutation" \
   "SELECT count(*) FROM public.allowed_read" "2"
@@ -516,6 +628,94 @@ if PGPASSWORD="$AGENT_PW" "$PGBIN/psql" -X \
   badrow "BOUNDARY-RED — after restoring strict pg_hba the agent STILL connected from $NONPROXY_HOST (boundary not re-enforced!)"
 else
   okrow "BOUNDARY-RED — strict boundary RESTORED: agent again REJECTED from non-proxy $NONPROXY_HOST (boundary enforcement confirmed reversible)"
+fi
+
+# ======================================================================================
+# PHASE 2 — STRICT PUBLIC LOCKDOWN (opt-in; issue #108). GREEN only. Everything above
+# proved the AGENT-ONLY default contains the agent AND leaves PUBLIC untouched. NOW apply
+# the opt-in deploy/sql/21_public_lockdown.sql (the `… FROM PUBLIC` revokes) and re-assert
+# the PUBLIC-globally-revoked rows in THEIR OWN context: with the lockdown applied the
+# in-DB large-object write built-ins and PUBLIC EXECUTE on public functions are denied to
+# the agent at the DB level (the belt-and-suspenders a dedicated DB gets). RED skips this
+# (it un-hardens the role; there is no lockdown to layer on).
+# ======================================================================================
+if [ "$MODE" = "green" ]; then
+  echo
+  log "===== PHASE 2: STRICT PUBLIC LOCKDOWN (opt-in 21_public_lockdown.sql — fixture only) ====="
+  # Apply the opt-in strict lockdown (idempotent — apply twice to prove it).
+  "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
+    -v ON_ERROR_STOP=1 -q -f "$LOCKDOWN_FILE" >/dev/null
+  "$PGBIN/psql" -X -h "$NONPROXY_HOST" -p "$TEST_PORT" -U postgres -d "$AGENT_DB" \
+    -v ON_ERROR_STOP=1 -q -f "$LOCKDOWN_FILE" >/dev/null
+  log "PHASE 2: strict lockdown applied twice (idempotent)"
+
+  # --- PUBLIC-NOW-REVOKED: the lockdown DID globally revoke PUBLIC's defaults. -----------
+  # PUBLIC no longer has TEMP on the database.
+  HAS_PUB_TEMP2="$(SU "SELECT has_database_privilege('public', current_database(), 'TEMP')")"
+  if [ "$HAS_PUB_TEMP2" = "f" ]; then
+    okrow "LOCKDOWN: PUBLIC no longer has TEMP on the database (REVOKE TEMPORARY … FROM PUBLIC applied)"
+  else
+    badrow "LOCKDOWN: PUBLIC still has TEMP on the database after the strict lockdown (expected revoked)"
+  fi
+  # PUBLIC no longer has EXECUTE on the in-DB large-object write built-in lo_create.
+  HAS_PUB_LO2="$(SU "SELECT has_function_privilege('public','lo_create(oid)','EXECUTE')")"
+  if [ "$HAS_PUB_LO2" = "f" ]; then
+    okrow "LOCKDOWN: PUBLIC no longer has EXECUTE on lo_create (REVOKE EXECUTE … FROM PUBLIC applied)"
+  else
+    badrow "LOCKDOWN: PUBLIC still has EXECUTE on lo_create after the strict lockdown (expected revoked)"
+  fi
+  # HONEST PG WART (documented residual, verified on PG 14-18): a function created AFTER the
+  # lockdown by a role with NO other default-ACL customization is STILL PUBLIC-executable —
+  # `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE … FROM PUBLIC` does not persist an entry when
+  # the result would be the empty set, so new functions fall back to the built-in PUBLIC
+  # default (proacl NULL). We assert that documented behavior here (NOT a false "deny"), so a
+  # future PG that changes this is caught. The RELIABLE deny is the blanket revoke of
+  # functions that EXIST at lockdown time (asserted by G-LOCKDOWN below) + re-running the
+  # lockdown / explicit per-function grants. See 21_public_lockdown.sql §2 caveat.
+  SU "CREATE OR REPLACE FUNCTION public.pgb_pub_probe2() RETURNS int LANGUAGE sql AS \$\$ SELECT 7 \$\$;" >/dev/null
+  HAS_PUB_FUT="$(SU "SELECT has_function_privilege('public','public.pgb_pub_probe2()','EXECUTE')")"
+  if [ "$HAS_PUB_FUT" = "t" ]; then
+    okrow "LOCKDOWN WART (documented): a function created AFTER the lockdown is STILL PUBLIC-executable (ALTER DEFAULT PRIVILEGES does not persist an empty-result entry — reliable deny is the blanket revoke of existing functions; see 21_public_lockdown.sql §2)"
+  else
+    okrow "LOCKDOWN: a function created AFTER the lockdown is NOT PUBLIC-executable (ALTER DEFAULT PRIVILEGES took effect on this PG — stricter than documented; acceptable)"
+  fi
+  SU "DROP FUNCTION IF EXISTS public.pgb_pub_probe2();" >/dev/null
+
+  # --- C-LOCKDOWN: the in-DB large-object WRITE built-ins are now DENIED to the agent. ----
+  # (EXECUTE revoked from PUBLIC by the lockdown; the agent, a PUBLIC member, loses them.)
+  assert_denied "LOCKDOWN: no lo_create (large-object create EXECUTE revoked from PUBLIC)" \
+    "SELECT lo_create(0)"
+  assert_denied "LOCKDOWN: no lo_from_bytea (large-object create-from-bytea revoked from PUBLIC)" \
+    "SELECT lo_from_bytea(0, '\\x00'::bytea)"
+  assert_denied "LOCKDOWN: no lowrite (large-object write revoked from PUBLIC)" \
+    "SELECT lowrite(lo_open(lo_create(0), 131072), repeat('x',1024)::bytea)"
+  assert_denied "LOCKDOWN: no lo_put (large-object write-at-offset revoked from PUBLIC)" \
+    "SELECT lo_put(lo_create(0), 0, '\\x00'::bytea)"
+
+  # --- G-LOCKDOWN: PUBLIC EXECUTE revoked — the SECURITY DEFINER write function created in
+  #     PHASE 1 (public.pgb_secdef_write, which EXISTED at lockdown time) is now stripped by
+  #     the blanket `REVOKE EXECUTE ON ALL FUNCTIONS … FROM PUBLIC`, so the agent can no
+  #     longer call it via the PUBLIC default (was the PHASE-1 residual in section G). We do
+  #     NOT re-create it (re-creating would reset its ACL to the PUBLIC default). ---
+  assert_denied "LOCKDOWN: PUBLIC EXECUTE revoked (cannot call the SECURITY DEFINER write fn that existed at lockdown time)" \
+    "SELECT public.pgb_secdef_write()"
+
+  # --- C-LOCKDOWN (PG14 residual closed): CREATE in schema public is now DENIED to the agent
+  #     on PG14 too — the lockdown's `REVOKE CREATE ON SCHEMA public FROM PUBLIC` strips the
+  #     PG14 PUBLIC default the agent-only file could not. On PG15+ this was already denied in
+  #     PHASE 1 (PUBLIC lacks CREATE there); re-asserting under the lockdown is harmless and
+  #     shows the lockdown is the deny on the one major where the default left a residual. ---
+  assert_denied "LOCKDOWN: agent cannot CREATE TABLE in public (CREATE revoked from PUBLIC — closes the PG14 residual)" \
+    "CREATE TABLE public.pgb_pwn_lockdown_tbl (id int)"
+
+  # --- AGENT STILL CONTAINED under the lockdown too: re-assert the core agent denies hold ---
+  # (the lockdown is additive belt-and-suspenders; it must not have loosened anything).
+  assert_denied "LOCKDOWN: agent STILL cannot read non-whitelisted secret_data" \
+    "SELECT secret FROM public.secret_data LIMIT 1"
+  assert_allowed "LOCKDOWN: whitelisted SELECT public.allowed_read STILL works" \
+    "SELECT count(*) FROM public.allowed_read" "2"
+  assert_denied "LOCKDOWN: agent STILL cannot CREATE TEMP TABLE" \
+    "CREATE TEMP TABLE pgb_pwn_lockdown (id int)"
 fi
 
 # --------------------------------------------------------------------------------------

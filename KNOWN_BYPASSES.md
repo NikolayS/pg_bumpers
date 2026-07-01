@@ -308,10 +308,11 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
   `statement_timeout` budget and the per-role byte/row cutoff (a side-effecting input fn
   cannot run unbounded or exfiltrate beyond ≤ B — see B1). Finally it is **fully closed at
   the DB, opt-in**: the `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC`
-  (+ `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE`) in `deploy/init/10_hardened_role.sql`
-  removes the agent role's EXECUTE on `public`-schema user functions — a user type's
-  input function included — so on a dedicated/hardened DB the bare-cast residual is denied
-  at the WALL regardless of the cooperative classifier's verdict.
+  (+ `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE`) in the opt-in
+  `deploy/sql/21_public_lockdown.sql` (moved out of the agent-only default by #108 — see
+  B-lo) removes the `PUBLIC`-flowing EXECUTE on `public`-schema user functions — a user
+  type's input function included — so on a dedicated/hardened DB the bare-cast residual is
+  denied at the WALL regardless of the cooperative classifier's verdict.
 - **Repro / teeth:** the classifier unit tests
   (`crates/pgwire/tests/classifier.rs`) prove the *qualified* direction fails closed and
   the *bare/builtin* direction stays Read for all three node kinds
@@ -329,9 +330,60 @@ impossible" or "tamper-proof". This file documents the residual, disclosed limit
 
 ---
 
+## B-lo — Default (agent-only) BYO hardening leaves `PUBLIC`-default write surfaces at the DB level; through the proxy they are Blocked by the M2a fail-closed classifier, direct-to-DB by the network boundary — not a DB revoke (#108)
+
+**Scope ledger (NOT a floor false-negative).** As of #108 (M2), the default BYO
+role hardening `deploy/sql/10_hardened_role.sql` is **agent-role-only** and NEVER
+mutates `PUBLIC` — that removes the global blast radius that took down a production
+DB (KNOWN_DANGERS.md D1). The honest cost: on a **shared** BYO DB the agent, as a
+member of `PUBLIC`, **retains at the DB level** the `PUBLIC`-default surfaces that
+**cannot be denied by an agent-scoped revoke** (verified on real PG 14-18 — a per-
+role `REVOKE … FROM pgb_agent` cannot subtract a `PUBLIC` grant):
+
+- **In-DB large-object WRITE built-ins** (`lo_create`/`lowrite`/`lo_from_bytea`/
+  `lo_put`/`lo_truncate*`/`lo_unlink`) — an own-large-object write + disk-DoS surface.
+- **`TEMPORARY` on the database** — `CREATE TEMP TABLE` (session-local write + disk DoS).
+- **Function `EXECUTE`** on functions created in `public` *after* apply (language default).
+- **`CREATE` on schema `public` — PG14 ONLY** (PG15+ removed the `PUBLIC` default).
+
+**Why this is NOT a floor bypass — and how M2a closed the realistic path.** The agent
+can only *reach* these surfaces if it can connect to the DB and get the statement
+executed. The **realistic agent path is through the proxy**, and there the **M2a
+fail-closed read classifier** (`pgb_pgwire::classify`, #114/#115) is the un-foolable
+gate: a `SELECT` is `Read` only if EVERY function it references is on the curated
+read-safe allowlist, so `SELECT lo_create(0)` / `SELECT lowrite(…)` / `SELECT
+some_write_fn()` / `SELECT a OPERATOR(public.wop) b` / `SELECT x::public.evil` all
+classify **NotRead → Blocked at the proxy floor** (with cost/byte/timeout budgets +
+audit). `CREATE TEMP TABLE` and `CREATE TABLE public.x` are DDL — already `NotRead`
+structurally. So the `PUBLIC`-default write class above is **denied through the proxy
+without any `… FROM PUBLIC` revoke** — that is precisely what makes removing the
+DB-level revoke from the default SAFE for the through-proxy path. The **direct-to-DB
+path** (agent bypassing the proxy) is prevented by the **§3 Layer-0 network boundary**
+(pg_hba restricts `pgb_agent` to connect ONLY from the proxy host — no direct libpq
+path exists); the `… FROM PUBLIC` revokes were always *defense-in-depth* for that
+boundary-prevented direct-connect case, and are fully restored at the DB level by the
+opt-in lockdown for a dedicated DB.
+
+**Residuals (small + honest).** The direct-to-DB path (past the network boundary) still
+leaves, at the DB level: the **bare/unqualified cast** to a side-effecting user type
+(B9 — exotic, `statement_timeout`-bounded), and on **PG14 only** the `CREATE TABLE
+public.x` default (`PUBLIC` keeps `CREATE` on 14; PG15+ removed it). Both are gated by
+the network boundary and restored by the opt-in lockdown.
+
+**Repro / disclosure.** `deploy/test/wall_matrix.sh` PHASE 1 asserts these as *documented
+DB-level residuals* on the agent-only default (at the DB level the agent CAN `CREATE TEMP
+TABLE`, call a `PUBLIC`-executable function, and — on PG14 — `CREATE TABLE` in `public`),
+AND asserts `PUBLIC` still HAS its `EXECUTE`/`TEMP`/`lo_create` defaults (the default did
+not globally revoke). The *through-proxy* guarantee (that this same write class is Blocked
+by the classifier) is carried by M2a's tests (`crates/pgwire/tests/classifier.rs`, the
+fuzz oracle) and the dbsafe-bench through-proxy assertions. PHASE 2 applies the opt-in
+`deploy/sql/21_public_lockdown.sql` and proves the DB-level deny returns for a dedicated
+DB. Tied to **SPEC.amendments A-M2**; the mitigation for a dedicated DB is the opt-in
+lockdown (clone-rehearsed per D1).
+
 ### Bottom line
 
-None of B1–B9 is a deterministic-floor false-negative: the catastrophic-FN ledger
+None of B1–B9 or B-lo is a deterministic-floor false-negative: the catastrophic-FN ledger
 (`dbsafe-bench/golden/known_bypasses.json`) is **empty**, and the gate keeps it
 empty (0 FN / 0 FP over the frozen corpus). B1–B9 are the honest **scope** of the
 MVP — bounded (not zero) read disclosure, a cooperative MCP, single-int-PK apply,
@@ -343,4 +395,9 @@ honest residual that AFTER-trigger effects on the approved rows are not undone (
 approval), and (B9) the near-theoretical bare/unqualified cast-to-a-side-effecting-user-type
 residual of the read classifier (only *qualified* type targets fail closed; bounded by
 `statement_timeout` + the byte/row cutoff and fully closed by the opt-in `FROM PUBLIC`
-EXECUTE revoke) — each disclosed here with a repro and tied to its SPEC.amendments entry.
+EXECUTE revoke) — each disclosed here with a repro and tied to its SPEC.amendments entry. **B-lo**
+(#108) is the agent-only-default residual: `PUBLIC`-default write surfaces remain at the DB
+level on a shared BYO DB, gated for the realistic through-proxy path by the M2a fail-closed
+read classifier (the `lo_*`/function/operator/qualified-cast write class is Blocked at the
+proxy floor — #114/#115) and for the direct-to-DB path by the §3 network boundary, with the
+opt-in `21_public_lockdown.sql` restoring the DB-level deny for a dedicated DB.
