@@ -7,9 +7,12 @@
 //! The classifier is **fail-closed**: a parse error, multiple statements, or any
 //! construct we do not positively recognize as read-only is classified
 //! [`Classification::NotRead`]. This is defense-in-depth (SPEC §4) — the network
-//! boundary + hardened role + `statement_timeout` + byte cutoff remain the
-//! un-foolable backstops — but for the **function-call write** class the
-//! classifier is now the **real gate**, not advisory (M2a, issue #114).
+//! boundary + `statement_timeout` + byte cutoff remain independent backstops —
+//! but for the **function-call write** class (and the related qualified/custom
+//! operator, non-builtin cast, and row-lock classes; M2a, issues #114/#115) the
+//! classifier is now the **real gate**, not advisory: M2 (#113) removes the
+//! DB-level `REVOKE … FROM PUBLIC` for exactly this class, so the WALL role is
+//! *not* the backstop here — only `statement_timeout` + the byte/row cutoff are.
 //!
 //! ## Function-call fail-closed gate (M2a, #114)
 //! The classifier used to be **projection-blind**: it inspected only the
@@ -41,7 +44,10 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor, visit_expressions};
+use sqlparser::ast::{
+    BinaryOperator, DataType, Expr, ObjectName, Query, SetExpr, Statement, TableFactor,
+    visit_expressions,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -570,32 +576,71 @@ fn function_name_is_read_safe(name: &ObjectName) -> bool {
         .any(|allowed| ident.eq_ignore_ascii_case(allowed))
 }
 
-/// Whether EVERY function referenced anywhere in `stmt`'s AST is read-safe.
+/// Whether EVERY function/operator/cast-invoked function referenced anywhere in
+/// `stmt`'s AST is read-safe.
 ///
 /// Two independent sweeps, both fail-closed:
 /// 1. **Expression sweep** — [`visit_expressions`] runs the derived `Visit` walk
 ///    over the whole statement, invoking the closure on every [`Expr`]. For each
-///    `Expr::Function` we check the name against the allowlist. Because the walk
-///    descends into nested expressions, subqueries, CTEs, JOIN `ON`, aggregate
-///    `FILTER`/`ORDER BY`, and function ARGUMENTS, a write hidden as an argument
-///    (`lo_put(lo_create(0), …)`) or inside a CTE/subquery is caught. We short-
-///    circuit (`ControlFlow::Break`) on the first offender.
+///    node we fail-closed on any construct that can invoke an ARBITRARY backing
+///    function (not just an `Expr::Function` call):
+///    - `Expr::Function` whose name is not on the read-safe allowlist;
+///    - `Expr::BinaryOp` / `Expr::UnaryOp` whose operator is a **qualified /
+///      custom** operator (`SELECT a OPERATOR(public.writeop) b` →
+///      `BinaryOperator::PGCustomBinaryOperator([...])`, or
+///      `BinaryOperator::Custom(_)`) — a schema-qualified/custom operator is
+///      backed by an arbitrary (possibly SECURITY DEFINER write) function, so it
+///      is NOT a trusted built-in. **Bare built-in operators stay read-safe**
+///      (arithmetic `+ - * / %`, `||`, bitwise/shift, comparison, logical,
+///      `LIKE`/`ILIKE`, `IS`, JSON/array `@> <@ ? -> …`, regex `~`, …), mirroring
+///      how a qualified function NAME already fails closed. sqlparser models
+///      `OPERATOR(...)` in the PREFIX position as a Function named `OPERATOR`
+///      (already caught by the function check); `UnaryOperator` has no
+///      qualified/custom variant in this sqlparser, so unary is covered by the
+///      built-in enum being closed — we still guard it for defence-in-depth;
+///    - `Expr::Cast` whose target type is a **schema-qualified** type name
+///      (`x::public.evil`, `CAST(x AS myschema.t)` → `DataType::Custom(name, …)`
+///      with a multi-part `name`) — a qualified user type invokes that type's
+///      input function, which can side-effect. **Bare built-in casts stay
+///      read-safe** (`x::int`, `x::text`, `x::timestamptz`, `x::jsonb`,
+///      `x::numeric`, …). We fail closed only on the *qualified* form because
+///      sqlparser also models some BARE built-in types (`inet`, `citext`) as
+///      `DataType::Custom`, so blocking every `Custom` would over-block a
+///      legitimate builtin read (see [`cast_target_type_is_read_safe`]).
+///
+///    Because the walk descends into nested expressions, subqueries, CTEs, JOIN
+///    `ON`, aggregate `FILTER`/`ORDER BY`, and function/operator ARGUMENTS, a
+///    write hidden as an argument (`lo_put(lo_create(0), …)`), inside a CTE /
+///    subquery, or behind a custom operator / qualified cast is caught. We
+///    short-circuit (`ControlFlow::Break`) on the first offender.
 /// 2. **Table-valued-function sweep** — table-valued function calls in
 ///    `FROM`/`JOIN` are table factors, NOT `Expr::Function` nodes, so the
 ///    expression sweep does not see the OUTER name (it does see their argument
 ///    expressions). [`statement_table_functions_all_read_safe`] walks the query
 ///    tree and checks each table-function name against the same allowlist.
 ///
-/// Returns `true` only if BOTH sweeps find no non-allowlisted function.
+/// Returns `true` only if BOTH sweeps find no non-allowlisted construct.
 fn statement_functions_all_read_safe(stmt: &Statement) -> bool {
-    // Sweep 1: every `Expr::Function` name (projection/WHERE/HAVING/args/…).
+    // Sweep 1: every function name, custom/qualified operator, and qualified cast
+    // target (projection/WHERE/HAVING/args/…).
     let expr_ok = visit_expressions(stmt, |expr: &Expr| {
-        if let Expr::Function(func) = expr
-            && !function_name_is_read_safe(&func.name)
-        {
-            return ControlFlow::Break(());
+        let read_safe = match expr {
+            Expr::Function(func) => function_name_is_read_safe(&func.name),
+            // A qualified/custom operator invokes an arbitrary backing function.
+            Expr::BinaryOp { op, .. } => binary_operator_is_read_safe(op),
+            // `UnaryOperator` has no custom/qualified variant in this sqlparser
+            // (every variant is a built-in), so unary operators are always safe;
+            // kept explicit as a fail-closed anchor if a variant is ever added.
+            Expr::UnaryOp { .. } => true,
+            // A qualified/non-builtin cast target invokes the type's input fn.
+            Expr::Cast { data_type, .. } => cast_target_type_is_read_safe(data_type),
+            _ => true,
+        };
+        if read_safe {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
         }
-        ControlFlow::Continue(())
     })
     .is_continue();
     if !expr_ok {
@@ -603,6 +648,83 @@ fn statement_functions_all_read_safe(stmt: &Statement) -> bool {
     }
     // Sweep 2: table-valued function names in FROM/JOIN.
     statement_table_functions_all_read_safe(stmt)
+}
+
+/// Whether a binary operator is a trusted BUILT-IN (side-effect-free) operator.
+///
+/// Fail-closed: only a **schema-qualified / custom** operator is unsafe —
+/// [`BinaryOperator::PGCustomBinaryOperator`] (the `a OPERATOR(schema.name) b`
+/// form) and [`BinaryOperator::Custom`] (a raw custom-operator token) are backed
+/// by an ARBITRARY function (possibly a SECURITY DEFINER write), so they are NOT
+/// trusted built-ins and make the statement NotRead. Every OTHER
+/// `BinaryOperator` variant is a language-level built-in (arithmetic, string
+/// concat, bitwise/shift, comparison, logical, regex/like, JSON/array operators)
+/// whose semantics are fixed and side-effect-free, so it stays read-safe. This
+/// mirrors how a qualified function NAME already fails closed while bare built-in
+/// names pass.
+fn binary_operator_is_read_safe(op: &BinaryOperator) -> bool {
+    !matches!(
+        op,
+        BinaryOperator::PGCustomBinaryOperator(_) | BinaryOperator::Custom(_)
+    )
+}
+
+/// Whether a `CAST`/`::` target data type is a trusted BUILT-IN type (so its
+/// input function is a fixed, side-effect-free built-in).
+///
+/// Fail-closed on a **schema-qualified** custom type name
+/// ([`DataType::Custom`] whose `ObjectName` has more than one part, e.g.
+/// `public.evil`, `pg_catalog.int4`, `myschema.t`): a qualified user type
+/// invokes that type's input function, which can side-effect, so the statement
+/// is NotRead — mirroring the qualified-function-name policy.
+///
+/// A BARE (single-part) `DataType::Custom` stays read-safe: sqlparser models
+/// several BUILT-IN PostgreSQL types (`inet`, `citext`, and any type it does not
+/// special-case) as bare `Custom`, so failing closed on *every* `Custom` would
+/// over-block a legitimate builtin read. This conservative "qualified fails
+/// closed, bare stays open" split is exactly the acceptable fallback for the
+/// builtin-vs-user distinction, and it still pins the `schema.type` bypass. All
+/// the NON-`Custom` `DataType` variants (`Int`, `Text`, `Timestamp`, `JSONB`,
+/// `Numeric`, `Varchar`, …) are recognized built-ins and stay read-safe.
+///
+/// The check **unwraps the element type** of the array/wrapper `DataType`
+/// variants so an ARRAY cast to a qualified type — `x::public.evil[]` parses to
+/// `Array(SquareBracket(Custom([public, evil]), …))`, and the `ARRAY<…>` /
+/// `Nullable(…)` / `LowCardinality(…)` wrappers likewise nest a `DataType` —
+/// cannot smuggle a qualified custom type past the bare-node check. The exotic
+/// composite/named-type variants (`Struct`/`Union`/`Tuple`/`Nested`/`Map`/
+/// `NamedTable` — ClickHouse/Hive/BigQuery/MsSQL shapes a PostgreSQL cast never
+/// yields) are fail-closed (not a recognized bare builtin), tighten-only.
+fn cast_target_type_is_read_safe(data_type: &DataType) -> bool {
+    match data_type {
+        // Qualified custom type (`public.evil`) fails closed; bare (`inet`,
+        // `citext`, `mytype`) stays read-safe.
+        DataType::Custom(name, _) => name.0.len() == 1,
+        // Array / wrapper types: recurse into the element type so a wrapped
+        // qualified custom (`public.evil[]`, `ARRAY<public.evil>`,
+        // `Nullable(public.evil)`) is caught. `Array(None)` has no element type
+        // and is a bare untyped array → read-safe.
+        DataType::Array(elem) => match elem {
+            sqlparser::ast::ArrayElemTypeDef::None => true,
+            sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
+            | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _)
+            | sqlparser::ast::ArrayElemTypeDef::Parenthesis(inner) => {
+                cast_target_type_is_read_safe(inner)
+            }
+        },
+        DataType::Nullable(inner) | DataType::LowCardinality(inner) => {
+            cast_target_type_is_read_safe(inner)
+        }
+        DataType::Map(k, v) => cast_target_type_is_read_safe(k) && cast_target_type_is_read_safe(v),
+        // Exotic composite/named types a PG cast never produces — fail closed.
+        DataType::Struct(..)
+        | DataType::Union(_)
+        | DataType::Tuple(_)
+        | DataType::Nested(_)
+        | DataType::NamedTable { .. } => false,
+        // Every other variant is a recognized built-in scalar type.
+        _ => true,
+    }
 }
 
 /// Walk `stmt` for table-valued function calls (`FROM generate_series(…)`,
@@ -704,6 +826,16 @@ fn table_factor_functions_all_read_safe(factor: &TableFactor) -> bool {
 /// read-only query, and requires the top-level set expression to be a
 /// SELECT/VALUES (not an `INSERT … RETURNING`-style body).
 fn query_is_read_only(query: &Query) -> bool {
+    // FIX 2 (#115): a row-lock clause (`FOR UPDATE` / `FOR SHARE`, incl. their
+    // `OF …`/`NOWAIT`/`SKIP LOCKED` variants) acquires REAL locks on the primary
+    // (a lock-DoS side effect), so it is not a pure read — fail closed on ANY
+    // lock clause. (sqlparser's PostgreSQL dialect only parses `FOR UPDATE`/`FOR
+    // SHARE`; `FOR NO KEY UPDATE` / `FOR KEY SHARE` fail to parse and are already
+    // fail-closed NotRead upstream.) This check runs at every recursion level, so
+    // a lock buried in a CTE body or a derived subquery is caught too.
+    if !query.locks.is_empty() {
+        return false;
+    }
     // Any CTE that itself contains a write makes the whole query not-read.
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {

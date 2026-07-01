@@ -15,12 +15,16 @@
 //!    permits multiple statements in one message.
 //! 2. **SQL gate** (read-only): the SQL text carried by an extended-protocol
 //!    `Parse` is classified by [`pgb_pgwire::classify`]; anything not provably a
-//!    single read is **blocked**. Since M2a (#114) the classifier fail-closes on
-//!    non-allowlisted function calls, so it is the **real gate** for the
-//!    function-call write class (`SELECT lo_create(…)`/`setval(…)`/`writing_fn()`
-//!    are Blocked here); the WALL role + `statement_timeout` + byte cutoff remain
-//!    the un-foolable backstops for everything else. The proxy audits every
-//!    decision.
+//!    single read is **blocked**. Since M2a (#114/#115) the classifier
+//!    fail-closes on non-allowlisted function calls **and on qualified/custom
+//!    operators, schema-qualified (non-builtin) casts, and `FOR UPDATE`/`FOR
+//!    SHARE` row-lock clauses**, so it is the **real gate** for the function-call
+//!    write class (`SELECT lo_create(…)`/`setval(…)`/`writing_fn()`,
+//!    `a OPERATOR(public.writeop) b`, `x::public.evil`, `… FOR UPDATE` are
+//!    Blocked here). Because M2 (#113) drops the DB-level `REVOKE … FROM PUBLIC`
+//!    for exactly this class, the WALL role is NOT the backstop here; the
+//!    independent floors that remain are `statement_timeout` + the byte/row
+//!    cutoff. The proxy audits every decision.
 
 use pgb_pgwire::{
     Classification, FrontendMessage, NotReadReason, RejectReason, classify_frontend_tag,
@@ -313,14 +317,18 @@ mod tests {
 
     #[test]
     fn function_call_writes_are_blocked_at_the_floor_gate() {
-        // M2a (#114): the read-only classifier is now the REAL gate for the
+        // M2a (#114/#115): the read-only classifier is the REAL gate for the
         // function-call write class — a `SELECT` is a read ONLY IF every function
-        // it references is on the curated read-safe allowlist. These
-        // side-effecting/unknown-function SELECTs are Blocked at the proxy FLOOR
-        // gate (they never reach the backend), not merely caught by the downstream
-        // statement_timeout / WALL role. Fail-closed: `lo_*` writers, sequence
-        // mutators, server-file readers, `pg_sleep`, `dblink`, and EVERY
-        // user/unknown/qualified `schema.fn()` — including a SECURITY DEFINER fn.
+        // it references is on the curated read-safe allowlist AND it uses no
+        // qualified/custom operator, no schema-qualified (non-builtin) cast, and
+        // no `FOR UPDATE`/`FOR SHARE` lock. These side-effecting SELECTs are
+        // Blocked at the proxy FLOOR gate (they never reach the backend). Because
+        // M2 (#113) removes the DB-level `REVOKE … FROM PUBLIC` for exactly this
+        // class, the WALL role is NOT the backstop here — the independent floors
+        // that remain are `statement_timeout` + the byte/row cutoff. Fail-closed:
+        // `lo_*` writers, sequence mutators, server-file readers, `pg_sleep`,
+        // `dblink`, EVERY user/unknown/qualified `schema.fn()` (incl. a SECURITY
+        // DEFINER fn), qualified/custom operators, non-builtin casts, and locks.
         let g = Enforcement::new();
         for sql in [
             "SELECT lo_create(0)",
@@ -338,6 +346,12 @@ mod tests {
             "SELECT (SELECT setval('s', 1))",
             "SELECT * FROM public.allowed_read WHERE public.writing_fn()",
             "SELECT * FROM my_writing_table_fn(1)",
+            // #115 fix round — the qualified/custom-operator, non-builtin-cast,
+            // and row-lock bypasses are blocked at the floor gate too.
+            "SELECT a OPERATOR(public.writeop) b FROM public.allowed_read",
+            "SELECT x::public.evil FROM public.allowed_read",
+            "SELECT * FROM public.allowed_read FOR UPDATE",
+            "SELECT * FROM public.allowed_read FOR SHARE",
         ] {
             match g.gate(&parse(sql)) {
                 GateDecision::Block { code, .. } => {
@@ -364,6 +378,12 @@ mod tests {
             "SELECT jsonb_build_object('a', 1)",
             "SELECT * FROM public.allowed_read WHERE lower(label) = 'x'",
             "SELECT * FROM generate_series(1, 5) g",
+            // #115 fix round — built-in operators, built-in casts, and a plain
+            // (lock-free) read must NOT be over-blocked by the new fail-closed
+            // checks; they still Allow through the floor gate.
+            "SELECT a + b, a || b, a = b FROM public.allowed_read",
+            "SELECT x::int, y::text, z::timestamptz FROM public.allowed_read",
+            "SELECT * FROM public.allowed_read",
         ] {
             match g.gate(&parse(sql)) {
                 GateDecision::Allow { sql: Some(_) } => {}

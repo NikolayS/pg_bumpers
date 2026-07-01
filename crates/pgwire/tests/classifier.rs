@@ -163,6 +163,113 @@ fn select_of_allowlisted_read_functions_is_read() {
     assert_read("SELECT max(length(name)) FROM t WHERE upper(name) LIKE 'A%'");
 }
 
+// -------------------------------------------------------------------------
+// M2a fix round (#115): three more side-effect classes a SELECT could smuggle
+// past the projection-blind-era gate, each found by an adversarial run of the
+// real classifier. All must fail-closed to NotRead; the corresponding built-in
+// (side-effect-free) forms must stay Read.
+// -------------------------------------------------------------------------
+
+#[test]
+fn qualified_or_custom_operator_is_not_read() {
+    // FIX 1 (HIGH): `SELECT a OPERATOR(public.writeop) b` parses to
+    // `Expr::BinaryOp { op: PGCustomBinaryOperator([...]) }` — NOT an
+    // `Expr::Function` — so the function sweep never saw it. A schema-qualified /
+    // custom operator invokes an ARBITRARY backing function (incl. a SECURITY
+    // DEFINER write). Fail-closed in EVERY expression position.
+    assert_not_read("SELECT a OPERATOR(public.writeop) b FROM t");
+    assert_not_read("SELECT * FROM t WHERE a OPERATOR(public.wop) b");
+    assert_not_read("SELECT a FROM t GROUP BY a HAVING count(*) OPERATOR(public.wop) 0");
+    assert_not_read("SELECT a FROM t ORDER BY a OPERATOR(public.wop) b");
+    assert_not_read("WITH w AS (SELECT a OPERATOR(public.wop) b AS c FROM t) SELECT * FROM w");
+    assert_not_read("SELECT (SELECT a OPERATOR(public.wop) b FROM t)");
+    assert_not_read("SELECT * FROM generate_series(1, 1 OPERATOR(public.wop) 2)");
+    // The PREFIX form `OPERATOR(public.wop) b` parses as a Function named
+    // `OPERATOR` (non-allowlisted) — already NotRead; pin it so it stays closed.
+    assert_not_read("SELECT OPERATOR(public.wop) b FROM t");
+}
+
+#[test]
+fn builtin_operators_stay_read_no_regression() {
+    // FIX 1 guard: bare BUILT-IN operators are side-effect-free and MUST stay
+    // Read — only the qualified/custom `OPERATOR(...)` form fails closed.
+    assert_read("SELECT a + b");
+    assert_read("SELECT a || b FROM t");
+    assert_read("SELECT a = b");
+    assert_read("SELECT a - b, a * b, a / b, a % b FROM t");
+    assert_read("SELECT a < b, a > b, a <= b, a >= b, a <> b FROM t");
+    assert_read("SELECT a AND b, a OR b, NOT a FROM t");
+    assert_read("SELECT a # b, a & b, a | b, a << b, a >> b FROM t");
+    assert_read("SELECT name LIKE 'a%', name ILIKE 'a%' FROM t");
+    assert_read("SELECT a IS NULL, a IS NOT NULL FROM t");
+    // JSON/array/containment built-in operators.
+    assert_read("SELECT jsonb_col ? 'k' FROM t");
+    assert_read("SELECT a @> b, a <@ b, a && b FROM t");
+    assert_read("SELECT j -> 'k', j ->> 'k', j #> '{a}', j #>> '{a}' FROM t");
+    // Unary built-ins.
+    assert_read("SELECT -b, +b, ~b FROM t");
+}
+
+#[test]
+fn for_update_or_share_lock_is_not_read() {
+    // FIX 2 (MEDIUM): `SELECT ... FOR UPDATE`/`FOR SHARE` acquire real row locks
+    // on the primary (lock-DoS side effect), so they are NOT a pure read.
+    // (`FOR NO KEY UPDATE` / `FOR KEY SHARE` do not parse under sqlparser's
+    // PostgreSQL dialect and are already fail-closed NotRead via ParseError —
+    // pinned here so the whole FOR-lock family stays closed.)
+    assert_not_read("SELECT * FROM t FOR UPDATE");
+    assert_not_read("SELECT * FROM t FOR SHARE");
+    assert_not_read("SELECT * FROM t FOR NO KEY UPDATE");
+    assert_not_read("SELECT * FROM t FOR KEY SHARE");
+    assert_not_read("SELECT * FROM t FOR UPDATE OF t");
+    assert_not_read("SELECT * FROM t FOR UPDATE NOWAIT");
+    assert_not_read("SELECT * FROM t FOR UPDATE SKIP LOCKED");
+    // A lock buried in a CTE body or subquery is still a lock on the primary.
+    assert_not_read("WITH w AS (SELECT id FROM t FOR UPDATE) SELECT * FROM w");
+    assert_not_read("SELECT * FROM (SELECT id FROM t FOR SHARE) sub");
+    // A plain SELECT with no lock clause stays Read.
+    assert_read("SELECT * FROM t");
+    assert_read("SELECT id FROM t WHERE id = 1");
+}
+
+#[test]
+fn cast_to_qualified_or_nonbuiltin_type_is_not_read() {
+    // FIX 3 (LOW): `x::public.evil` / `CAST(x AS myschema.t)` invokes the user
+    // type's input function (can side-effect). A schema-QUALIFIED cast target
+    // fails closed; bare built-in casts stay Read. (Conservative: only the
+    // qualified form fails closed, because sqlparser models some bare BUILTIN
+    // types — `inet`, `citext` — as `DataType::Custom` too, so blocking all
+    // Custom would over-block legitimate builtin reads.)
+    assert_not_read("SELECT x::public.evil");
+    assert_not_read("SELECT CAST(x AS myschema.t) FROM t");
+    assert_not_read("SELECT x::pg_catalog.int4");
+    assert_not_read("SELECT * FROM t WHERE x::public.evil = 1");
+    assert_not_read("WITH w AS (SELECT x::public.evil AS y FROM t) SELECT * FROM w");
+    // TRY_CAST and a chained cast whose FIRST hop is qualified are caught too.
+    assert_not_read("SELECT TRY_CAST(x AS public.evil)");
+    assert_not_read("SELECT x::public.evil::text");
+    // ARRAY cast to a qualified type must NOT slip past the bare-node check —
+    // `public.evil[]` nests the qualified `Custom` inside `DataType::Array`.
+    assert_not_read("SELECT x::public.evil[]");
+    assert_not_read("SELECT ARRAY[x]::public.evil[]");
+    // Bare builtin casts stay Read.
+    assert_read("SELECT x::int");
+    assert_read("SELECT x::text");
+    assert_read("SELECT x::timestamptz");
+    assert_read("SELECT x::jsonb");
+    assert_read("SELECT x::numeric");
+    assert_read("SELECT CAST(x AS int) FROM t");
+    assert_read("SELECT x::varchar(10)");
+    // Builtin ARRAY casts stay Read (element type is a recognized builtin).
+    assert_read("SELECT x::int[]");
+    assert_read("SELECT x::text[]");
+    // A bare (unqualified) user type — array or scalar — stays Read (the
+    // conservative qualified-only policy; sqlparser models builtin inet/citext
+    // as bare Custom, so we do not over-block bare).
+    assert_read("SELECT x::citext");
+    assert_read("SELECT x::inet");
+}
+
 #[test]
 fn read_only_cte_is_read() {
     assert_read(
